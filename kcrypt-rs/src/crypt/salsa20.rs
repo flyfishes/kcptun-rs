@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn sse2_matches_scalar() {
         // Verify SSE2 4-block output matches 4× scalar output
-        let key = *b"test-key-12345-test-key-67890";
+        let key = *b"test-key-12345-test-key-67890\0\0\0";
         let nonce = *b"nonce123";
         let ctr = 7u64;
 

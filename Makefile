@@ -377,16 +377,16 @@ targets:
 # test / stress / clippy / fmt
 # ---------------------------------------------------------------------------
 test:
-	$(CARGO) test --workspace -j $(NUM_JOBS)
+	ulimit -n 65536 2>/dev/null; $(CARGO) test --workspace -j $(NUM_JOBS) -- --test-threads=2
 
 test-smol:
-	$(CARGO) test $(RT_PKGS) --no-default-features --features smol --target-dir target/smol-test -- --test-threads=1
+	ulimit -n 65536 2>/dev/null; $(CARGO) test $(RT_PKGS) --no-default-features --features smol --target-dir target/smol-test -- --test-threads=2
 
 test-both: test test-smol
 
 # Stress tests — data-integrity + concurrency, requires release build
 stress:
-	$(CARGO) test --release -p kcptun-server --test stress_test -- --nocapture --test-threads=1
+	ulimit -n 65536 2>/dev/null; $(CARGO) test --release -p kcptun-server --test stress_test -- --nocapture --test-threads=1
 
 clippy:
 	$(CARGO) clippy --workspace -- -D warnings

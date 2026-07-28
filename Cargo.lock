@@ -888,6 +888,7 @@ dependencies = [
  "kcrypt-rs",
  "parking_lot 0.12.5",
  "reed-solomon-erasure",
+ "smallvec",
 ]
 
 [[package]]
@@ -1620,6 +1621,7 @@ dependencies = [
  "kio-rs",
  "log",
  "parking_lot 0.12.5",
+ "tokio",
 ]
 
 [[package]]

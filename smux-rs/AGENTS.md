@@ -15,8 +15,10 @@ SMUX stream multiplexer over a single async transport (typically KCP+Snappy). Ru
 | `build.rs` | Runtime feature glue if present |
 | `src/lib.rs` | Public re-exports: `Session`, `Stream`, `Frame`, `Config`, … |
 | `src/frame.rs` | 8B header codec; `Cmd`, `Frame`, `FrameCodec`; `FRAME_HEADER_SIZE=8`, `MAX_FRAME_SIZE` |
-| `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive |
+| `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive, SYN queue |
 | `src/stream.rs` | Logical `Stream` (AsyncRead/AsyncWrite via session), window / state |
+| `src/conn.rs` | `SmuxConn` high-level wrapper (auto read/flush/keepalive/reap) |
+| `src/io.rs` | `SmuxIo` wrapper with optional transport backpressure |
 
 ## Subdirectories
 
@@ -41,8 +43,14 @@ None (flat `src/`).
 ### Common Patterns
 
 ```rust
+// High-level (recommended for standalone use):
+use smux_rs::{SmuxConn, Config};
+let conn = SmuxConn::new(Config::default(), true)?;
+let stream = conn.open_stream()?; // SmuxIo: AsyncRead + AsyncWrite
+
+// Low-level (for kcptun / custom transport):
 use smux_rs::{Config, Session, DEFAULT_CONFIG};
-// Session over async transport from kio
+let session = Session::new_client(&Config::default())?;
 ```
 
 ## Dependencies

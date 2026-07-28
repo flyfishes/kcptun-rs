@@ -19,7 +19,13 @@ panic = "abort"
 strip = true
 
 # For flamegraphs / samply: keep symbols, frame pointers, no LTO so stacks are human-readable.
-# Usage: cargo build --profile profiling -p kcptun-server -p kcptun-client
+# Usage: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client
+#
+# IMPORTANT: Always pass -C force-frame-pointers=yes (or use `make profiling-bins`)
+# when building for SIGPROF-based profilers (pprof-rs, samply). Without frame
+# pointers, ~40% of CPU samples get "stuck" at libc/pthread boundaries
+# (e.g. __pthread_atfork_parent_handlers, unix_madvise) with flat==cum,
+# unable to attribute to the Rust caller.
 [profile.profiling]
 inherits = "release"
 lto = false

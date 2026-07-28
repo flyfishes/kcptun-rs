@@ -1,11 +1,15 @@
 //! SMUX logical stream implementation.
 
 use std::collections::VecDeque;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
+use log::debug;
 use parking_lot::Mutex;
 
 /// Error returned by stream operations.
@@ -59,6 +63,12 @@ pub struct Stream {
     /// `write` / `write_bytes` push; `drain_send_max` copies into the caller's
     /// frame assembly buffer once (P1.4).
     send_buf: Arc<Mutex<VecDeque<Bytes>>>,
+    /// Number of bytes waiting to be sent (atomic counter — avoids locking +
+    /// iterating `send_buf` on every `pending_send()` query).
+    send_buf_bytes: std::sync::atomic::AtomicUsize,
+    /// Number of bytes available to read (atomic counter — avoids locking +
+    /// iterating `recv_buf_bytes` / `recv_buf` on every `available()` query).
+    recv_buf_bytes_avail: std::sync::atomic::AtomicUsize,
     /// Number of bytes read by the consumer.
     bytes_read: Arc<AtomicU32>,
     /// Number of bytes written by the consumer.
@@ -94,6 +104,12 @@ pub struct Stream {
     /// Stored waker for poll_read-based async wrappers.
     /// Set by `register_read_waker`, woken by `wakeup_reader`.
     read_waker: Mutex<Option<std::task::Waker>>,
+    /// Wakes up a writer blocked in `poll_write()` (v2 peer window).
+    /// Fires when the peer window opens (UPD received via `apply_peer_update`).
+    ch_write_wakeup: kio::Notify,
+    /// Stored waker for poll_write-based async writers.
+    /// Set by `register_write_waker`, woken by `wakeup_writer`.
+    write_waker: Mutex<Option<std::task::Waker>>,
 }
 
 impl Stream {
@@ -106,6 +122,8 @@ impl Stream {
             recv_buf_bytes: Arc::new(Mutex::new(VecDeque::new())),
             max_recv_buf: 4 * 1024 * 1024, // 4MB default
             send_buf: Arc::new(Mutex::new(VecDeque::new())),
+            send_buf_bytes: std::sync::atomic::AtomicUsize::new(0),
+            recv_buf_bytes_avail: std::sync::atomic::AtomicUsize::new(0),
             bytes_read: Arc::new(AtomicU32::new(0)),
             bytes_written: Arc::new(AtomicU32::new(0)),
             opened: AtomicBool::new(false),
@@ -120,6 +138,8 @@ impl Stream {
             peer_window: AtomicU32::new(262144), // Go initialPeerWindow
             ch_reader_wakeup: kio::Notify::new(),
             read_waker: Mutex::new(None),
+            ch_write_wakeup: kio::Notify::new(),
+            write_waker: Mutex::new(None),
         }
     }
 
@@ -137,6 +157,8 @@ impl Stream {
             recv_buf_bytes: Arc::new(Mutex::new(VecDeque::new())),
             max_recv_buf: recv_capacity,
             send_buf: Arc::new(Mutex::new(VecDeque::new())),
+            send_buf_bytes: std::sync::atomic::AtomicUsize::new(0),
+            recv_buf_bytes_avail: std::sync::atomic::AtomicUsize::new(0),
             bytes_read: Arc::new(AtomicU32::new(0)),
             bytes_written: Arc::new(AtomicU32::new(0)),
             opened: AtomicBool::new(false),
@@ -151,6 +173,8 @@ impl Stream {
             peer_window: AtomicU32::new(262144), // Go initialPeerWindow
             ch_reader_wakeup: kio::Notify::new(),
             read_waker: Mutex::new(None),
+            ch_write_wakeup: kio::Notify::new(),
+            write_waker: Mutex::new(None),
         }
     }
 
@@ -231,6 +255,25 @@ impl Stream {
         }
     }
 
+    /// Wake up any writer blocked in `poll_write()` (v2 peer window).
+    /// Called by `apply_peer_update` when the peer's window opens up,
+    /// or on close to unblock any pending writes.
+    #[inline]
+    pub fn wakeup_writer(&self) {
+        self.ch_write_wakeup.notify_one();
+        if let Some(w) = self.write_waker.lock().take() {
+            w.wake();
+        }
+    }
+
+    /// Register a waker for poll_write-based async writers.
+    /// The waker will be called by `wakeup_writer()` when the peer
+    /// window opens (UPD received via `apply_peer_update`).
+    #[inline]
+    pub fn register_write_waker(&self, waker: std::task::Waker) {
+        *self.write_waker.lock() = Some(waker);
+    }
+
     /// Push incoming data into the receive buffer.
     ///
     /// Routes through the zero-copy `Bytes` queue (same as `push_data_bytes`)
@@ -239,6 +282,8 @@ impl Stream {
         if data.is_empty() {
             return Ok(());
         }
+        // Route through the zero-copy Bytes queue (same as push_data_bytes)
+        // so the hot path does not use the legacy contiguous `recv_buf` (P1.4).
         self.push_data_bytes(Bytes::copy_from_slice(data))
     }
 
@@ -252,8 +297,11 @@ impl Stream {
         if data.is_empty() {
             return Ok(());
         }
+        let n = data.len();
         let mut recv = self.recv_buf_bytes.lock();
         recv.push_back(data);
+        self.recv_buf_bytes_avail
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         // Wake up any waiting reader
         self.wakeup_reader();
         Ok(())
@@ -281,6 +329,8 @@ impl Stream {
                     }
                 }
                 if offset > 0 {
+                    self.recv_buf_bytes_avail
+                        .fetch_sub(offset, std::sync::atomic::Ordering::Relaxed);
                     let was_empty =
                         self.bytes_read.fetch_add(offset as u32, Ordering::Relaxed) == 0;
                     let incr_val =
@@ -311,6 +361,10 @@ impl Stream {
         let to_read = buf.len().min(recv.len());
         buf[..to_read].copy_from_slice(&recv[..to_read]);
         recv.advance(to_read);
+        if to_read > 0 {
+            self.recv_buf_bytes_avail
+                .fetch_sub(to_read, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // V2 flow control: track incremental reads for UPD generation (matching Go)
         let was_empty = self.bytes_read.fetch_add(to_read as u32, Ordering::Relaxed) == 0;
@@ -370,6 +424,8 @@ impl Stream {
         }
         let n = data.len();
         self.send_buf.lock().push_back(data);
+        self.send_buf_bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         // Note: bytes_written tracks *on-wire* bytes (incremented in drain_send_max),
         // matching Go smux `numWritten` which advances only when frames are transmitted.
         Ok(n)
@@ -405,6 +461,8 @@ impl Stream {
             // Count transmitted bytes for peer-window inflight (Go numWritten).
             self.bytes_written
                 .fetch_add(drained as u32, Ordering::Relaxed);
+            self.send_buf_bytes
+                .fetch_sub(drained, std::sync::atomic::Ordering::Relaxed);
         }
         drained
     }
@@ -418,23 +476,13 @@ impl Stream {
     /// Get the number of bytes available to read.
     #[inline]
     pub fn available(&self) -> usize {
-        let n = self
-            .recv_buf_bytes
-            .lock()
-            .iter()
-            .map(|b| b.len())
-            .sum::<usize>();
-        if n > 0 {
-            return n;
-        }
-        // Legacy contiguous buffer (rare after push_data routes to Bytes).
-        self.recv_buf.lock().len()
+        self.recv_buf_bytes_avail.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the number of bytes waiting to be sent.
     #[inline]
     pub fn pending_send(&self) -> usize {
-        self.send_buf.lock().iter().map(|b| b.len()).sum()
+        self.send_buf_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Mark the remote side as closed.
@@ -501,6 +549,9 @@ impl Stream {
         self.recv_buf.lock().clear();
         self.recv_buf_bytes.lock().clear();
         self.send_buf.lock().clear();
+        // Reset atomic byte counters to match cleared buffers.
+        self.recv_buf_bytes_avail.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.send_buf_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         // Shrink legacy contiguous buffer capacity if it grew large.
         {
             let mut rb = self.recv_buf.lock();
@@ -512,9 +563,17 @@ impl Stream {
     }
 
     /// Apply a peer UPD frame (consumed + window) — matching Go `stream.update`.
+    ///
+    /// When the peer window opens (transition from 0 to positive or consumed
+    /// advances), this wakes any writers blocked in `poll_write()`.
     pub fn apply_peer_update(&self, consumed: u32, window: u32) {
+        let old_effective = self.peer_send_window();
         self.peer_consumed.store(consumed, Ordering::Release);
         self.peer_window.store(window, Ordering::Release);
+        // Wake writers if the window may have opened.
+        if old_effective == 0 && self.peer_send_window() > 0 {
+            self.wakeup_writer();
+        }
     }
 
     /// Disable write-side peer window (SMUX v1 has no UPD / no per-stream window).
@@ -574,8 +633,9 @@ impl Stream {
         self.remote_closed.store(true, Ordering::Release);
         *self.state.lock() = StreamState::Closed;
         self.clear_buffers();
-        // Wake up any waiting readers
+        // Wake up any waiting readers and writers
         self.fin_event();
+        self.wakeup_writer();
     }
 
     /// Get the number of bytes read in total.
@@ -588,6 +648,171 @@ impl Stream {
     #[inline]
     pub fn bytes_written_total(&self) -> u32 {
         self.bytes_written.load(Ordering::Relaxed)
+    }
+}
+
+/// Shared read logic for `AsyncRead` impls on `Stream` and `SmuxIo`.
+///
+/// Both tokio (via `ReadBuf`) and smol (via `&mut [u8]`) reduce to this
+/// after extracting the raw byte slice. Returns:
+/// - `Ok(0)` → EOF (stream closed or peer sent FIN)
+/// - `Ok(n)` → read `n` bytes
+/// - `Err(_)` → connection reset
+/// - `Pending` → would block, waker registered
+pub(crate) fn poll_read_into(
+    stream: &Stream,
+    waker: &std::task::Waker,
+    buf: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    match stream.read(buf) {
+        Ok((0, _)) => Poll::Ready(Ok(0)),
+        Ok((n, _)) => Poll::Ready(Ok(n)),
+        Err(StreamError::WouldBlock) => {
+            stream.register_read_waker(waker.clone());
+            // Re-check after registering (lost-wakeup race).
+            match stream.read(buf) {
+                Ok((0, _)) => Poll::Ready(Ok(0)),
+                Ok((n, _)) => Poll::Ready(Ok(n)),
+                Err(StreamError::WouldBlock) => Poll::Pending,
+                Err(StreamError::Closed) => Poll::Ready(Ok(0)),
+                Err(e) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("SMUX read error: {:?}", e),
+                ))),
+            }
+        }
+        Err(StreamError::Closed) => Poll::Ready(Ok(0)),
+        Err(e) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            format!("SMUX read error: {:?}", e),
+        ))),
+    }
+}
+
+// ─── kio::AsyncRead / AsyncWrite impls (standalone async support) ─────────
+
+#[cfg(feature = "tokio")]
+impl kio::AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut kio::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let space = buf.initialize_unfilled();
+        match poll_read_into(&self, cx.waker(), space) {
+            Poll::Ready(Ok(0)) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(n)) => {
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl kio::AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.local_closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMUX stream closed",
+            )));
+        }
+        // v2 write-side flow control: block when peer window is full.
+        let peer_win = self.peer_send_window();
+        if peer_win == 0 {
+            self.register_write_waker(cx.waker().clone());
+            // Re-check after registering waker (lost-wakeup race).
+            if self.peer_send_window() == 0 {
+                return Poll::Pending;
+            }
+        }
+        match self.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(StreamError::Closed) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMUX stream closed",
+            ))),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "SMUX write error",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Writes are buffered; flush is a no-op (the external flush loop
+        // drains send_buf through the Session). Standalone users should
+        // ensure Session::prepare_outbound_into is called to drain.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        debug!("Stream::poll_shutdown: marking stream {} local_closed", self.id);
+        self.mark_local_closed();
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "smol")]
+impl kio::AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        poll_read_into(&self, cx.waker(), buf)
+    }
+}
+
+#[cfg(feature = "smol")]
+impl kio::AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.local_closed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMUX stream closed",
+            )));
+        }
+        // v2 write-side flow control: block when peer window is full.
+        let peer_win = self.peer_send_window();
+        if peer_win == 0 {
+            self.register_write_waker(cx.waker().clone());
+            if self.peer_send_window() == 0 {
+                return Poll::Pending;
+            }
+        }
+        match self.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(StreamError::Closed) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMUX stream closed",
+            ))),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "SMUX write error",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        debug!("Stream::poll_close: marking stream {} local_closed", self.id);
+        self.mark_local_closed();
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -811,6 +1036,45 @@ mod tests {
             let (n, _) = stream.read_async(&mut buf).await.unwrap();
             assert_eq!(n, 9);
             assert_eq!(&buf[..9], b"last data");
+        });
+    }
+
+    #[test]
+    fn stream_poll_read_returns_data_via_trait() {
+        let mut stream = Stream::new(1);
+        stream.push_data(b"hello trait").unwrap();
+        kio::block_on(async {
+            use kio::AsyncReadExt;
+            let mut buf = [0u8; 32];
+            // &mut Stream implements AsyncRead via the blanket impl
+            // for T: AsyncRead + Unpin.
+            let n = (&mut stream).read(&mut buf).await.unwrap();
+            assert_eq!(n, 11);
+            assert_eq!(&buf[..11], b"hello trait");
+        });
+    }
+
+    #[test]
+    fn stream_poll_write_and_then_poll_read_shutdown() {
+        kio::block_on(async {
+            use kio::AsyncWriteExt;
+        let mut stream = Stream::new(1);
+
+            // Write some data via AsyncWrite trait
+            let n = (&mut stream).write(b"hello world").await.unwrap();
+            assert_eq!(n, 11);
+
+            // Verify via the sync method
+            assert_eq!(stream.pending_send(), 11);
+
+            // Shutdown (half-close local side).
+            // tokio's AsyncWriteExt provides shutdown(); futures_lite (smol)
+            // uses close() for the same semantic.
+            #[cfg(feature = "tokio")]
+            (&mut stream).shutdown().await.unwrap();
+            #[cfg(feature = "smol")]
+            (&mut stream).close().await.unwrap();
+            assert!(stream.is_local_closed());
         });
     }
 }

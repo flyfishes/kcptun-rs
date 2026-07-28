@@ -18,7 +18,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use crossbeam::queue::SegQueue;
 
 // ─── Wire constants ───────────────────────────────────────────────────────────
@@ -103,12 +103,6 @@ pub struct Segment {
     pub len: u32,
     /// Payload data.
     pub data: BytesMut,
-    /// Frozen, reference-counted view of the payload for retransmission sharing.
-    ///
-    /// Once set (via `freeze_payload`), retransmits and FEC paths can share this
-    /// `Bytes` without copying the user data again. Header fields (ts/wnd/una) are
-    /// still rewritten on each transmit, so only the payload portion is shared.
-    pub payload: Bytes,
     /// Number of retransmissions.
     pub resendts: u32,
     /// Retransmission timeout.
@@ -135,7 +129,6 @@ impl Segment {
             una: 0,
             len: 0,
             data: BytesMut::with_capacity(cap),
-            payload: Bytes::new(),
             resendts: 0,
             rto: 0,
             fastack: 0,
@@ -156,7 +149,6 @@ impl Segment {
         self.una = 0;
         self.len = 0;
         self.data.clear();
-        self.payload = Bytes::new();
         self.resendts = 0;
         self.rto = 0;
         self.fastack = 0;
@@ -181,11 +173,7 @@ impl Segment {
         hdr[20..24].copy_from_slice(&self.len.to_le_bytes());
         buf.put_slice(&hdr);
         if self.len > 0 {
-            if !self.payload.is_empty() {
-                buf.put_slice(&self.payload[..self.len as usize]);
-            } else {
-                buf.put_slice(&self.data[..self.len as usize]);
-            }
+            buf.put_slice(&self.data[..self.len as usize]);
         }
         KCP_OVERHEAD + self.len as usize
     }

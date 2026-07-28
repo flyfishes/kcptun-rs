@@ -202,6 +202,11 @@ fn send_and_recv(cli_port: u16, data: &[u8], timeout_secs: u64) -> Result<Vec<u8
     s.set_write_timeout(Some(Duration::from_secs(15))).ok();
     s.write_all(data).map_err(|e| format!("write: {}", e))?;
     s.flush().map_err(|e| format!("flush: {}", e))?;
+    // Give the flush loop time to drain data through KCP before triggering FIN.
+    // Under high concurrency (100 streams on 1 KCP channel), the drain cycles
+    // need time to move data from SMUX send_buf through KCP. Without this
+    // pause, FIN can arrive at the echo server before all data, truncating echo.
+    thread::sleep(Duration::from_millis(500));
 
     // Half-close: signal to echo server that we're done sending
     let _ = s.shutdown(std::net::Shutdown::Write);

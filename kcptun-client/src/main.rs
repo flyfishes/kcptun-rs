@@ -514,7 +514,7 @@ struct KcpConn {
     /// `Vec` alloc + `extend_from_slice` copy (R2: output Bytes pipeline).
     raw_packets: Arc<parking_lot::Mutex<Vec<bytes::Bytes>>>,
     /// Shared atomic counter of KCP wait_send, updated by the flush loop.
-    /// Read by SmuxStreamAsync::poll_write for backpressure.
+    /// Read by SmuxIo::poll_write for backpressure.
     wait_send: Arc<AtomicUsize>,
     /// KCP send window size, used for backpressure threshold.
     snd_wnd: usize,
@@ -1112,69 +1112,13 @@ impl KcpConn {
                     health_checks_left -= 1;
                 }
 
-                // ── Phase 1: Drain SMUX + encode frames into out_buf (NO KCP lock) ──
-                // Header reserved first, payload drained in place, length patched —
-                // no to_vec / data.clone() chain (P0.3).
-                // Note: out_buf already cleared at the top of the cycle (before Phase 0).
-                // Phase 0 may have queued a NOP keepalive, so do NOT clear here.
-                {
-                    let streams = smux2.streams();
-                    let stream_map = streams.lock();
-                    // Drain ALL pending SMUX bytes (multiple frames per stream).
-                    // Cap total bytes per cycle to keep KCP send under control.
-                    const MAX_DRAIN_BYTES: usize = 64 * 1024;
-                    let mut drained_total = 0usize;
-                    'outer: for (id, s) in stream_map.iter() {
-                        loop {
-                            if drained_total >= MAX_DRAIN_BYTES {
-                                break 'outer;
-                            }
-                            let header_pos = out_buf.len();
-                            smux_rs::frame::Frame::encode_header_into(
-                                &mut out_buf,
-                                smuxver,
-                                smux_rs::frame::Cmd::Psh,
-                                *id,
-                                0,
-                            );
-                            let n = s.drain_send_max(&mut out_buf, smux_rs::frame::MAX_FRAME_SIZE);
-                            if n == 0 {
-                                out_buf.truncate(header_pos);
-                                break;
-                            }
-                            smux_rs::frame::Frame::patch_header_length(
-                                &mut out_buf,
-                                header_pos,
-                                n as u16,
-                            );
-                            drained_total += n;
-                        }
-                    }
-                }
-
-                // ── Phase 1a: Collect FIN candidates (do NOT mark yet) ──
-                // mark_fin_sent only after kcp.send succeeds (BUGREPORT.md deadlock class).
-                let fin_candidates: Vec<u32> = {
-                    let streams = smux2.streams();
-                    let stream_map = streams.lock();
-                    stream_map
-                        .iter()
-                        .filter(|(_, s)| {
-                            s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent()
-                        })
-                        .map(|(id, _)| *id)
-                        .collect()
-                };
-                for &stream_id in &fin_candidates {
-                    debug!("flush: encoding FIN for stream {}", stream_id);
-                    smux_rs::frame::Frame::encode_header_into(
-                        &mut out_buf,
-                        smuxver,
-                        smux_rs::frame::Cmd::Fin,
-                        stream_id,
-                        0,
-                    );
-                }
+                // ── Phase 1: Prepare outbound SMUX frames (PSH + FINs + UPDs) ──
+                // Unified API. Same zero-copy drain_send_max path, single copy into
+                // out_buf, peer window respected, FIN headers encoded for eligible
+                // streams (mark only after kcp.send success). Replaces previous
+                // manual Phase 1/1a/1c. Reaping stays below as policy.
+                const MAX_DRAIN_BYTES: usize = 64 * 1024;
+                let fin_ids: Vec<u32> = smux2.prepare_outbound_into(&mut out_buf, MAX_DRAIN_BYTES, smuxver);
 
                 // ── Phase 1b: Reap fully closed + local-closed past linger ──
                 // Linger bounds map growth when peer FIN is lost (proxy short-connect leak).
@@ -1209,51 +1153,39 @@ impl KcpConn {
                     drop(stream_map);
                 }
 
-                // ── Phase 1c: Drain UPD frames (matching Go's sendWindowUpdate) ──
-                smux2.check_upd();
-                let upd_before = out_buf.len();
-                for upd in smux2.take_upd_frames() {
-                    smux_rs::frame::Frame::encode_header_into(
-                        &mut out_buf,
-                        smuxver,
-                        smux_rs::frame::Cmd::Upd,
-                        upd.stream_id,
-                        8,
-                    );
-                    out_buf.extend_from_slice(&upd.consumed.to_le_bytes());
-                    out_buf.extend_from_slice(&upd.window.to_le_bytes());
-                }
-                if out_buf.len() > upd_before {
-                    debug!(
-                        "SMUX: UPD frames appended ({} -> {} bytes)",
-                        upd_before,
-                        out_buf.len()
-                    );
-                }
-
                 // ── Phase 2: Snappy compress OUTSIDE KCP lock (P0.4) ──
                 // Matches server Phase 3/4 split — keeps ACK path unblocked.
                 // Large flushes offload to cpu_block so the reactor can process
                 // UDP/ACKs concurrently (esp. smol). Small flushes stay inline.
-                let send_data: Option<Vec<u8>> = if out_buf.is_empty() {
+                //
+                // `send_data` is `Option<bytes::Bytes>` — zero-copy reference-
+                // counted slice. Both the compress path (Vec→Bytes via into())
+                // and the nocomp path (BytesMut→Bytes via freeze()) avoid an
+                // extra copy compared to the previous `Vec<u8>` pipeline.
+                let send_data: Option<bytes::Bytes> = if out_buf.is_empty() {
                     None
                 } else if !nocomp2 {
                     use std::io::Write;
-                    let plain = out_buf.split().to_vec();
+                    let plain = out_buf.split().freeze();
                     let plain_len = plain.len();
                     let compress_fn = {
                         let compressor = compressor2.clone();
-                        move || {
+                        move || -> bytes::Bytes {
                             let mut enc = compressor.lock();
                             enc.write_all(&plain).ok();
                             enc.flush().ok();
-                            std::mem::take(enc.get_mut())
+                            // Vec<u8> → Bytes is zero-copy (into_bytes).
+                            std::mem::take(enc.get_mut()).into()
                         }
                     };
-                    let compressed = if kcp_rs::should_cpu_block_compress(plain_len)
-                        && !has_encryption2
-                        && !has_aead2
-                    {
+                    // P0: Always offload snappy to cpu_block when the batch is large
+                    // enough. Previously, snappy was kept inline when has_encryption
+                    // was true to avoid a "double pool hop" (snappy on pool, then
+                    // encrypt on pool). However, running snappy inline blocks the
+                    // tokio worker thread, preventing it from processing UDP recv /
+                    // ACKs. The throughput cost of blocking the worker far exceeds
+                    // the latency cost of a second pool hop.
+                    let compressed = if kcp_rs::should_cpu_block_compress(plain_len) {
                         kio::cpu_block(compress_fn).await
                     } else {
                         compress_fn()
@@ -1264,7 +1196,7 @@ impl KcpConn {
                         Some(compressed)
                     }
                 } else {
-                    Some(out_buf.split().to_vec())
+                    Some(out_buf.split().freeze())
                 };
 
                 // ── Phase 3: kcp.send + flush only (KCP lock held briefly) ──
@@ -1298,17 +1230,17 @@ impl KcpConn {
                                 offset = end;
                             }
                             // Only mark FIN after the whole batch was accepted by KCP.
-                            if send_ok && !fin_candidates.is_empty() {
+                            if send_ok && !fin_ids.is_empty() {
                                 let streams = smux2.streams();
                                 let stream_map = streams.lock();
-                                for id in &fin_candidates {
+                                for id in &fin_ids {
                                     if let Some(s) = stream_map.get(id) {
                                         s.mark_fin_sent();
                                     }
                                 }
                             }
                         }
-                    } else if !fin_candidates.is_empty() {
+                    } else if !fin_ids.is_empty() {
                         // FIN-only cycle (no PSH/UPD payload after compress empty path handled above).
                         // fin frames live in send_data when out_buf non-empty; if send_data is None
                         // there was nothing to send — leave fin_sent false for retry.
@@ -1472,242 +1404,6 @@ impl KcpConn {
             return true;
         }
         false
-    }
-}
-
-// ─── SMUX Async Wrapper ─────────────────────────────────────────────────────────
-
-/// An async wrapper around an SMUX stream, implementing AsyncRead + AsyncWrite.
-struct SmuxStreamAsync {
-    stream: Arc<smux_rs::stream::Stream>,
-    /// Shared counter of KCP wait_send, updated by the flush loop.
-    /// Used for backpressure: when wait_send is too high, poll_write
-    /// returns Pending to stop the pipe from flooding KCP.
-    wait_send: Arc<AtomicUsize>,
-    /// KCP send window, used as the backpressure threshold.
-    snd_wnd: usize,
-    /// Notify for waking up the flush loop immediately on new data.
-    flush_notify: Arc<kio::Notify>,
-    /// Wakes writers blocked on KCP send-window backpressure.
-    /// Signaled from the UDP-ACK path and the flush loop (same role as
-    /// Go kcp-go's `chWriteEvent`).
-    write_notify: Arc<kio::Notify>,
-    /// Ensures at most one backpressure waiter task is armed.
-    bp_armed: Arc<AtomicBool>,
-}
-
-impl SmuxStreamAsync {
-    fn new(
-        stream: Arc<smux_rs::stream::Stream>,
-        wait_send: Arc<AtomicUsize>,
-        snd_wnd: usize,
-        flush_notify: Arc<kio::Notify>,
-        write_notify: Arc<kio::Notify>,
-    ) -> Self {
-        SmuxStreamAsync {
-            stream,
-            wait_send,
-            snd_wnd,
-            flush_notify,
-            write_notify,
-            bp_armed: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Park until KCP send window has room, then wake the poller.
-    ///
-    /// Prefers `write_notify` (ACK / flush driven). A short timeout is only a
-    /// safety net for the rare lost-wakeup race with `notify_waiters` (which
-    /// does not store a permit). At most one waiter task is armed at a time.
-    fn arm_backpressure_wake(this: &Self, cx: &mut Context<'_>) {
-        // Always refresh the waker for the current poller.
-        let waker = cx.waker().clone();
-        if this
-            .bp_armed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            // Already armed — still re-check after a short yield so a race
-            // where the waiter just exited cannot stall forever.
-            let bp_armed = this.bp_armed.clone();
-            let wait_send = this.wait_send.clone();
-            let snd_wnd = this.snd_wnd;
-            kio::spawn_task(async move {
-                kio::sleep_ms(1).await;
-                if wait_send.load(Ordering::Relaxed) < snd_wnd {
-                    waker.wake();
-                } else if !bp_armed.load(Ordering::Acquire) {
-                    // Previous waiter finished while still blocked; re-arm path
-                    // will run on next poll. Wake so we re-enter poll_write.
-                    waker.wake();
-                }
-            });
-            return;
-        }
-        let write_notify = this.write_notify.clone();
-        let wait_send = this.wait_send.clone();
-        let snd_wnd = this.snd_wnd;
-        let bp_armed = this.bp_armed.clone();
-        kio::spawn_task(async move {
-            loop {
-                let _ = kio::timeout(Duration::from_millis(2), write_notify.notified()).await;
-                if wait_send.load(Ordering::Relaxed) < snd_wnd {
-                    bp_armed.store(false, Ordering::Release);
-                    waker.wake();
-                    return;
-                }
-            }
-        });
-    }
-}
-
-// ── tokio AsyncRead/AsyncWrite (uses ReadBuf) ──
-#[cfg(feature = "tokio")]
-impl AsyncRead for SmuxStreamAsync {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let space = buf.initialize_unfilled();
-        match this.stream.read(space) {
-            Ok((0, _)) => Poll::Ready(Ok(())),
-            Ok((n, _)) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
-            }
-            Err(smux_rs::stream::StreamError::WouldBlock) => {
-                this.stream.register_read_waker(cx.waker().clone());
-                let space = buf.initialize_unfilled();
-                match this.stream.read(space) {
-                    Ok((0, _)) => Poll::Ready(Ok(())),
-                    Ok((n, _)) => {
-                        buf.advance(n);
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(smux_rs::stream::StreamError::WouldBlock) => Poll::Pending,
-                    Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("SMUX stream read error: {:?}", e),
-                    ))),
-                }
-            }
-            Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("SMUX stream read error: {:?}", e),
-            ))),
-        }
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl AsyncWrite for SmuxStreamAsync {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let ws = this.wait_send.load(Ordering::Relaxed);
-        if ws >= this.snd_wnd {
-            Self::arm_backpressure_wake(this, cx);
-            return Poll::Pending;
-        }
-        match this.stream.write(buf) {
-            Ok(n) => {
-                // Wake up the flush loop immediately so it drains SMUX
-                // and sends through KCP without waiting for the timer.
-                this.flush_notify.notify_one();
-                Poll::Ready(Ok(n))
-            }
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "SMUX stream write error",
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().stream.mark_local_closed();
-        Poll::Ready(Ok(()))
-    }
-}
-
-// ── smol AsyncRead/AsyncWrite (uses &mut [u8]) ──
-#[cfg(feature = "smol")]
-impl AsyncRead for SmuxStreamAsync {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match this.stream.read(buf) {
-            Ok((0, _)) => Poll::Ready(Ok(0)),
-            Ok((n, _)) => Poll::Ready(Ok(n)),
-            Err(smux_rs::stream::StreamError::WouldBlock) => {
-                this.stream.register_read_waker(cx.waker().clone());
-                match this.stream.read(buf) {
-                    Ok((0, _)) => Poll::Ready(Ok(0)),
-                    Ok((n, _)) => Poll::Ready(Ok(n)),
-                    Err(smux_rs::stream::StreamError::WouldBlock) => Poll::Pending,
-                    Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(0)),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("SMUX stream read error: {:?}", e),
-                    ))),
-                }
-            }
-            Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(0)),
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("SMUX stream read error: {:?}", e),
-            ))),
-        }
-    }
-}
-
-#[cfg(feature = "smol")]
-impl AsyncWrite for SmuxStreamAsync {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let ws = this.wait_send.load(Ordering::Relaxed);
-        if ws >= this.snd_wnd {
-            Self::arm_backpressure_wake(this, cx);
-            return Poll::Pending;
-        }
-        match this.stream.write(buf) {
-            Ok(n) => {
-                // Wake up the flush loop immediately so it drains SMUX
-                // and sends through KCP without waiting for the timer.
-                this.flush_notify.notify_one();
-                Poll::Ready(Ok(n))
-            }
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "SMUX stream write error",
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().stream.mark_local_closed();
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -1932,11 +1628,11 @@ async fn handle_client(
     write_notify: Arc<kio::Notify>,
     closewait: u64,
 ) -> Result<()> {
-    let smux_async = SmuxStreamAsync::new(
+    let smux_async = smux_rs::SmuxIo::with_backpressure(
         smux_stream.clone(),
+        flush_notify,
         wait_send,
         snd_wnd,
-        flush_notify,
         write_notify,
     );
 
@@ -1964,8 +1660,15 @@ async fn handle_client(
     // Local half-close only. Do NOT mark_fin_sent here — that blocked the flush
     // loop from ever encoding a real FIN (BUGREPORT_PROXY_MEMORY_GROWTH).
     // Flush marks fin_sent after FIN is queued; linger reaps if peer never FINs.
+    //
+    // IMPORTANT: Do NOT call clear_buffers() here. The flush loop may still have
+    // data in the stream's send_buf that has been written by the pipe but not yet
+    // drained and sent through KCP. Clearing buffers would discard unsent data,
+    // causing silent data loss (observed in stress tests as truncated/zero responses).
+    // The flush loop is responsible for draining send_buf, sending FIN after drain,
+    // and the linger reaper will eventually clear buffers after is_fin_sent + timeout.
     smux_stream.mark_local_closed();
-    smux_stream.clear_buffers();
+    // Do not clear buffers — let flush drain and linger reap.
 
     match pipe_result {
         Ok((a, b)) => {
@@ -2344,7 +2047,7 @@ async fn async_main() -> Result<()> {
                 info!("accepted connection from {} (stream {})", peer, stream_id);
 
                 let conn = &conns[idx];
-                let qpp_key = key_str.as_bytes().to_vec();
+                let qpp_key = key.to_vec();
                 let ws = conn.wait_send.clone();
                 let sw = conn.snd_wnd;
                 let flush_notify_ref = conn.flush_notify.clone();

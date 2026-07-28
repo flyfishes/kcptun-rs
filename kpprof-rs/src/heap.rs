@@ -9,14 +9,33 @@
 //! - Sampling rate: 1 allocation per `sample_rate` bytes (default 524288 = 512KB,
 //!   matching Go `runtime.MemProfileRate`).
 //! - Fast path: atomic counter increment (no backtrace).
-//! - Slow path (sample hit): capture `backtrace::Backtrace`, record in global map.
+//! - Slow path (sample hit): capture raw stack addresses via `backtrace::trace()`
+//!   (NO symbolization — avoids `addr2line` `OnceCell` reentrant init panics
+//!   when the `pprof` crate's CPU profiler or its `trigger_lazy()` is active).
+//! - Symbolization is deferred to `build_profile()` via `backtrace::resolve()`.
 //! - Zero-cost when `sample_rate == 0` (profiling disabled).
 
 use std::alloc::{GlobalAlloc, Layout};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::SystemTime;
+
+// ─── Re-entrance guard ───────────────────────────────────────────────────────
+//
+// `record_sample` calls `backtrace::trace()` on the slow path, which itself
+// allocates memory. Without a guard, those re-entrant allocations would call
+// `record_sample` again, potentially capturing another backtrace, which
+// allocates again, etc. This creates a deep recursion that overflows the stack
+// in profiling builds (`debug = 2`, `lto = false` — no inlining means each
+// frame is large).
+//
+// The guard is a thread-local `Cell<bool>` with `const` initialization, so it
+// never allocates and adds only a single pointer dereference to the fast path.
+thread_local! {
+    static IN_SAMPLE: Cell<bool> = const { Cell::new(false) };
+}
 
 use pprof::protos::{self as protos, Message};
 use parking_lot::Mutex;
@@ -45,13 +64,29 @@ fn ensure_profile_start() {
     }
 }
 
+/// FNV-1a hash for stack deduplication. Zero-allocation (unlike DefaultHasher).
+fn fnv1a_hash(data: &[usize]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &addr in data {
+        hash ^= addr as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 // ─── Allocation sample records ───────────────────────────────────────────────
+
+/// Maximum stack depth captured per sample. 64 frames covers virtually all
+/// real-world async/tokio stacks without heap allocation.
+const MAX_STACK_DEPTH: usize = 64;
 
 /// A single allocation sample (one unique call stack).
 #[derive(Clone)]
 struct AllocSample {
-    /// Rich frames (demangled name, filename, line) captured at sample time.
-    frames: Vec<Frame>,
+    /// Raw stack addresses captured at sample time via `backtrace::trace()`.
+    /// Symbolization is deferred to `build_profile()` to avoid `addr2line`
+    /// `OnceCell` reentrant init panics in the allocator hot path.
+    addresses: Vec<usize>,
     /// Total bytes allocated at this stack.
     alloc_bytes: u64,
     /// Total allocation count at this stack.
@@ -61,7 +96,8 @@ struct AllocSample {
     free_count: u64,
 }
 
-/// Structured frame info for better Go pprof compatibility (filename + line).
+/// Structured frame info for Go pprof compatibility (filename + line).
+/// Resolved from raw addresses during `build_profile()`.
 #[derive(Clone, Debug)]
 struct Frame {
     name: String,
@@ -89,6 +125,13 @@ fn record_sample(is_alloc: bool, size: usize) {
         return;
     }
 
+    // Prevent re-entrant sampling: if we're already capturing a backtrace (which
+    // allocates internally), skip sampling for those allocations to avoid
+    // unbounded recursion that would overflow the stack.
+    if IN_SAMPLE.with(|f| f.get()) {
+        return;
+    }
+
     // Atomically increment counter and check if we should sample.
     let prev = ALLOC_COUNTER.fetch_add(size, Ordering::Relaxed);
     let curr = prev.wrapping_add(size);
@@ -98,45 +141,36 @@ fn record_sample(is_alloc: bool, size: usize) {
         return; // Same bucket — skip.
     }
 
+    // Set the re-entrance guard BEFORE any operation that might trigger a
+    // re-entrant allocation (ensure_profile_start, backtrace::trace, etc).
+    IN_SAMPLE.with(|f| f.set(true));
+
     // Ensure we have a start time for time_nanos/duration_nanos.
     ensure_profile_start();
 
-    // Capture backtrace on the slow path.
-    let bt = backtrace::Backtrace::new();
-    let frames: Vec<Frame> = bt
-        .frames()
-        .iter()
-        .flat_map(|f| f.symbols())
-        .map(|s| {
-            let name = s
-                .name()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let filename = s
-                .filename()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let lineno = s.lineno().unwrap_or(0);
-            Frame {
-                name: name.clone(),
-                sys_name: name, // backtrace gives demangled; system_name can be same
-                filename,
-                lineno,
-            }
-        })
-        .collect();
-
-    // Hash on the structured frames (name + file + line) for stability.
-    let hash: u64 = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for fr in &frames {
-            fr.name.hash(&mut hasher);
-            fr.filename.hash(&mut hasher);
-            fr.lineno.hash(&mut hasher);
+    // Capture raw stack addresses via backtrace::trace().
+    // This does NOT trigger addr2line symbolization, avoiding OnceCell
+    // reentrant init panics when the pprof CPU profiler's signal handler
+    // or trigger_lazy() is active.
+    //
+    // Use a stack-allocated array to avoid heap allocation in the slow path
+    // (which would trigger madvise/mimalloc overhead and distort the profile).
+    let mut addresses: [usize; MAX_STACK_DEPTH] = [0; MAX_STACK_DEPTH];
+    let mut depth: usize = 0;
+    backtrace::trace(|frame| {
+        if depth < MAX_STACK_DEPTH {
+            addresses[depth] = frame.ip() as usize;
+            depth += 1;
+            true
+        } else {
+            false // stop — stack too deep
         }
-        hasher.finish()
-    };
+    });
+    let addr_slice = &addresses[..depth];
+
+    // Hash on the raw addresses for stack deduplication.
+    // Use FNV-1a (no allocation, unlike DefaultHasher which allocates).
+    let hash: u64 = fnv1a_hash(addr_slice);
 
     let mut guard = SAMPLES.lock();
     if guard.is_none() {
@@ -144,7 +178,7 @@ fn record_sample(is_alloc: bool, size: usize) {
     }
     let map = guard.as_mut().unwrap();
     let sample = map.entry(hash).or_insert_with(|| AllocSample {
-        frames,
+        addresses: addr_slice.to_vec(),
         alloc_bytes: 0,
         alloc_count: 0,
         free_bytes: 0,
@@ -160,6 +194,9 @@ fn record_sample(is_alloc: bool, size: usize) {
         sample.free_count += 1;
         TOTAL_FREE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
     }
+
+    // Clear the re-entrance guard.
+    IN_SAMPLE.with(|f| f.set(false));
 }
 
 // ─── Profiling allocator ─────────────────────────────────────────────────────
@@ -217,6 +254,80 @@ unsafe impl GlobalAlloc for ProfilingAllocator {
     }
 }
 
+// ─── Symbolization (deferred from record_sample) ─────────────────────────────
+
+/// Resolve a raw address to a `Frame` using `backtrace::resolve()`.
+///
+/// This is called during `build_profile()`, NOT during `record_sample()`, to
+/// avoid `addr2line` `OnceCell` reentrant init panics in the allocator path.
+fn resolve_address(addr: usize) -> Frame {
+    let mut name = "<unknown>".to_string();
+    let mut filename = String::new();
+    let mut lineno = 0u32;
+
+    backtrace::resolve(addr as *mut std::ffi::c_void, |sym| {
+        if let Some(n) = sym.name() {
+            name = n.to_string();
+        }
+        if let Some(f) = sym.filename() {
+            filename = f.to_string_lossy().into_owned();
+        }
+        if let Some(l) = sym.lineno() {
+            lineno = l;
+        }
+    });
+
+    Frame {
+        sys_name: name.clone(),
+        name,
+        filename,
+        lineno,
+    }
+}
+
+/// Check if a symbolized frame belongs to the profiling infrastructure.
+///
+/// These frames are captured by `backtrace::trace()` inside `record_sample()`
+/// and must be stripped so that the leaf frame is the actual allocation site.
+fn is_profiling_frame(name: &str) -> bool {
+    // Match on substrings that cover both debug and release (mangled) names.
+    // `record_sample` — the sampling function itself
+    // `ProfilingAllocator` — alloc/dealloc/alloc_zeroed/realloc wrappers
+    // `backtrace::trace` — the backtrace crate's trace entry point
+    // `backtrace::backtrace` — internal backtrace impl
+    name.contains("record_sample")
+        || name.contains("ProfilingAllocator")
+        || name.contains("backtrace::trace")
+        || name.contains("backtrace::backtrace")
+        || name.contains("kpprof::heap")
+}
+
+/// Remove leading (leaf-side) frames that belong to the profiling allocator.
+///
+/// `backtrace::trace()` captures frames from leaf (innermost) to root. The
+/// first few frames are always `record_sample` → `ProfilingAllocator::alloc`
+/// → … They must be stripped so `go tool pprof` attributes `flat` to the real
+/// caller, not to the profiler.
+fn skip_profiling_frames(frames: Vec<Frame>) -> Vec<Frame> {
+    let mut iter = frames.into_iter();
+    let mut skipped = Vec::new();
+
+    // Skip all leading profiling-internal frames.
+    for fr in iter.by_ref() {
+        if is_profiling_frame(&fr.name) {
+            skipped.push(fr);
+        } else {
+            // First non-profiling frame — keep it as the new leaf.
+            let mut result = vec![fr];
+            result.extend(iter);
+            return result;
+        }
+    }
+
+    // All frames were profiling-internal (shouldn't happen, but guard anyway).
+    skipped
+}
+
 // ─── pprof protobuf generation ───────────────────────────────────────────────
 
 /// Build a Go pprof protobuf for heap (inuse_space + alloc_space).
@@ -237,6 +348,21 @@ fn build_profile(heap: bool) -> Vec<u8> {
     // compatibility with `go tool pprof`. We always emit a valid Profile
     // (with 0 or more samples) so that /debug/pprof/heap is always usable,
     // matching Go's net/http/pprof behavior.
+
+    // 0) Symbolize raw addresses → Frame structs.
+    //    This is the ONLY place symbolization happens, safely outside the
+    //    allocator hot path and any signal handler context.
+    //
+    //    Skip leading (leaf) frames that belong to the profiling infrastructure
+    //    itself (record_sample, ProfilingAllocator::alloc/dealloc/realloc,
+    //    backtrace::trace). Without this, `record_sample` becomes the leaf and
+    //    gets 100% flat attribution, masking the real allocation caller.
+    let mut symbolized: HashMap<u64, (Vec<Frame>, &AllocSample)> = HashMap::new();
+    for (hash, sample) in &samples {
+        let all_frames: Vec<Frame> = sample.addresses.iter().map(|&a| resolve_address(a)).collect();
+        let frames: Vec<Frame> = skip_profiling_frames(all_frames);
+        symbolized.insert(*hash, (frames, sample));
+    }
 
     // 1) Collect unique strings. string_table[0] must be "".
     let mut dedup: HashSet<String> = HashSet::new();
@@ -265,8 +391,8 @@ fn build_profile(heap: bool) -> Vec<u8> {
         }
     }
 
-    for s in samples.values() {
-        for fr in &s.frames {
+    for (frames, _) in symbolized.values() {
+        for fr in frames {
             dedup.insert(fr.name.clone());
             dedup.insert(fr.sys_name.clone());
             dedup.insert(fr.filename.clone());
@@ -317,10 +443,10 @@ fn build_profile(heap: bool) -> Vec<u8> {
 
     let mut pb_samples: Vec<protos::Sample> = Vec::new();
 
-    for sample in samples.values() {
+    for (frames, sample) in symbolized.values() {
         let mut loc_ids: Vec<u64> = Vec::new();
 
-        for fr in &sample.frames {
+        for fr in frames {
             let key = (fr.name.clone(), fr.filename.clone(), fr.lineno);
             let func_id = *func_map.entry(key.clone()).or_insert_with(|| {
                 let id = (fn_tbl.len() as u64) + 1;
@@ -456,24 +582,16 @@ mod tests {
         ALLOC_COUNTER.store(0, Ordering::Relaxed);
     }
 
-    fn seed(frames: Vec<Frame>, a_bytes: u64, a_cnt: u64, f_bytes: u64, f_cnt: u64) {
-        let hash: u64 = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            for fr in &frames {
-                fr.name.hash(&mut h);
-                fr.filename.hash(&mut h);
-                fr.lineno.hash(&mut h);
-            }
-            h.finish()
-        };
+    /// Seed a sample with raw addresses (for testing protobuf structure).
+    fn seed(addresses: Vec<usize>, a_bytes: u64, a_cnt: u64, f_bytes: u64, f_cnt: u64) {
+        let hash = fnv1a_hash(&addresses);
         let mut g = SAMPLES.lock();
         if g.is_none() {
             *g = Some(HashMap::new());
         }
         let m = g.as_mut().unwrap();
         let e = m.entry(hash).or_insert_with(|| AllocSample {
-            frames,
+            addresses,
             alloc_bytes: 0,
             alloc_count: 0,
             free_bytes: 0,
@@ -511,13 +629,9 @@ mod tests {
     fn heap_profile_roundtrips_via_protos() {
         let _g = TEST_SERIAL.lock();
         reset_state(1);
-        let fr = Frame {
-            name: "my::func".into(),
-            sys_name: "my::func".into(),
-            filename: "src/x.rs".into(),
-            lineno: 123,
-        };
-        seed(vec![fr], 8192, 4, 2048, 2);
+        // Use a dummy address (0x1000) — symbolization will resolve to "<unknown>"
+        // but the protobuf structure should still be valid.
+        seed(vec![0x1000], 8192, 4, 2048, 2);
 
         let bytes = build_heap_profile();
         assert!(!bytes.is_empty());
@@ -544,13 +658,7 @@ mod tests {
     fn allocs_profile_has_alloc_labels() {
         let _g = TEST_SERIAL.lock();
         reset_state(1);
-        let fr = Frame {
-            name: "alloc_site".into(),
-            sys_name: "alloc_site".into(),
-            filename: "src/a.rs".into(),
-            lineno: 1,
-        };
-        seed(vec![fr], 1024, 1, 0, 0);
+        seed(vec![0x2000], 1024, 1, 0, 0);
 
         let bytes = build_allocs_profile();
         let prof = protos::Profile::parse_from_bytes(&bytes).unwrap();
@@ -567,13 +675,7 @@ mod tests {
     fn values_match_sample_type_count() {
         let _g = TEST_SERIAL.lock();
         reset_state(1);
-        let fr = Frame {
-            name: "v".into(),
-            sys_name: "v".into(),
-            filename: "f.rs".into(),
-            lineno: 9,
-        };
-        seed(vec![fr], 555, 3, 111, 1);
+        seed(vec![0x3000], 555, 3, 111, 1);
 
         for bytes in [build_heap_profile(), build_allocs_profile()] {
             if bytes.is_empty() {

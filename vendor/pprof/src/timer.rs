@@ -22,7 +22,19 @@ extern "C" {
     fn setitimer(which: c_int, new_value: *mut Itimerval, old_value: *mut Itimerval) -> c_int;
 }
 
-const ITIMER_PROF: c_int = 2;
+// Use ITIMER_REAL (wall-clock) instead of ITIMER_PROF (CPU-only).
+//
+// ITIMER_PROF only fires during CPU execution, NOT during syscall blocking.
+// For I/O-bound servers (tokio/mio), 99% of time is spent in kevent/epoll_wait
+// syscalls where ITIMER_PROF doesn't fire, yielding <1% sample coverage.
+//
+// ITIMER_REAL fires based on wall-clock time, matching Go's runtime profiler
+// behavior on macOS. This gives realistic sample counts (~frequency * duration)
+// and shows where wall time is actually spent (including I/O wait).
+//
+// ITIMER_REAL generates SIGALRM (not SIGPROF); the signal handler in
+// profiler.rs is updated accordingly.
+const ITIMER_REAL: c_int = 0;
 
 pub struct Timer {
     pub frequency: c_int,
@@ -41,7 +53,7 @@ impl Timer {
 
         unsafe {
             setitimer(
-                ITIMER_PROF,
+                ITIMER_REAL,
                 &mut Itimerval {
                     it_interval,
                     it_value,
@@ -77,7 +89,7 @@ impl Drop for Timer {
         let it_value = it_interval.clone();
         unsafe {
             setitimer(
-                ITIMER_PROF,
+                ITIMER_REAL,
                 &mut Itimerval {
                     it_interval,
                     it_value,

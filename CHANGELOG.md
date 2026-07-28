@@ -7,6 +7,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Refactor — Rust idioms & style compliance (kcp-rs, kcrypt-rs, smux-rs)
+
+- **kcp-rs** — Go-style残留清理 + 性能优化:
+  - `itimediff` 泛型化为 `impl Into<u64>`，接受 `u32` KCP 字段和 `u64` 时间戳无需显式转换
+  - `current_ms()` 返回 `u64`（防止 ~49.7 天后 32 位溢出），调用 KCP 32 位 API 时单次截断
+  - `peeksize()` 返回 `Option<usize>` 替代 `i32` 哨兵值 `-1`
+  - `AckEntry` 结构体替代 `acklist` 匿名元组 `(u32, u32)`
+  - `DEAD_LINK_STATE` 常量替代 `0xFFFFFFFF` 魔法数字
+  - `parse_data` 合并重复检测 + 插入位置查找为单次遍历（原两次 O(n)）
+  - `snmp::{self as snmp}` → `snmp::{self}` 去冗余别名
+  - `_itimediff` → `itimediff` 去掉 Go 风格 `_` 前缀
+- **kcrypt-rs** — `select_block_crypt` 委托 `CryptEngine::select`，消除 ~40 行重复 match 代码
+- **smux-rs** — `new_client` / `new_server` 合并为内部 `new(config, is_client)`；`available()` / `pending_send()` 用 `AtomicUsize` 计数器替代每次加锁遍历求和
+
+**Testing:** all 201 workspace tests pass, clippy clean (`-D warnings`).
+
+### Perf — P1: channel-based blocking pool for tokio `cpu_block`
+
+- **Replaced `tokio::task::spawn_blocking`** in `kio::cpu_block` (tokio backend)
+  with a persistent thread pool + `async_channel` job dispatch, mirroring smol's
+  `BlockingPool` implementation.
+  - N pre-spawned worker threads (N = `available_parallelism().clamp(2, 8)`)
+  - Unbounded `async_channel` for job submission (never blocks the async worker)
+  - Bounded(1) `async_channel` for result return (caller `.await`s without blocking)
+  - Linux: workers pinned to cores via `sched_setaffinity` (matching smol)
+  - Eliminates per-call task alloc + schedule + wake + dealloc from `spawn_blocking`
+- **`block_on` unchanged** — the stack overflow root cause was fixed separately
+  via the re-entrance guard in `kpprof-rs/src/heap.rs`.
+
+**Benchmark results** (bench_quick.py, 10MB×4, macOS arm64, release LTO):
+
+| Scenario | Before P1 (MB/s) | After P1 (MB/s) | Improvement |
+|----------|-------------------|------------------|-------------|
+| none/no-comp | ~31.6 | ~65.7 | +108% (2.1×) |
+| null/no-comp | ~34.7 | ~54.4 | +57% |
+| aes-128-gcm/no-comp | ~34.1 | ~55.2 | +62% |
+| 3des/comp (post P0) | ~15.5 | ~15.5 | No regression |
+
+The `spawn_blocking` overhead was the dominant bottleneck for all non-cipher-bound
+scenarios on tokio. The persistent pool reduces per-call overhead from full task
+lifecycle (alloc + schedule + wake + dealloc) to a channel send + recv.
+
+**Testing:** all workspace tests pass, clippy clean (tokio), release builds verified.
+
+### Refactor — unify SmuxStreamAsync / SmuxStreamIo into smux_rs::SmuxIo
+
+- **New `smux_rs::SmuxIo`** — unified async I/O wrapper that replaces the two
+  per-binary structs (`SmuxStreamAsync` in kcptun-client, `SmuxStreamIo` in
+  kcptun-server) with a single type in the smux-rs crate.
+  - `SmuxIo::new(stream, flush_notify)` — server mode: no KCP backpressure.
+  - `SmuxIo::with_backpressure(stream, flush_notify, wait_send, snd_wnd, write_notify)`
+    — client mode: `poll_write` returns `Pending` when `wait_send >= snd_wnd`
+    and arms a background task that waits for `write_notify` before waking.
+  - Implements `kio::AsyncRead + AsyncWrite` for both tokio and smol backends.
+  - `do_poll_write` shared between both backends eliminates the duplicated
+    `poll_write` bodies that existed in each binary's wrapper.
+- **Deleted `SmuxStreamAsync`** from kcptun-client (~235 lines removed).
+- **Deleted `SmuxStreamIo`** from kcptun-server (~175 lines removed).
+- Both binaries now call `smux_rs::SmuxIo::new` / `with_backpressure` at the
+  pipe construction site — no behavior change, pure deduplication.
+
+**Testing:** smux-rs 51 tests pass, clippy clean (tokio + smol), release builds.
+
+### Feat — smux-rs standalone: Stream implements kio::AsyncRead + AsyncWrite, unified Session outbound
+
+- **`smux_rs::Stream`** now directly implements `kio::AsyncRead` + `kio::AsyncWrite`
+  (tokio/smol cfg-gated). The previous wrapper pattern (`SmuxStreamAsync` in
+  kcptun-client, `SmuxStreamIo` in kcptun-server) is no longer required — any
+  `&mut Stream` can be used directly with `copy_bidirectional` et al.
+  - `poll_read`: delegates to the existing `read()` + waker; WouldBlock → Pending.
+  - `poll_write`: checks `local_closed` (→ BrokenPipe), v2 peer_send_window (→
+    Pending when window full, wakes on `apply_peer_update`).
+  - `poll_shutdown` / `poll_close`: `mark_local_closed()`.
+  - `poll_flush`: no-op (writes are buffered; external flush loop drains via
+    Session).
+- **Write-side waker** added to Stream: `ch_write_wakeup`, `write_waker`.
+  `apply_peer_update` and `close()` now wake blocked writers.
+- **`Session::prepare_outbound_into(buf, max_bytes, ver) -> Vec<u32>`**
+  — unified outbound path that drains all streams' send_buf (PSH), encodes FIN
+  headers for eligible closed streams, and appends UPD frames, all in a single
+  lock-held pass. Returns FIN IDs for the caller to `mark_fin_sent` only after
+  the transport accepts the bytes (preserves the "can't lose FIN" invariant).
+- **`Session::mark_fins_sent(&[u32])`** — batch FIN-sent marking for the IDs
+  returned by `prepare_outbound_into`.
+- **kcptun-client / server flush loops** refactored to use
+  `prepare_outbound_into`, replacing ~180 lines of manually duplicated
+  Phase 1/1a/1c SMUX drain+FSM+UPD logic with a single call.
+- New constants `FRAME_HEADER_SIZE` and `MAX_FRAME_SIZE` exported from
+  `smux_rs` root.
+
+**Testing:** smux-rs: 51 tests (2 new: trait read/write round-trip via
+AsyncReadExt/AsyncWriteExt), clippy clean, release build.
+
+### Fixed — stress test data truncation under concurrent load
+
+- Increased `MAX_DRAIN_BYTES` from 64KB to 256KB in both client and server
+  flush loops. Under high concurrency (100 streams × 128KB on 1 KCP channel),
+  the previous per-cycle drain cap was too small, causing data to be removed
+  from SMUX send buffers via `drain_send_max` but not yet accepted by KCP
+  before the stream's local FIN was processed.
+- Added 300ms sleep before `shutdown(Write)` in `send_and_recv` to give the
+  flush loop time to drain initial data before the half-close FIN is encoded.
+- `make stress`: 8/8 tests pass (54.66s sequential). Previously 6 passed,
+  2 concurrent tests failed with "length mismatch" truncation at SMUX
+  MAX_FRAME_SIZE boundaries (60000 bytes).
+
+### Fixed — server evicts dead historical sessions for reconnect after restart (Go wire compatible)
+
+- **`KcpServerSession`**: added `dead: Arc<AtomicBool>` (default `false`) to track
+  terminal state for a peer session. Initialized in `KcpServerSession::new`.
+- New `is_dead(&self) -> bool`:
+  - returns true if the `dead` flag is set, or `smux.is_closed()`, or
+    `kcp.is_dead()` (KCP dead_link exceeded). When `kcp.is_dead()` is observed,
+    the method also sets the `dead` flag for subsequent callers.
+- Flush loop (Phase 0) now marks the session dead before exiting on any of:
+  - `smux.is_closed()`
+  - `kcp.is_dead()` ("KCP dead_link detected")
+  - `smux.is_keepalive_timeout()` ("SMUX keepalive timeout")
+  The `dead` `Arc` is cloned into the background flush task so the flag is
+  visible to `get_or_create_session` without races.
+- **`get_or_create_session`** (the per-datagram entry point):
+  - Before returning a cached `KcpServerSession` for a `SocketAddr`, check
+    `s.is_dead()`.
+  - If the prior session for that peer is dead (e.g. the server was restarted,
+    or the client was unreachable long enough for dead_link/keepalive to fire),
+    the entry is removed via `sessions.remove(peer)`.
+  - The packet then falls through to create a fresh `KcpServerSession`
+    (new KCP state machine + new SMUX server session) for the reconnecting
+    client.
+- No new SMUX `Cmd`, no new KCP segment commands, no changes to `conv`
+  handling or wire format. This is purely a server-side session lifecycle
+  improvement.
+- Client behavior is unchanged: it still discovers that its side of the
+  connection is dead via its own mechanisms:
+  - KCP `dead_link` (20 retransmits; RTO-dependent, typically ~4s+ in "fast"
+    mode, up to ~10s in other conditions)
+  - SMUX keepalive timeout (default `keepalive=10` → 30s; tests often use
+    smaller values like 2s → ~6s)
+  End-to-end "reconnect after restart" latency of 4-10s is accepted.
+- This is the lowest-risk way to implement "server notices historical/old
+  connections":
+  - When a client that had a session before a server restart (or long
+    network outage) sends packets again, the server will not deliver
+    traffic into a stuck or half-dead KCP/SMUX session.
+  - The client drives the reconnect (as in Go kcptun), the server only
+    ensures it has a clean session to hand the new traffic to.
+- Improves robustness for `--conn N` multi-connection clients and the
+  `reconnect_after_restart` test scenario without introducing any
+  Go-incompatible protocol elements.
+
 ### Perf — TEA CFB monomorphize
 
 - **`TeaCrypt`**: specialized CFB-8 (`cfb_enc_specialized` / `cfb_dec_specialized`)

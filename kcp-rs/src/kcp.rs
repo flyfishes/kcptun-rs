@@ -16,12 +16,13 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use bytes::{Bytes, BytesMut};
+use smallvec::SmallVec;
 
 use crate::segment::SegmentPool;
 use crate::segment::{
     Command, Segment, KCP_ASK_SEND, KCP_ASK_TELL, KCP_DEFAULT_WND, KCP_MAX_FRAG, KCP_OVERHEAD, MTU,
 };
-use crate::snmp::{self as snmp, DEFAULT_SNMP};
+use crate::snmp::{self, DEFAULT_SNMP};
 
 // ─── Constants (matching Go kcp-go v5) ─────────────────────────────────────
 
@@ -42,11 +43,21 @@ pub const IKCP_PROBE_LIMIT: u32 = 120000;
 /// After this many retransmits, mark the connection as dead
 const IKCP_DEADLINK: u32 = 20;
 
+/// State value indicating a dead connection (matching Go kcp-go `dead_link`).
+const DEAD_LINK_STATE: u32 = 0xFFFF_FFFF;
+
 /// Slow-start threshold minimum
 const IKCP_THRESH_MIN: u32 = 2;
 
 /// Initial slow-start threshold
 const KCP_THRESHOLD_INIT: u32 = 2;
+
+/// A queued ACK entry: sequence number + timestamp of the received segment.
+#[derive(Clone, Copy)]
+struct AckEntry {
+    sn: u32,
+    ts: u32,
+}
 
 // ─── KCP State Machine ─────────────────────────────────────────────────────
 
@@ -107,7 +118,9 @@ pub struct KCP {
     incr: u32,
 
     // ── ACK list ──
-    acklist: Vec<(u32, u32)>, // (sn, ts)
+    /// Most flush cycles accumulate ≤16 ACKs; SmallVec avoids heap alloc on
+    /// the common path while spilling to the heap for large bursts.
+    acklist: SmallVec<[AckEntry; 16]>,
 
     // ── Output buffer ──
     buffer: BytesMut,
@@ -143,10 +156,15 @@ impl fmt::Debug for KCP {
 }
 
 /// Signed difference for wrapping-safe sequence number comparisons.
-/// Matches the original KCP C function `_itimediff(later, earlier)`.
+/// Matches the original KCP C function `itimediff(later, earlier)`.
+///
+/// Accepts any integer widening to `u64` (both `u32` KCP fields and `u64`
+/// timestamps from `current_ms()`) without explicit casts at call sites.
+/// The result is `i32` — KCP wire timestamps are 32-bit and `itimediff`
+/// only cares about the low 32 bits of the difference.
 #[inline]
-fn _itimediff(later: u32, earlier: u32) -> i32 {
-    later.wrapping_sub(earlier) as i32
+fn itimediff(later: impl Into<u64>, earlier: impl Into<u64>) -> i32 {
+    later.into().wrapping_sub(earlier.into()) as i32
 }
 
 impl KCP {
@@ -191,7 +209,7 @@ impl KCP {
             ts_probe: 0,
             dead_link: IKCP_DEADLINK,
             incr: 0,
-            acklist: Vec::with_capacity(64),
+            acklist: SmallVec::new(),
             buffer: BytesMut::with_capacity(MTU),
             output,
             pool: SegmentPool::new(4096),
@@ -366,15 +384,12 @@ impl KCP {
     /// Receive data from the KCP connection. Returns `None` if no data is
     /// available.
     pub fn recv(&mut self) -> Result<BytesMut, KcpError> {
-        let peeksize = self.peeksize();
-        if peeksize < 0 {
-            return Err(KcpError::NoData);
-        }
+        let peeksize = self.peeksize().ok_or(KcpError::NoData)?;
 
         let fast_recover = self.rcv_queue.len() as u32 >= self.rcv_wnd;
 
         // Merge fragments
-        let mut data = BytesMut::with_capacity(peeksize as usize);
+        let mut data = BytesMut::with_capacity(peeksize);
         loop {
             match self.rcv_queue.pop_front() {
                 Some(seg) => {
@@ -383,7 +398,7 @@ impl KCP {
                         data.extend_from_slice(&seg.data[..size]);
                     }
                     self.pool.release(seg);
-                    if data.len() as i32 >= peeksize {
+                    if data.len() >= peeksize {
                         break;
                     }
                 }
@@ -414,17 +429,14 @@ impl KCP {
     /// When the message spans multiple segments, they are merged via
     /// `extend_from_slice` (same as `recv()`).
     pub fn recv_bytes(&mut self) -> Result<bytes::Bytes, KcpError> {
-        let peeksize = self.peeksize();
-        if peeksize < 0 {
-            return Err(KcpError::NoData);
-        }
+        let peeksize = self.peeksize().ok_or(KcpError::NoData)?;
 
         let fast_recover = self.rcv_queue.len() as u32 >= self.rcv_wnd;
 
         // ── Fast path: single-segment message (frg == 0) ──
         // This is the common case in stream mode. Zero-copy: just
         // freeze the segment's BytesMut data and return a slice.
-        if peeksize == self.rcv_queue.front().map(|s| s.len as i32).unwrap_or(-1) {
+        if peeksize == self.rcv_queue.front().map(|s| s.len as usize).unwrap_or(0) {
             if let Some(mut seg) = self.rcv_queue.pop_front() {
                 let size = cmp::min(seg.len as usize, seg.data.len());
                 let data = seg.data.split_to(size).freeze();
@@ -445,7 +457,7 @@ impl KCP {
         }
 
         // ── Slow path: multi-segment message ──
-        let mut data = BytesMut::with_capacity(peeksize as usize);
+        let mut data = BytesMut::with_capacity(peeksize);
         loop {
             match self.rcv_queue.pop_front() {
                 Some(seg) => {
@@ -454,7 +466,7 @@ impl KCP {
                         data.extend_from_slice(&seg.data[..size]);
                     }
                     self.pool.release(seg);
-                    if data.len() as i32 >= peeksize {
+                    if data.len() >= peeksize {
                         break;
                     }
                 }
@@ -476,40 +488,32 @@ impl KCP {
     }
 
     /// Check the size of the next message in the receive queue.
-    /// Returns -1 if no data is available.
-    pub fn peeksize(&self) -> i32 {
-        match self.rcv_queue.front() {
-            None => return -1,
-            Some(seg) => {
-                if seg.frg == 0 {
-                    return seg.len as i32;
-                }
-            }
-        }
-
-        if self.rcv_queue.is_empty() {
-            return -1;
+    /// Returns `None` if no complete message is available.
+    pub fn peeksize(&self) -> Option<usize> {
+        let front = self.rcv_queue.front()?;
+        if front.frg == 0 {
+            return Some(front.len as usize);
         }
 
         let count = self.rcv_queue.len();
-        if count as u8 <= self.rcv_queue[0].frg {
-            return -1;
+        if count as u8 <= front.frg {
+            return None;
         }
 
-        let mut length = 0i32;
+        let mut length = 0usize;
         for seg in &self.rcv_queue {
-            length += seg.len as i32;
+            length += seg.len as usize;
             if seg.frg == 0 {
                 break;
             }
         }
-        length
+        Some(length)
     }
 
     // ── Ack processing ────────────────────────────────────────────────────
 
     fn parse_ack(&mut self, sn: u32) {
-        if _itimediff(sn, self.snd_una) < 0 || _itimediff(sn, self.snd_nxt) >= 0 {
+        if itimediff(sn, self.snd_una) < 0 || itimediff(sn, self.snd_nxt) >= 0 {
             return;
         }
 
@@ -520,22 +524,22 @@ impl KCP {
                 // so we don't need to remove from snd_buf here.
                 break;
             }
-            if _itimediff(sn, seg.sn) < 0 {
+            if itimediff(sn, seg.sn) < 0 {
                 break;
             }
         }
     }
 
     fn parse_fastack(&mut self, sn: u32, ts: u32) -> bool {
-        if _itimediff(sn, self.snd_una) < 0 || _itimediff(sn, self.snd_nxt) >= 0 {
+        if itimediff(sn, self.snd_una) < 0 || itimediff(sn, self.snd_nxt) >= 0 {
             return false;
         }
 
         let mut should_fast_ack = false;
         for seg in &mut self.snd_buf {
-            if _itimediff(sn, seg.sn) < 0 {
+            if itimediff(sn, seg.sn) < 0 {
                 break;
-            } else if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {
+            } else if sn != seg.sn && itimediff(seg.ts, ts) <= 0 {
                 if seg.fastack != 0xFFFFFFFF {
                     seg.fastack += 1;
                     if seg.fastack >= self.fastresend as u32 {
@@ -551,7 +555,7 @@ impl KCP {
     fn parse_una(&mut self, una: u32) -> usize {
         let mut count = 0;
         for seg in &self.snd_buf {
-            if _itimediff(una, seg.sn) > 0 {
+            if itimediff(una, seg.sn) > 0 {
                 count += 1;
             } else {
                 break;
@@ -576,7 +580,7 @@ impl KCP {
     }
 
     fn ack_push(&mut self, sn: u32, ts: u32) {
-        self.acklist.push((sn, ts));
+        self.acklist.push(AckEntry { sn, ts });
     }
 
     // ── Input processing ─────────────────────────────────────────────────
@@ -646,9 +650,9 @@ impl KCP {
                 }
                 c if c == Command::Push as u8 => {
                     // Window check: only ack if within window
-                    if _itimediff(sn, self.rcv_nxt + self.rcv_wnd) < 0 {
+                    if itimediff(sn, self.rcv_nxt + self.rcv_wnd) < 0 {
                         self.ack_push(sn, ts);
-                        if _itimediff(sn, self.rcv_nxt) >= 0 {
+                        if itimediff(sn, self.rcv_nxt) >= 0 {
                             // Create segment from received data
                             let mut seg = self.pool.acquire();
                             seg.conv = conv;
@@ -692,18 +696,18 @@ impl KCP {
             snmp::add(&DEFAULT_SNMP.in_segs, in_segs);
         }
 
-        // Update RTT with the latest ts (matching Go: only for regular packets)
+        // Update RTT with the latest ts (matching Go: only for regular packets).
+        // Fetch the current timestamp once and reuse it for flush triggers below.
+        let now_ms = self.current_ms();
         if update_rtt {
-            if let Some(current_ms) = self.current_ms() {
-                if _itimediff(current_ms, latest_ts) >= 0 {
-                    self.update_ack(_itimediff(current_ms, latest_ts));
-                }
+            if itimediff(now_ms, latest_ts) >= 0 {
+                self.update_ack(itimediff(now_ms, latest_ts));
             }
         }
 
         // Congestion window update (matching Go: nocwnd check)
         if self.nocwnd == 0 {
-            if _itimediff(self.snd_una, snd_una) > 0 {
+            if itimediff(self.snd_una, snd_una) > 0 {
                 if self.cwnd < self.rmt_wnd {
                     let mss = self.mss;
                     if self.cwnd < self.ssthresh {
@@ -730,13 +734,15 @@ impl KCP {
             }
         }
 
-        // Flush triggers (matching Go)
+        // Flush triggers (matching Go). Reuse the timestamp fetched above to
+        // avoid a second SystemTime::now() syscall inside flush().
+        let now_ms_32 = now_ms as u32;
         if flush_segments != 0 {
-            self.flush();
+            self.flush_with_current(now_ms_32);
         } else if self.acklist.len() >= (self.mtu / KCP_OVERHEAD as u32) as usize {
-            self.flush();
+            self.flush_with_current(now_ms_32);
         } else if ack_no_delay && !self.acklist.is_empty() {
-            self.flush();
+            self.flush_with_current(now_ms_32);
         }
 
         Ok(offset)
@@ -751,19 +757,26 @@ impl KCP {
         let sn = newseg.sn;
 
         // Check if outside receive window
-        if _itimediff(sn, self.rcv_nxt + self.rcv_wnd) >= 0 || _itimediff(sn, self.rcv_nxt) < 0 {
+        if itimediff(sn, self.rcv_nxt + self.rcv_wnd) >= 0 || itimediff(sn, self.rcv_nxt) < 0 {
             return true;
         }
 
-        // Check for duplicate by looking through rcv_buf
-        let is_dup = self.rcv_buf.iter().any(|s| s.sn == sn);
-        if !is_dup {
-            // Insert in sorted order
-            let pos = self.rcv_buf.iter().position(|s| _itimediff(s.sn, sn) > 0);
-            match pos {
-                Some(p) => self.rcv_buf.insert(p, newseg),
-                None => self.rcv_buf.push_back(newseg),
+        // Single pass: detect duplicate and find insertion position simultaneously
+        // (replaces two separate O(n) scans with one).
+        let mut is_dup = false;
+        let mut insert_pos = self.rcv_buf.len();
+        for (i, s) in self.rcv_buf.iter().enumerate() {
+            if s.sn == sn {
+                is_dup = true;
+                break;
             }
+            if itimediff(s.sn, sn) > 0 {
+                insert_pos = i;
+                break;
+            }
+        }
+        if !is_dup {
+            self.rcv_buf.insert(insert_pos, newseg);
         }
 
         // Move available data from rcv_buf → rcv_queue
@@ -824,7 +837,7 @@ impl KCP {
             self.ts_flush = current;
         }
 
-        let mut slap = _itimediff(current, self.ts_flush);
+        let mut slap = itimediff(current, self.ts_flush);
 
         // Clock jump detection (matching Go)
         if slap >= 10000 || slap < -10000 {
@@ -834,10 +847,10 @@ impl KCP {
 
         if slap >= 0 {
             self.ts_flush = self.ts_flush.wrapping_add(self.interval);
-            if _itimediff(current, self.ts_flush) >= 0 {
+            if itimediff(current, self.ts_flush) >= 0 {
                 self.ts_flush = current.wrapping_add(self.interval);
             }
-            self.flush()
+            self.flush_with_current(current)
         } else {
             self.interval
         }
@@ -854,18 +867,18 @@ impl KCP {
             return current;
         }
 
-        if _itimediff(current, ts_flush) >= 10000 || _itimediff(current, ts_flush) < -10000 {
+        if itimediff(current, ts_flush) >= 10000 || itimediff(current, ts_flush) < -10000 {
             ts_flush = current;
         }
 
-        if _itimediff(current, ts_flush) >= 0 {
+        if itimediff(current, ts_flush) >= 0 {
             return current;
         }
 
-        tm_flush = _itimediff(ts_flush, current);
+        tm_flush = itimediff(ts_flush, current);
 
         for seg in &self.snd_buf {
-            let diff = _itimediff(seg.resendts, current);
+            let diff = itimediff(seg.resendts, current);
             if diff <= 0 {
                 return current;
             }
@@ -888,8 +901,18 @@ impl KCP {
     ///
     /// Returns `next_update` — the milliseconds until the next meaningful
     /// event (nearest RTO or interval), matching Go kcp-go's `flush()` return.
+    #[inline]
     pub fn flush(&mut self) -> u32 {
-        let current = self.current_ms().unwrap_or(0);
+        let current = self.current_ms() as u32;
+        self.flush_with_current(current)
+    }
+
+    /// Flush with an externally-provided timestamp.
+    ///
+    /// Use this when the caller already has the current monotonic millisecond
+    /// value (e.g., `update()` receives `current`), avoiding a redundant
+    /// `SystemTime::now()` syscall inside the flush loop.
+    pub fn flush_with_current(&mut self, current: u32) -> u32 {
         let mut next_update = self.interval;
 
         // Build single-use segment for ACK/WASK/WINS headers
@@ -913,13 +936,13 @@ impl KCP {
         if !self.acklist.is_empty() {
             let n = self.acklist.len();
             for i in 0..n {
-                let (ack_sn, ack_ts) = self.acklist[i];
+                let (ack_sn, ack_ts) = (self.acklist[i].sn, self.acklist[i].ts);
                 // Check space
                 if self.buffer.len() + KCP_OVERHEAD > mtu {
                     flush_buf(&mut self.buffer, &mut self.output);
                 }
                 // Filter jitter caused by bufferbloat (matching Go)
-                if _itimediff(ack_sn, self.rcv_nxt) >= 0 || i == n - 1 {
+                if itimediff(ack_sn, self.rcv_nxt) >= 0 || i == n - 1 {
                     ack_seg.sn = ack_sn;
                     ack_seg.ts = ack_ts;
                     ack_seg.encode(&mut self.buffer);
@@ -933,7 +956,7 @@ impl KCP {
             if self.probe_wait == 0 {
                 self.probe_wait = IKCP_PROBE_INIT;
                 self.ts_probe = current + self.probe_wait;
-            } else if _itimediff(current, self.ts_probe) >= 0 {
+            } else if itimediff(current, self.ts_probe) >= 0 {
                 if self.probe_wait < IKCP_PROBE_INIT {
                     self.probe_wait = IKCP_PROBE_INIT;
                 }
@@ -977,7 +1000,7 @@ impl KCP {
 
         // ── Move segments from snd_queue to snd_buf ──
         let mut new_segs_count = 0;
-        while _itimediff(self.snd_nxt, self.snd_una + cwnd) < 0 {
+        while itimediff(self.snd_nxt, self.snd_una + cwnd) < 0 {
             match self.snd_queue.pop_front() {
                 Some(mut newseg) => {
                     newseg.conv = self.conv;
@@ -1036,7 +1059,7 @@ impl KCP {
                 seg.resendts = current + seg.rto;
                 change += 1;
                 early_retrans_segs += 1;
-            } else if _itimediff(current, seg.resendts) >= 0 {
+            } else if itimediff(current, seg.resendts) >= 0 {
                 // RTO timeout
                 needsend = true;
                 if self.nodelay == 0 {
@@ -1058,13 +1081,6 @@ impl KCP {
                 seg.wnd = current_wnd;
                 seg.una = self.rcv_nxt;
 
-                // Freeze payload for zero-copy retransmit sharing.
-                // Done here (not in send()) so stream-mode append in send()
-                // can still extend seg.data before the segment is transmitted.
-                if seg.payload.is_empty() && !seg.data.is_empty() {
-                    seg.payload = seg.data.split_to(seg.data.len()).freeze();
-                }
-
                 let need = KCP_OVERHEAD + seg.len as usize;
                 if self.buffer.len() + need > mtu {
                     flush_buf(&mut self.buffer, &mut self.output);
@@ -1079,13 +1095,13 @@ impl KCP {
 
                 // Dead link check (matching Go)
                 if seg.xmit >= self.dead_link {
-                    self.state = 0xFFFFFFFF;
+                    self.state = DEAD_LINK_STATE;
                 }
             }
 
             // Track nearest RTO for nextUpdate (matching Go kcp-go)
             if !seg.acked {
-                let rto = _itimediff(seg.resendts, current);
+                let rto = itimediff(seg.resendts, current);
                 if rto > 0 && (rto as u32) < next_update {
                     next_update = rto as u32;
                 }
@@ -1205,7 +1221,7 @@ impl KCP {
     /// Returns true if KCP connection is dead (state == 0xFFFFFFFF).
     #[inline]
     pub fn is_dead(&self) -> bool {
-        self.state == 0xFFFFFFFF
+        self.state == DEAD_LINK_STATE
     }
 
     /// Get the current RTO value.
@@ -1232,14 +1248,16 @@ impl KCP {
         self.interval
     }
 
-    /// Get the current timestamp (for matching Go).
-    fn current_ms(&self) -> Option<u32> {
-        Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis() as u32,
-        )
+    /// Get the current timestamp in milliseconds (for matching Go).
+    ///
+    /// Returns `u64` to avoid 32-bit overflow after ~49.7 days of uptime.
+    /// Callers that need the KCP 32-bit wire timestamp should truncate with
+    /// `as u32` — `itimediff` handles wraparound correctly.
+    fn current_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     /// Get the maximum segment size.

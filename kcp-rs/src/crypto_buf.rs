@@ -251,9 +251,14 @@ pub fn should_cpu_block_encrypt(
 
 /// Size threshold for session-level Snappy offload (≥4 KiB).
 ///
-/// Callers should **also** require null/none crypto: when encrypt is itself
-/// offloaded to `cpu_block`, keeping Snappy inline avoids a double pool hop
-/// and keeps the plaintext warm for the subsequent encrypt_batch.
+/// Callers should offload Snappy compression to `cpu_block` whenever this
+/// returns true, **regardless of whether encryption is also enabled**.
+/// Previously, callers skipped the offload when `has_encryption` was true
+/// to avoid a "double pool hop" (snappy on pool, then encrypt on pool).
+/// However, flamegraph analysis (2026-07-27) showed that running Snappy
+/// inline blocks the tokio worker thread, preventing it from processing
+/// UDP recv / ACKs — the throughput cost of blocking the worker far
+/// exceeds the latency cost of a second pool hop.
 #[inline]
 pub fn should_cpu_block_compress(uncompressed_bytes: usize) -> bool {
     uncompressed_bytes >= 4096

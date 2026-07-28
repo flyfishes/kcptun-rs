@@ -1,24 +1,7 @@
 # bench/profiles
 
-Generated flamegraph / samply artifacts live here. **Do not commit large binary or JSON profiles.**
-
-## Regenerate
-
-```bash
-make release
-bash bench/profile_flamegraph.sh all
-```
-
-Artifacts:
-
-| File pattern | Scenario |
-|--------------|----------|
-| `L1-null-nocomp-*.json` | Bulk null + nocomp |
-| `L2-aes-nocomp-*.json` | Bulk AES + nocomp |
-| `L3-3des-nocomp-*.json` | Bulk 3des + nocomp |
-| `L4-stress-*.json` | Multi-conn stress under sampler |
-
-Interpretation notes (committed): `HOTSPOTS.md` (created after first real capture).
+Generated pprof artifacts live here. **Do not commit large binary profiles.**
+Only `README.md`, `HOTSPOTS.md`, and `.gitkeep` are tracked.
 
 ## Go-compatible pprof (protobuf)
 
@@ -30,7 +13,7 @@ make profile            # Rust → bench/profiles/rust-*.pb (+ -heap.pb, -allocs
 make profile-go         # Go   → bench/profiles/go-*.pb.gz
 ```
 
-Artifacts:
+Artifacts (gitignored — regenerate locally):
 
 | File pattern             | Description                     |
 |--------------------------|---------------------------------|
@@ -44,3 +27,5 @@ View:
 go tool pprof -http=:0 bench/profiles/rust-server-aes-*.pb
 go tool pprof -http=:0 bench/profiles/rust-server-aes-*-heap.pb
 ```
+
+Interpretation notes (committed): `HOTSPOTS.md`.

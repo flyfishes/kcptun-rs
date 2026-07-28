@@ -8,7 +8,9 @@ Reproducible CPU sampling for the data plane on **macOS arm64** (primary) and Li
 # Go toolchain (for pprof analysis UI)
 # Install from https://go.dev/dl/ or: brew install go
 
-# Build profiling binaries with symbols + pprof feature
+# Build profiling binaries with symbols + pprof feature + frame pointers
+make profiling-bins
+# Or manually:
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client
 ```
 
@@ -48,6 +50,9 @@ go tool pprof -top bench/profiles/rust-server-aes-*.pb
 
 # Source-level annotation
 go tool pprof -list=encrypt_batch bench/profiles/rust-server-aes-*.pb
+
+# Filter out I/O wait to see CPU hotspots
+go tool pprof -top -ignore="Inner::park" bench/profiles/rust-server-aes-*.pb
 ```
 
 ## Manual pprof capture
@@ -76,7 +81,24 @@ open 'http://127.0.0.1:6060/debug/pprof/'
 
 > Note: profiles show **Rust demangled names** inside Go pprof UI. This is not a Go binary profile of the Go kcptun process — use `bash bench/profile_go_pprof.sh` for pure Go.
 
-## Symbol map (this stack)
+## Interpreting profiles
+
+### I/O-bound servers (most kcptun-rs usage)
+
+The wall-clock CPU profile will show 99%+ in `tokio::runtime::park::Inner::park` —
+the tokio worker thread waiting for I/O. This is **correct** behavior: the server
+spends most wall time waiting, not computing.
+
+To find actual CPU hotspots:
+```bash
+# Filter out park to see work functions
+go tool pprof -top -ignore="Inner::park" profile.pb.gz
+
+# Or use CPU-intensive scenarios
+CRYPT=3des bash bench/profile_rust_go_pprof.sh server 30
+```
+
+### Symbol map
 
 | Frame pattern | Layer |
 |---------------|--------|
@@ -90,12 +112,13 @@ open 'http://127.0.0.1:6060/debug/pprof/'
 
 ## Optimization decision tree
 
-1. **Cipher inner loop dominates (L2/L3)** → algorithm / monomorphization micro-opts; verify not residual `dyn` dispatch.
-2. **Copy / Bytes / Vec churn (L1)** → ownership pipeline; avoid `to_vec`; null move paths.
-3. **Lock / mutex (L1/L4)** → shorten critical sections; never hold KCP lock across encrypt/snappy.
-4. **Syscall / send (L1)** → batch send paths; Linux `sendmmsg` only if justified.
-5. **Scheduler / cpu_block (L1/L2)** → retune thresholds only with evidence.
-6. **No actionable hotspot ≥ ~5%** → stop coding; document in `HOTSPOTS.md`.
+1. **Profile shows 99% `Inner::park`** → I/O-bound; filter with `-ignore="Inner::park"`.
+2. **Cipher inner loop dominates (L2/L3)** → algorithm / monomorphization micro-opts; verify not residual `dyn` dispatch.
+3. **Copy / Bytes / Vec churn (L1)** → ownership pipeline; avoid `to_vec`; null move paths.
+4. **Lock / mutex (L1/L4)** → shorten critical sections; never hold KCP lock across encrypt/snappy.
+5. **Syscall / send (L1)** → batch send paths; Linux `sendmmsg` only if justified.
+6. **Scheduler / cpu_block (L1/L2)** → retune thresholds only with evidence.
+7. **No actionable hotspot ≥ ~5%** → stop coding; document in `HOTSPOTS.md`.
 
 Hard constraints: Go wire compatibility; no congestion-window cheats; one optimization class per change; prefer shared `kcp_rs::encrypt_batch` to avoid client/server drift.
 
@@ -122,9 +145,18 @@ Update `bench/profiles/HOTSPOTS.md` with before/after notes.
 - `null` cipher has **no** crypto header; `none` has header without encryption.
 - Compression is **on by default**; profiling scripts use `--nocomp` for raw data-plane profiles.
 - Release profile strips symbols; profiling profile keeps them (`strip = false, debug = 2`).
+- **`make vendor` overwrites vendored pprof-rs** — the ITIMER_REAL + SIGALRM changes in
+  `vendor/pprof/src/{timer.rs,profiler.rs}` must be re-applied after vendoring.
+  Check `git diff vendor/pprof/src/timer.rs` after `make vendor`.
+- **Vendored pprof-rs modifications** (vs upstream defaults):
+  1. `ITIMER_REAL` (wall-clock) instead of `ITIMER_PROF` (CPU-only) — gives ~90% sample coverage
+     vs <1% for I/O-bound servers. ITIMER_REAL generates SIGALRM (signal handler updated).
+  2. `frame-pointer` feature enabled — uses frame-pointer chain walking for clean Rust-only
+     backtraces. Automatically stops at libc/pthread boundaries. Empty backtraces are dropped.
 
 ## Related docs
 
 - `PERF_OPTIMIZATION_PLAN.md` — residual R-items and KPI gates
 - `.claude/skills/flamegraph-perf/SKILL.md` — agent skill for the full profiling loop
-- `bench/profiles/HOTSPOTS.md` — last recorded ranking (after first real matrix)
+- `bench/profiles/HOTSPOTS.md` — last recorded ranking
+- `kpprof-rs/src/lib.rs` — kpprof module docs (endpoints, profiling guide, symbol map)

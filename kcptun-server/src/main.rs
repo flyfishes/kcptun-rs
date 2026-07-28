@@ -509,183 +509,6 @@ fn now_ms() -> u32 {
         .as_millis() as u32
 }
 
-// ─── SMUX Async Wrapper ─────────────────────────────────────────────────────────
-
-/// An async wrapper around an SMUX stream, implementing AsyncRead + AsyncWrite.
-struct SmuxStreamIo {
-    stream: Arc<smux_rs::stream::Stream>,
-    /// Notify the flush loop that new data is available for sending.
-    flush_notify: Arc<kio::Notify>,
-}
-
-impl SmuxStreamIo {
-    fn new(stream: Arc<smux_rs::stream::Stream>, flush_notify: Arc<kio::Notify>) -> Self {
-        SmuxStreamIo {
-            stream,
-            flush_notify,
-        }
-    }
-}
-
-// ── tokio AsyncRead/AsyncWrite (uses ReadBuf) ──
-#[cfg(feature = "tokio")]
-impl AsyncRead for SmuxStreamIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let space = buf.initialize_unfilled();
-        match this.stream.read(space) {
-            Ok((0, _)) => Poll::Ready(Ok(())),
-            Ok((n, _)) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
-            }
-            Err(smux_rs::stream::StreamError::WouldBlock) => {
-                // Register waker; wakeup_reader() (called by push_data) will wake
-                // us immediately when data arrives. Eliminates spawn(sleep(5ms)).
-                this.stream.register_read_waker(cx.waker().clone());
-                // Re-check after registering: data may have arrived between
-                // the WouldBlock and the waker registration (lost-wakeup race).
-                let space = buf.initialize_unfilled();
-                match this.stream.read(space) {
-                    Ok((0, _)) => Poll::Ready(Ok(())),
-                    Ok((n, _)) => {
-                        buf.advance(n);
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(smux_rs::stream::StreamError::WouldBlock) => Poll::Pending,
-                    Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("SMUX stream read error: {:?}", e),
-                    ))),
-                }
-            }
-            Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("SMUX stream read error: {:?}", e),
-            ))),
-        }
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl AsyncWrite for SmuxStreamIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match this.stream.write(buf) {
-            Ok(n) => {
-                // Wake up the flush loop immediately so it drains SMUX
-                // and sends through KCP without waiting for the timer.
-                this.flush_notify.notify_one();
-                Poll::Ready(Ok(n))
-            }
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "SMUX stream write error",
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Only mark local side as closed — do NOT call close() because that
-        // would clear the send buffer (losing data not yet drained by the
-        // flush loop) and set remote_closed=true (preventing FIN from being
-        // sent). The flush loop will send a FIN frame and fully close the
-        // stream after all pending data has been drained.
-        let stream = self.get_mut().stream.clone();
-        log::debug!(
-            "SmuxStreamIo::poll_shutdown: marking stream {} local_closed",
-            stream.id()
-        );
-        stream.mark_local_closed();
-        Poll::Ready(Ok(()))
-    }
-}
-
-// ── smol AsyncRead/AsyncWrite (uses &mut [u8]) ──
-#[cfg(feature = "smol")]
-impl AsyncRead for SmuxStreamIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match this.stream.read(buf) {
-            Ok((0, _)) => Poll::Ready(Ok(0)),
-            Ok((n, _)) => Poll::Ready(Ok(n)),
-            Err(smux_rs::stream::StreamError::WouldBlock) => {
-                this.stream.register_read_waker(cx.waker().clone());
-                match this.stream.read(buf) {
-                    Ok((0, _)) => Poll::Ready(Ok(0)),
-                    Ok((n, _)) => Poll::Ready(Ok(n)),
-                    Err(smux_rs::stream::StreamError::WouldBlock) => Poll::Pending,
-                    Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(0)),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("SMUX stream read error: {:?}", e),
-                    ))),
-                }
-            }
-            Err(smux_rs::stream::StreamError::Closed) => Poll::Ready(Ok(0)),
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("SMUX stream read error: {:?}", e),
-            ))),
-        }
-    }
-}
-
-#[cfg(feature = "smol")]
-impl AsyncWrite for SmuxStreamIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match this.stream.write(buf) {
-            Ok(n) => {
-                // Wake up the flush loop immediately so it drains SMUX
-                // and sends through KCP without waiting for the timer.
-                this.flush_notify.notify_one();
-                Poll::Ready(Ok(n))
-            }
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "SMUX stream write error",
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let stream = self.get_mut().stream.clone();
-        log::debug!(
-            "SmuxStreamIo::poll_close: marking stream {} local_closed",
-            stream.id()
-        );
-        stream.mark_local_closed();
-        Poll::Ready(Ok(()))
-    }
-}
-
 struct QPPPort<T: AsyncRead + AsyncWrite + Unpin> {
     inner: T,
     qpp: parking_lot::Mutex<qpp_rs::QuantumPermutationPad>,
@@ -744,7 +567,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
                     let qpp = this.qpp.lock();
                     let mut prng = this.prng_dec.lock();
                     qpp_rs::decrypt_with_pads(
-                        &qpp.pads,
+                        &qpp.rpads,
                         &mut tmp[..filled],
                         &mut prng,
                         qpp.count(),
@@ -826,7 +649,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
                     let qpp = this.qpp.lock();
                     let mut prng = this.prng_dec.lock();
                     qpp_rs::decrypt_with_pads(
-                        &qpp.pads,
+                        &qpp.rpads,
                         &mut tmp[..filled],
                         &mut prng,
                         qpp.count(),
@@ -925,7 +748,7 @@ async fn handle_stream(
         info!("stream {} connected to target {}", stream_id, target);
     }
 
-    let smux_io = SmuxStreamIo::new(smux_stream.clone(), flush_notify);
+    let smux_io = smux_rs::SmuxIo::new(smux_stream.clone(), flush_notify);
 
     // Default idle timeout to prevent FD leaks when close_wait is 0.
     // If neither side sends data for this duration, the pipe is closed.
@@ -951,8 +774,15 @@ async fn handle_stream(
     // Local half-close only. Do NOT mark_fin_sent here — that made flush skip
     // encoding FIN (same class of leak as client; see BUGREPORT_PROXY_MEMORY_GROWTH).
     // Flush encodes FIN then marks fin_sent after kcp.send success; linger reaps zombies.
+    //
+    // IMPORTANT: Do NOT call clear_buffers() here. The flush loop may still have
+    // data in the stream's send_buf that has been written by the pipe but not yet
+    // drained and sent through KCP. Clearing buffers would discard unsent data,
+    // causing silent data loss (observed in stress tests as truncated/zero responses).
+    // The flush loop is responsible for draining send_buf, sending FIN after drain,
+    // and the linger reaper will eventually clear buffers after is_fin_sent + timeout.
     smux_stream.mark_local_closed();
-    smux_stream.clear_buffers();
+    // Do not clear buffers — let flush drain and linger reap.
 
     match pipe_result {
         Ok((a, b)) => {
@@ -1029,6 +859,18 @@ struct KcpServerSession {
     /// have new data to send. Eliminates the 0~10ms wait of the fixed
     /// sleep interval.
     flush_notify: Arc<kio::Notify>,
+
+    /// Set when KCP dead_link or SMUX keepalive timeout is detected on this
+    /// session. Allows the UDP dispatcher (get_or_create_session) to evict a
+    /// dead session for a given peer address and create a fresh one when the
+    /// client reconnects (e.g. after server restart or prolonged outage).
+    ///
+    /// This is the lowest-risk way to "notice historical connections":
+    /// we never send any new control frames or change wire format.
+    /// The client will still discover the old side is dead via its own
+    /// KCP dead_link (20 retransmits) or SMUX keepalive timeout (typically
+    /// a few seconds). 4-10s end-to-end is acceptable per requirements.
+    dead: Arc<AtomicBool>,
 }
 
 impl KcpServerSession {
@@ -1173,10 +1015,36 @@ impl KcpServerSession {
             },
             crypto_buf: Arc::new(parking_lot::Mutex::new(kcp_rs::CryptoBuf::new(conv as u64))),
             flush_notify: Arc::new(kio::Notify::new()),
+            dead: Arc::new(AtomicBool::new(false)),
         };
 
         session.start_flush_loop();
         session
+    }
+
+    /// Returns true if this session has been marked dead (KCP dead_link,
+    /// SMUX keepalive timeout, or explicit close). The UDP dispatcher uses
+    /// this to evict a stale session for a peer address so that a reconnecting
+    /// client (after server restart, prolonged outage, etc.) gets a fresh
+    /// session instead of being handed a dead one.
+    ///
+    /// This is the lowest-risk "historical connection" detection:
+    /// we do not introduce any new wire frames or protocol changes.
+    /// The client still discovers deadness via its own KCP dead_link (20
+    /// retransmits) or SMUX keepalive timeout. End-to-end 4-10s is accepted.
+    fn is_dead(&self) -> bool {
+        if self.dead.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.smux.is_closed() {
+            return true;
+        }
+        // Check KCP directly for freshness (mirrors client behavior).
+        if self.kcp.lock().is_dead() {
+            self.dead.store(true, Ordering::Release);
+            return true;
+        }
+        false
     }
 
     /// Start the background KCP update/flush loop for this session.
@@ -1202,6 +1070,7 @@ impl KcpServerSession {
         let crypto_buf = self.crypto_buf.clone();
         let flush_notify = self.flush_notify.clone();
         let fec_encoder = self.fec_encoder.clone();
+        let dead = self.dead.clone();
 
         let h = kio::spawn_task(async move {
             let mut next_update: u64 = KCP_UPDATE_INTERVAL_MS;
@@ -1222,17 +1091,20 @@ impl KcpServerSession {
 
                 // ── Phase 0: dead-link + SMUX keepalive ──
                 if smux.is_closed() {
+                    dead.store(true, Ordering::Release);
                     break;
                 }
                 if health_checks_left == 0 {
                     health_checks_left = 50; // ~100ms at 2ms update interval
                     if kcp.lock().is_dead() {
                         error!("KCP dead_link detected for peer {} — closing session", peer);
+                        dead.store(true, Ordering::Release);
                         smux.close();
                         break;
                     }
                     if smux.is_keepalive_timeout() {
                         error!("SMUX keepalive timeout for peer {} — closing session", peer);
+                        dead.store(true, Ordering::Release);
                         smux.close();
                         break;
                     }
@@ -1246,59 +1118,19 @@ impl KcpServerSession {
                     health_checks_left -= 1;
                 }
 
-                // ── Phase 1: Drain SMUX + encode frames into out_buf (NO KCP lock) ──
-                // Header reserved, payload drained in place, length patched (P0.3).
-                // Wrapped so stream MutexGuard is dropped before any .await.
-                // Note: do not clear out_buf here — Phase 0 may have queued NOP.
-                let fin_streams = {
-                    let streams = smux.streams();
-                    let stream_map = streams.lock();
-                    // Drain ALL pending SMUX bytes (multiple frames per stream).
-                    const MAX_DRAIN_BYTES: usize = 64 * 1024;
-                    let mut drained_total = 0usize;
-                    'outer: for (id, s) in stream_map.iter() {
-                        loop {
-                            if drained_total >= MAX_DRAIN_BYTES {
-                                break 'outer;
-                            }
-                            let header_pos = out_buf.len();
-                            smux_rs::frame::Frame::encode_header_into(
-                                &mut out_buf,
-                                smuxver,
-                                smux_rs::frame::Cmd::Psh,
-                                *id,
-                                0,
-                            );
-                            let n = s.drain_send_max(&mut out_buf, smux_rs::frame::MAX_FRAME_SIZE);
-                            if n == 0 {
-                                out_buf.truncate(header_pos);
-                                break;
-                            }
-                            smux_rs::frame::Frame::patch_header_length(
-                                &mut out_buf,
-                                header_pos,
-                                n as u16,
-                            );
-                            drained_total += n;
-                        }
-                    }
-
-                    // Collect streams that need FIN frames (do NOT mark_fin_sent yet —
-                    // that blocked cleanup in the handle path; mark only after kcp.send
-                    // succeeds, matching the "can't lose FIN" invariant from BUGREPORT.md).
-                    let fin_streams: Vec<u32> = stream_map
-                        .iter()
-                        .filter(|(_, s)| {
-                            s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent()
-                        })
-                        .map(|(id, _)| *id)
-                        .collect();
-                    fin_streams
-                };
+                // ── Phase 1: Prepare outbound SMUX frames (PSH + FINs + UPDs) ──
+                // Unified `prepare_outbound_into` does drain + FIN header encoding + UPDs.
+                // Same zero-copy path. Returns stream IDs whose FINs were encoded;
+                // mark_fin_sent only after kcp.send succeeds.
+                const MAX_DRAIN_BYTES: usize = 64 * 1024;
+                let fin_streams: Vec<u32> = smux.prepare_outbound_into(&mut out_buf, MAX_DRAIN_BYTES, smuxver);
 
                 // ── Phase 1a: Clean up closed / stale streams ──
                 // Stale = local_closed past linger without peer FIN (proxy short-connect).
                 // Also clean up handled_streams to prevent unbounded growth.
+                //
+                // NOTE: FIN headers and UPDs are already encoded by prepare_outbound_into above.
+                // We do NOT re-encode them here. Mark fin_sent only after kcp.send succeeds (below).
                 const STREAM_LINGER_SECS: u64 = 30;
                 {
                     let streams = smux.streams();
@@ -1332,53 +1164,36 @@ impl KcpServerSession {
                     drop(stream_map);
                 }
 
-                // Encode FIN frames into out_buf
-                for &stream_id in &fin_streams {
-                    debug!("flush: sending FIN for stream {}", stream_id);
-                    smux_rs::frame::Frame::encode_header_into(
-                        &mut out_buf,
-                        smuxver,
-                        smux_rs::frame::Cmd::Fin,
-                        stream_id,
-                        0,
-                    );
-                }
-
-                // ── UPD frames (matching Go's sendWindowUpdate) ──
-                smux.check_upd();
-                for upd in smux.take_upd_frames() {
-                    smux_rs::frame::Frame::encode_header_into(
-                        &mut out_buf,
-                        smuxver,
-                        smux_rs::frame::Cmd::Upd,
-                        upd.stream_id,
-                        8,
-                    );
-                    out_buf.extend_from_slice(&upd.consumed.to_le_bytes());
-                    out_buf.extend_from_slice(&upd.window.to_le_bytes());
-                }
-
                 // ── Phase 3: Snappy compress (NO KCP lock held) ──
                 // Large flushes → cpu_block; small stay inline (same threshold as client).
+                //
+                // `send_data` is `Option<bytes::Bytes>` — zero-copy reference-
+                // counted slice, avoiding `.to_vec()` copies on both the compress
+                // and nocomp paths.
                 let send_data = if out_buf.is_empty() {
                     None
                 } else if !_nocomp {
                     use std::io::Write;
-                    let plain = out_buf.split().to_vec();
+                    let plain = out_buf.split().freeze();
                     let plain_len = plain.len();
                     let compress_fn = {
                         let compressor = compressor.clone();
-                        move || {
+                        move || -> bytes::Bytes {
                             let mut enc = compressor.as_ref().map(|c| c.lock()).unwrap();
                             enc.write_all(&plain).ok();
                             enc.flush().ok();
-                            std::mem::take(enc.get_mut())
+                            // Vec<u8> → Bytes is zero-copy (into_bytes).
+                            std::mem::take(enc.get_mut()).into()
                         }
                     };
-                    let to_send = if kcp_rs::should_cpu_block_compress(plain_len)
-                        && !has_encryption
-                        && !has_aead
-                    {
+                    // P0: Always offload snappy to cpu_block when the batch is large
+                    // enough. Previously, snappy was kept inline when has_encryption
+                    // was true to avoid a "double pool hop" (snappy on pool, then
+                    // encrypt on pool). However, running snappy inline blocks the
+                    // tokio worker thread, preventing it from processing UDP recv /
+                    // ACKs. The throughput cost of blocking the worker far exceeds
+                    // the latency cost of a second pool hop.
+                    let to_send = if kcp_rs::should_cpu_block_compress(plain_len) {
                         kio::cpu_block(compress_fn).await
                     } else {
                         compress_fn()
@@ -1389,7 +1204,7 @@ impl KcpServerSession {
                         Some(to_send)
                     }
                 } else {
-                    let to_send = out_buf.split().to_vec();
+                    let to_send = out_buf.split().freeze();
                     if to_send.is_empty() {
                         None
                     } else {
@@ -1812,7 +1627,23 @@ fn get_or_create_session(
     keepalive: u64,
     nocomp: bool,
 ) -> Arc<KcpServerSession> {
-    // Step 1: Try to get an existing session WITHOUT locking (DashMap shard read)
+    // Step 1: Try to get an existing session WITHOUT locking (DashMap shard read).
+    // If we have a session for this peer but it is dead (KCP dead_link or
+    // SMUX keepalive timeout), evict it so a reconnecting client (after server
+    // restart or prolonged outage) will get a fresh session. This is the
+    // lowest-risk "notice historical connections" behavior: we do not send any
+    // new control frames or change the wire format. The client discovers
+    // deadness via its own mechanisms (dead_link ~20 retransmits or SMUX
+    // keepalive timeout). 4-10s end-to-end detection is acceptable.
+    //
+    // IMPORTANT: Do not hold the get() guard while calling remove(), as that
+    // can deadlock on DashMap shard lock (read guard vs write for remove).
+    // Snapshot the liveness first, then remove if needed.
+    let need_evict = sessions.get(peer).is_some_and(|s| s.is_dead());
+    if need_evict {
+        sessions.remove(peer);
+    }
+
     if let Some(s) = sessions.get(peer) {
         return s.clone();
     }

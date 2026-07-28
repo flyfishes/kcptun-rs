@@ -23,10 +23,14 @@
 //! - `Stream` — individual logical channel (implements AsyncRead + AsyncWrite)
 //! - Keepalive via periodic ping frames
 
+pub mod conn;
 pub mod frame;
+pub mod io;
 pub mod session;
 pub mod stream;
 
-pub use frame::{Cmd, Frame, FrameCodec, FrameError};
+pub use conn::SmuxConn;
+pub use frame::{Cmd, Frame, FrameCodec, FrameError, FRAME_HEADER_SIZE, MAX_FRAME_SIZE};
+pub use io::SmuxIo;
 pub use session::{Config, Session, SessionError, UpdFrame, DEFAULT_CONFIG};
 pub use stream::Stream;

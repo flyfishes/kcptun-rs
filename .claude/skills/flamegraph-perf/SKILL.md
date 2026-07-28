@@ -23,8 +23,8 @@ description: Profile kcptun-rs with Go pprof, rank hotspots, evidence-gated opti
 # Go toolchain for pprof analysis
 # Install from https://go.dev/dl/ or: brew install go
 
-# Build profiling binaries with symbols + pprof feature
-RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client
+# Build profiling binaries (bakes in force-frame-pointers=yes)
+make profiling-bins
 ```
 
 ## Scenario matrix
@@ -52,6 +52,9 @@ bash bench/profile_rust_go_pprof.sh server 20   # or make profile
 go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-aes-*.pb
 go tool pprof -top bench/profiles/rust-server-aes-*.pb
 go tool pprof -list=encrypt_batch bench/profiles/rust-server-aes-*.pb
+
+# Filter out I/O wait to see CPU hotspots
+go tool pprof -top -ignore="Inner::park" bench/profiles/rust-server-aes-*.pb
 ```
 
 Produces Google protobuf with **demangled Rust function names** (e.g. `AesCfbCrypt::encrypt`, `encrypt_batch`), not `0x` addresses.
@@ -92,49 +95,54 @@ curl 'http://127.0.0.1:6060/debug/pprof/deadlock'
 |---------------|--------|
 | `encrypt_batch` / `should_cpu_block_encrypt` | Crypto batch |
 | `CryptEngine` / cipher `encrypt` / CFB | Block crypt |
-| `aes::soft::fixslice::*` | **Wrong on Apple Silicon** — soft AES |
 | `aes::armv8::*` / `aes::ni::*` | Hardware AES |
+| `aes::soft::fixslice::*` | Software AES (should not appear on aarch64) |
 | `TripleDesCipher::encrypt_block` | 3DES |
 | `KCP::flush` / `input` / `send` / `SegmentPool` | ARQ |
 | `encode_header_into` / SMUX flush | Mux |
 | snappy | Compression (off with `--nocomp`) |
-| `send_batch` | UDP I/O |
-| `async_main::{closure}` (collapsed) | Tokio entry; may hide inlined leaves |
+| `send_batch` / `UdpSocket::send_to` | UDP I/O |
+| `tokio::runtime::park::Inner::park` | I/O wait (filter with `-ignore`) |
+| `cpu_block` / tokio runtime | Scheduling / offload |
 
 ## Decision tree
 
-1. **Cipher soft path on aarch64** → ensure `.cargo/config.toml` has `--cfg aes_armv8` (see `make vendor` recipe).
-2. **Cipher inner loop (L2/L3)** → algorithm micro-opts; verify not residual `dyn`.
-3. **Copy / Bytes churn (L1)** → ownership pipeline.
-4. **Lock / mutex (L1/L4)** → shorten critical sections; never hold KCP lock across encrypt/snappy.
-5. **Syscall / send** → batch send; Linux sendmmsg only if justified.
-6. **No actionable ≥~5% leaf** → stop coding; document in HOTSPOTS.md.
+1. **Profile shows 99% `Inner::park`** → I/O-bound; filter with `-ignore="Inner::park"`.
+2. **Cipher soft path on aarch64** → ensure `.cargo/config.toml` has `--cfg aes_armv8` (see `make vendor` recipe).
+3. **Cipher inner loop (L2/L3)** → algorithm micro-opts; verify not residual `dyn`.
+4. **Copy / Bytes churn (L1)** → ownership pipeline.
+5. **Lock / mutex (L1/L4)** → shorten critical sections; never hold KCP lock across encrypt/snappy.
+6. **Syscall / send** → batch send; Linux sendmmsg only if justified.
+7. **No actionable ≥~5% leaf** → stop coding; document in HOTSPOTS.md.
 
 Hard rules: wire compatibility; no congestion cheats; one class per change; shared `encrypt_batch`.
 
 ## Gotchas
 
 - Build with `--features pprof` to enable the pprof HTTP server; without it, `--pprof` is a no-op.
+- **Always use `make profiling-bins`** (not raw `cargo build --profile profiling`) — it bakes in
+  `-C force-frame-pointers=yes` which is REQUIRED for pprof-rs frame-pointer unwinding.
 - Use `--features pprof-deadlock` for deadlock detection (adds overhead from `parking_lot::deadlock_detection`).
 - `null` has no crypto header; `none` has header without encryption
 - Compression default ON; profile script uses `--nocomp`
 - Default release `strip=true` + LTO hides symbols; use `--profile profiling` for symbol info
 - `make vendor` rewrites `.cargo/config.toml` — must keep `aes_armv8` flags (Makefile does)
-
-## Last run summary (2026-07-21)
-
-- Git: `49f2aac` (armv8 AES) after tooling `d482d31` / analysis `a79d74a`
-- Host: macOS arm64
-- L1 null bulk: ~77–128 MB/s (no single ≥5% leaf beyond async main)
-- L2 aes **before** armv8: ~12–14 MB/s, soft fixslice in profile
-- L2 aes **after** armv8: ~66–85 MB/s (~5–6×)
-- L3 3des: ~12–14 MB/s; `TripleDesCipher::encrypt_block` visible
-- L4 stress: test OK; low signal for locks
-- Change landed: enable `aes_armv8` cfg for aarch64 targets
+- **`make vendor` overwrites vendored pprof-rs** — the ITIMER_REAL + SIGALRM changes in
+  `vendor/pprof/src/{timer.rs,profiler.rs}` must be re-applied after vendoring.
+  Check `git diff vendor/pprof/src/timer.rs` after `make vendor`.
+- **I/O-bound server profiles**: The CPU profile will show 99%+ in `tokio::runtime::park::Inner::park`
+  (tokio worker waiting for I/O). This is CORRECT wall-clock behavior. To find CPU hotspots:
+  - `go tool pprof -top -ignore="Inner::park" profile.pb.gz`
+  - Or run `make stress` for CPU-intensive workloads
+- **Vendored pprof-rs modifications** (vs upstream defaults):
+  1. `ITIMER_REAL` (wall-clock) instead of `ITIMER_PROF` (CPU-only) — gives ~90% sample coverage
+     vs <1% for I/O-bound servers. ITIMER_REAL generates SIGALRM (signal handler updated).
+  2. `frame-pointer` feature enabled — uses frame-pointer chain walking for clean Rust-only
+     backtraces. Automatically stops at libc/pthread boundaries. Empty backtraces are dropped.
 
 ## Related docs
 
 - `bench/PROFILE_RUNBOOK.md`
 - `bench/profiles/HOTSPOTS.md`
 - `PERF_OPTIMIZATION_PLAN.md`
-- Design: `docs/superpowers/specs/2026-07-21-flamegraph-perf-design.md`
+- `kpprof-rs/src/lib.rs` — kpprof module docs (endpoints, profiling guide, vendored modifications)

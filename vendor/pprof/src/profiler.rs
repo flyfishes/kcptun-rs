@@ -370,6 +370,16 @@ extern "C" fn perf_signal_handler(
                 }
             });
 
+            // Skip samples with empty backtraces. With the frame-pointer
+            // unwinder, this happens when the signal fires inside a system
+            // library (libc/pthread) that lacks frame pointers — the unwinder
+            // can't traverse the stack, producing an empty trace. Recording
+            // these would create misleading "(anonymous)" or system-symbol
+            // leaf frames in the profile.
+            if bt.is_empty() {
+                return;
+            }
+
             let current_thread = unsafe { libc::pthread_self() };
             let mut name = [0; MAX_THREAD_NAME];
             let name_ptr = &mut name as *mut [libc::c_char] as *mut libc::c_char;
@@ -457,14 +467,16 @@ impl Profiler {
             signal::SaFlags::SA_SIGINFO | signal::SaFlags::SA_RESTART,
             signal::SigSet::empty(),
         );
-        unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }?;
+        // ITIMER_REAL generates SIGALRM (not SIGPROF), so we register the handler
+// for SIGALRM. See timer.rs for why ITIMER_REAL is used instead of ITIMER_PROF.
+unsafe { signal::sigaction(signal::SIGALRM, &sigaction) }?;
 
         Ok(())
     }
 
     fn unregister_signal_handler(&self) -> Result<()> {
         let handler = signal::SigHandler::SigIgn;
-        unsafe { signal::signal(signal::SIGPROF, handler) }?;
+        unsafe { signal::signal(signal::SIGALRM, handler) }?;
 
         Ok(())
     }

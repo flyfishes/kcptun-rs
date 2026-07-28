@@ -43,7 +43,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `smux-rs/` | SMUX v1/v2 multiplexer (see `smux-rs/AGENTS.md`) |
 | `qpp-rs/` | Quantum Permutation Pad stream obfuscation (see `qpp-rs/AGENTS.md`) |
 | `kio-rs/` | Runtime-agnostic async I/O tokio\|smol (see `kio-rs/AGENTS.md`) |
-| `kpprof-rs/` | Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock) |
+| `kpprof-rs/` | Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock) (see `kpprof-rs/AGENTS.md`) |
 | `kcptun-client/` | Client binary (see `kcptun-client/AGENTS.md`) |
 | `kcptun-server/` | Server binary + stress tests (see `kcptun-server/AGENTS.md`) |
 | `bench/` | Bench/profile runners (see `bench/AGENTS.md`) |

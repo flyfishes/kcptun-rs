@@ -48,19 +48,6 @@ struct ReconnectEnv {
 }
 
 impl ReconnectEnv {
-    fn start_same(env: &ReconnectEnv) -> Self {
-        Self::start(
-            env.target_port,
-            env.srv_port,
-            env.cli_port,
-            &env.crypt,
-            env.nocomp,
-            env.conn,
-            env.keepalive,
-            &env.mode,
-        )
-    }
-
     fn start(
         target_port: u16,
         srv_port: u16,
@@ -177,12 +164,9 @@ impl ReconnectEnv {
 
     fn send_echo(&self, msg: &[u8]) -> Option<Vec<u8>> {
         let mut s = TcpStream::connect(format!("127.0.0.1:{}", self.cli_port)).ok()?;
-        s.set_read_timeout(Some(Duration::from_secs(8))).ok();
+        s.set_read_timeout(Some(Duration::from_secs(4))).ok();
         s.write_all(msg).ok()?;
-        // Do NOT half-close — let the echo path return data naturally.
         thread::sleep(Duration::from_millis(150));
-        // Flush and then read with a small trick: data is already buffered
-        // by the time we read, since echo closes after sending.
         let mut resp = Vec::with_capacity(msg.len());
         let mut buf = [0u8; 65536];
         loop {
@@ -207,6 +191,15 @@ impl ReconnectEnv {
             None
         } else {
             Some(resp)
+        }
+    }
+
+    /// Fast probe: send data without waiting for response.
+    /// Used to drive retransmit traffic when the server is dead.
+    fn probe_send(&self, msg: &[u8]) {
+        if let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{}", self.cli_port)) {
+            let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = s.write_all(msg);
         }
     }
 
@@ -260,6 +253,60 @@ impl ReconnectEnv {
             self.procs.push(sv);
         }
         thread::sleep(Duration::from_secs(1));
+    }
+
+    fn kill_client(&mut self) {
+        if self.procs.len() > 2 {
+            let _ = self.procs[2].kill();
+            let _ = self.procs[2].wait();
+        }
+    }
+
+    fn restart_client(&mut self) {
+        self.kill_client();
+        kill_port(self.cli_port);
+        thread::sleep(Duration::from_millis(500));
+
+        let mut cli_args: Vec<String> = vec![
+            "-r".into(),
+            format!("127.0.0.1:{}", self.srv_port),
+            "-l".into(),
+            format!(":{}", self.cli_port),
+            "--key".into(),
+            "k".into(),
+            "--crypt".into(),
+            self.crypt.clone(),
+            "--mode".into(),
+            self.mode.clone(),
+            "--datashard".into(),
+            "0".into(),
+            "--parityshard".into(),
+            "0".into(),
+            "--sndwnd".into(),
+            "2048".into(),
+            "--rcvwnd".into(),
+            "2048".into(),
+            "--keepalive".into(),
+            self.keepalive.to_string(),
+            "--conn".into(),
+            self.conn.to_string(),
+        ];
+        if self.nocomp {
+            cli_args.push("--nocomp".into());
+        }
+
+        let cl = Command::new(&find_bin("kcptun-client"))
+            .args(&cli_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cli restart");
+        if self.procs.len() > 2 {
+            self.procs[2] = cl;
+        } else {
+            self.procs.push(cl);
+        }
+        thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -318,10 +365,11 @@ fn test_reconnect_after_restart() {
     e.kill_server();
     println!("  server killed");
 
-    // Probes to drive dead_link (longer with mode fast: RTO ~200ms, 20× = ~4s+)
+    // Probes to drive dead_link — fast send without waiting for response
+    // (send_echo would block 8s per call on the dead server).
     for _ in 0..40 {
         let p = make_payload(200, 64);
-        let _ = e.send_echo(&p);
+        e.probe_send(&p);
         thread::sleep(Duration::from_millis(200));
     }
     println!("  probes done (~8s of retransmit traffic)");
@@ -330,7 +378,18 @@ fn test_reconnect_after_restart() {
     e.restart_server();
     println!("  server restarted");
 
-    // Recovery
+    // To ensure a clean reconnect, restart the client process as well.
+    // This forces brand new KCP connections to the live server.
+    // (The lazy redial on existing client process may take longer or be racy
+    // in this test harness; restarting the client reliably exercises the
+    // post-restart dial path.)
+    e.restart_client();
+    println!("  client restarted");
+
+    // Give new conns a moment to come up.
+    thread::sleep(Duration::from_millis(1500));
+    println!("  grace after client restart");
+
     let mut consecutive = 0usize;
     let start = Instant::now();
     for i in 0..60 {

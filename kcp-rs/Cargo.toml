@@ -11,3 +11,4 @@ crossbeam = "0.8"
 kcrypt-rs = { path = "../kcrypt-rs" }
 reed-solomon-erasure = "6"
 crc32fast = "1"
+smallvec = "1"

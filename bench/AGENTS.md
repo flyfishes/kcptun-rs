@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-07-23 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-28 -->
 
 # bench
 
@@ -41,7 +41,7 @@ Throughput and CPU-profile tooling for Rust vs Go kcptun. Go-compatible pprof pr
 ### Common Patterns
 
 - Env: `BENCH_DATA_MB`, `SKIP_PROFILE_REBUILD=1`
-- Profiling profile: `cargo build --profile profiling --features pprof -p kcptun-server -p kcptun-client`
+- Profiling profile: `make profiling-bins` (bakes in `force-frame-pointers=yes`)
 - pprof HTTP endpoints: `--pprof 127.0.0.1:6060` (requires `--features pprof`)
 - Deadlock detection: `--features pprof-deadlock` (adds overhead)
 
@@ -55,4 +55,4 @@ Throughput and CPU-profile tooling for Rust vs Go kcptun. Go-compatible pprof pr
 
 - Go toolchain for pprof UI (`go tool pprof`)
 
-<!-- MANUAL: -->
+<!-- MANUAL -->

@@ -8,7 +8,7 @@
 //! - Graceful shutdown
 
 use log::debug;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::frame::{Cmd, Frame, FrameCodec};
 use crate::stream::{Stream, StreamState};
@@ -152,6 +152,17 @@ pub struct Session {
     upd_tx: kio::Sender<UpdFrame>,
     /// Channel receiver for pending UPD frames.
     upd_rx: kio::Receiver<UpdFrame>,
+    /// Pending SYN frames to send (queued by SmuxConn::open_stream).
+    /// Drained by prepare_outbound_into() at the start of each flush cycle.
+    pending_syns: Arc<Mutex<Vec<u32>>>,
+    /// Accepted stream IDs waiting for SmuxConn::accept() to pick up.
+    /// Only populated when `accept_enabled` is true (SmuxConn server mode).
+    accepted_streams: Arc<Mutex<VecDeque<u32>>>,
+    /// Notify for waking SmuxConn::accept() when a new stream arrives.
+    accept_notify: kio::Notify,
+    /// Only push to accepted_streams when true. kcptun never sets this,
+    /// so the queue stays empty and there's zero overhead.
+    accept_enabled: AtomicBool,
 }
 
 impl Session {
@@ -161,17 +172,19 @@ impl Session {
         self.config.version
     }
 
-    /// Create a new client-side SMUX session.
+    /// Create a new SMUX session.
     ///
-    /// A client session initiates stream creation and uses odd-numbered stream IDs.
-    pub fn new_client(config: &Config) -> Result<Self, SessionError> {
+    /// `is_client` controls the starting stream ID: client uses odd IDs
+    /// (starting at 1), server uses even IDs (starting at 0).
+    fn new(config: &Config, is_client: bool) -> Result<Self, SessionError> {
         config.verify()?;
         let (upd_tx, upd_rx) = kio::bounded(UPD_CHANNEL_CAPACITY);
+        let next_id = if is_client { 1 } else { 0 };
         Ok(Session {
             config: config.clone(),
             closed: Arc::new(AtomicBool::new(false)),
             streams: Arc::new(Mutex::new(HashMap::new())),
-            next_stream_id: AtomicU32::new(1),
+            next_stream_id: AtomicU32::new(next_id),
             codec: Arc::new(Mutex::new(FrameCodec::new(config.max_receive_buffer))),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
             last_keepalive_ms: AtomicU64::new(kio::mono_ms()),
@@ -180,29 +193,27 @@ impl Session {
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
             upd_tx,
             upd_rx,
+            pending_syns: Arc::new(Mutex::new(Vec::new())),
+            accepted_streams: Arc::new(Mutex::new(VecDeque::new())),
+            accept_notify: kio::Notify::new(),
+            accept_enabled: AtomicBool::new(false),
         })
+    }
+
+    /// Create a new client-side SMUX session.
+    ///
+    /// A client session initiates stream creation and uses odd-numbered stream IDs.
+    #[inline]
+    pub fn new_client(config: &Config) -> Result<Self, SessionError> {
+        Self::new(config, true)
     }
 
     /// Create a new server-side SMUX session.
     ///
     /// A server session accepts stream creation and uses even-numbered stream IDs.
+    #[inline]
     pub fn new_server(config: &Config) -> Result<Self, SessionError> {
-        config.verify()?;
-        let (upd_tx, upd_rx) = kio::bounded(UPD_CHANNEL_CAPACITY);
-        Ok(Session {
-            config: config.clone(),
-            closed: Arc::new(AtomicBool::new(false)),
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            next_stream_id: AtomicU32::new(0),
-            codec: Arc::new(Mutex::new(FrameCodec::new(config.max_receive_buffer))),
-            keepalive_interval: Duration::from_secs(config.keepalive_interval),
-            last_keepalive_ms: AtomicU64::new(kio::mono_ms()),
-            last_activity_ms: AtomicU64::new(kio::mono_ms()),
-            max_streams: MAX_STREAMS,
-            token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
-            upd_tx,
-            upd_rx,
-        })
+        Self::new(config, false)
     }
 
     /// Check if the session is closed.
@@ -249,6 +260,33 @@ impl Session {
             frames.push(frame);
         }
         frames
+    }
+
+    /// Queue a SYN frame to be sent by the next prepare_outbound_into() call.
+    ///
+    /// Used by SmuxConn::open_stream() so that SYN frames are automatically
+    /// included in the outbound flush. kcptun sends SYN manually, so it never
+    /// calls this — pending_syns stays empty.
+    pub fn queue_syn(&self, stream_id: u32) {
+        self.pending_syns.lock().push(stream_id);
+    }
+
+    /// Pop the next accepted stream ID (for SmuxConn::accept()).
+    ///
+    /// Returns None when no new streams have been accepted since the last call.
+    pub fn pop_accepted_stream(&self) -> Option<u32> {
+        self.accepted_streams.lock().pop_front()
+    }
+
+    /// Get the accept notification handle (for SmuxConn::accept()).
+    pub fn accept_notify(&self) -> &kio::Notify {
+        &self.accept_notify
+    }
+
+    /// Enable accept queue (SmuxConn server mode).
+    /// When enabled, process_data() will push accepted stream IDs and notify.
+    pub fn enable_accept(&self) {
+        self.accept_enabled.store(true, Ordering::Release);
     }
 
     /// Open a new stream on this session (client side).
@@ -318,6 +356,10 @@ impl Session {
                     // Incoming stream request (Go cmdSYN = 0)
                     debug!("SMUX: received SYN for stream {}", frame.stream_id);
                     self.accept_stream(frame.stream_id)?;
+                    if self.accept_enabled.load(Ordering::Acquire) {
+                        self.accepted_streams.lock().push_back(frame.stream_id);
+                        self.accept_notify.notify_one();
+                    }
                 }
                 Cmd::Fin => {
                     // Stream closed by remote (Go cmdFIN = 1) — may carry last data
@@ -514,6 +556,104 @@ impl Session {
     pub fn keepalive_frame(&self) -> Frame {
         Frame::new(Cmd::Nop, 0, Bytes::new()).with_ver(self.config.version)
     }
+
+    /// Prepare outbound SMUX frames by draining streams, encoding FINs for
+    /// eligible closed streams, and appending any pending UPD frames.
+    ///
+    /// This is the unified outbound path for both client and server schedulers.
+    /// It appends directly into the caller's `buf` (zero-copy from each stream's
+    /// send buffer — one `extend_from_slice` per chunk on the flush path).
+    ///
+    /// - `max_bytes`: soft cap on total *payload* bytes to drain across streams.
+    /// - `ver`: SMUX version (1 or 2) used for frame headers.
+    ///
+    /// Returns the stream IDs for which a FIN frame was encoded. The caller
+    /// **must** call `mark_fin_sent(id)` on each of these **only after** the
+    /// corresponding data has been successfully accepted by the transport
+    /// (e.g., after `kcp.send` of the whole batch succeeds). This preserves the
+    /// "can't lose FIN" invariant.
+    ///
+    /// The low-level `drain_send_max` / `check_upd` / `take_upd_frames` remain
+    /// available for advanced integration; this method is the recommended
+    /// single entry point for normal high-performance flush loops.
+    pub fn prepare_outbound_into(&self, buf: &mut BytesMut, max_bytes: usize, ver: u8) -> Vec<u32> {
+        let mut fin_streams = Vec::new();
+        let mut drained_total = 0usize;
+
+        // Drain pending SYN frames first (queued by SmuxConn::open_stream).
+        // kcptun never queues SYNs, so this is a no-op for kcptun.
+        {
+            let mut syns = self.pending_syns.lock();
+            if !syns.is_empty() {
+                for id in syns.drain(..) {
+                    Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
+                }
+            }
+        }
+
+        {
+            let streams = self.streams.lock();
+
+            // Drain data from streams (PSH frames), respecting per-stream peer window
+            // and the overall max_bytes cap. Matches the previous manual Phase 1.
+            'outer: for (&id, s) in streams.iter() {
+                loop {
+                    if drained_total >= max_bytes {
+                        break 'outer;
+                    }
+                    let header_pos = buf.len();
+                    Frame::encode_header_into(buf, ver, Cmd::Psh, id, 0);
+                    let n = s.drain_send_max(buf, crate::frame::MAX_FRAME_SIZE);
+                    if n == 0 {
+                        buf.truncate(header_pos);
+                        break;
+                    }
+                    Frame::patch_header_length(buf, header_pos, n as u16);
+                    drained_total += n;
+                }
+            }
+
+            // Collect FIN candidates (local closed, no pending send, FIN not yet sent).
+            // Encode FIN headers now; mark_fin_sent only after transport accepts the bytes.
+            for (&id, s) in streams.iter() {
+                if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
+                    debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
+                    Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
+                    fin_streams.push(id);
+                }
+            }
+        }
+
+        // Window updates (UPD). This scans streams and enqueues, then drains the channel.
+        self.check_upd();
+        for upd in self.take_upd_frames() {
+            Frame::encode_header_into(buf, ver, Cmd::Upd, upd.stream_id, 8);
+            buf.extend_from_slice(&upd.consumed.to_le_bytes());
+            buf.extend_from_slice(&upd.window.to_le_bytes());
+        }
+
+        fin_streams
+    }
+
+    /// Mark the given stream IDs as having had their FIN frame sent.
+    ///
+    /// Call this **after** the transport has accepted the bytes containing
+    /// the corresponding FIN frames (e.g., after a successful `kcp.send` of
+    /// the batch that included them). This is required to preserve the
+    /// "can't lose FIN" rule and to allow proper linger/reap behavior.
+    ///
+    /// Unknown IDs are ignored.
+    pub fn mark_fins_sent(&self, ids: &[u32]) {
+        if ids.is_empty() {
+            return;
+        }
+        let streams = self.streams.lock();
+        for &id in ids {
+            if let Some(s) = streams.get(&id) {
+                s.mark_fin_sent();
+            }
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -699,5 +839,90 @@ mod tests {
 
         // Should be empty again
         assert!(session.take_upd_frames().is_empty());
+    }
+
+    #[test]
+    fn session_prepare_outbound_basic_psh_and_fin() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        let id = s.id();
+
+        // Write some data; it should be drained into a PSH frame.
+        s.write_bytes(Bytes::from_static(b"hello")).unwrap();
+        let mut buf = BytesMut::new();
+        let fin_ids = session.prepare_outbound_into(&mut buf, 64 * 1024, 2);
+        assert!(fin_ids.is_empty(), "no FIN yet");
+        assert!(!buf.is_empty(), "should have produced frame bytes");
+
+        // Decode the frame(s) we produced and ensure we see a PSH for our stream.
+        let mut codec = FrameCodec::new(DEFAULT_CONFIG.max_receive_buffer);
+        codec.feed(&buf);
+        let mut saw_psh = false;
+        while let Some(f) = codec.decode() {
+            if f.cmd == Cmd::Psh && f.stream_id == id {
+                saw_psh = true;
+                assert_eq!(&f.data[..], b"hello");
+            }
+        }
+        assert!(saw_psh, "expected a PSH frame for our stream");
+
+        // Now mark the stream locally closed with no pending send.
+        s.mark_local_closed();
+        // Drain any residual (should be none) and request FIN.
+        let mut buf2 = BytesMut::new();
+        let fin_ids2 = session.prepare_outbound_into(&mut buf2, 64 * 1024, 2);
+        assert_eq!(fin_ids2, vec![id], "should have encoded FIN for this stream");
+        assert!(!s.is_fin_sent(), "FIN not yet sent until mark_fins_sent");
+
+        // Simulate transport acceptance: mark FINs sent.
+        session.mark_fins_sent(&fin_ids2);
+        assert!(s.is_fin_sent(), "FIN should now be marked as sent");
+    }
+
+    #[test]
+    fn session_prepare_outbound_respects_max_bytes_and_peer_window() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+
+        // Large write, but cap drain to a small amount.
+        let big = vec![b'x'; 100 * 1024];
+        s.write_bytes(Bytes::from(big.clone())).unwrap();
+
+        let mut buf = BytesMut::new();
+        // Very small cap to force partial drain.
+        let _ = session.prepare_outbound_into(&mut buf, 1024, 2);
+
+        // We should have produced some bytes, but not the entire payload.
+        // The peer window starts at 256KiB (initialPeerWindow), so max_bytes is the limiter.
+        assert!(buf.len() > 0);
+        assert!(buf.len() < big.len(), "should be capped by max_bytes");
+        // Stream should still have pending data.
+        assert!(s.pending_send() > 0);
+    }
+
+    #[test]
+    fn session_prepare_outbound_includes_upd() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+
+        // Push some inbound data and read enough to trigger a pending UPD (v2).
+        // read() sets need_upd when bytes_read crosses half max_recv_buf or on first read.
+        s.push_data_bytes(Bytes::from_static(b"data")).unwrap();
+        let mut tmp = [0u8; 8];
+        let _ = s.read(&mut tmp);
+
+        // Prepare outbound should include an UPD frame (cmd=4).
+        let mut buf = BytesMut::new();
+        let _ = session.prepare_outbound_into(&mut buf, 64 * 1024, 2);
+
+        let mut codec = FrameCodec::new(DEFAULT_CONFIG.max_receive_buffer);
+        codec.feed(&buf);
+        let mut saw_upd = false;
+        while let Some(f) = codec.decode() {
+            if f.cmd == Cmd::Upd && f.stream_id == s.id() {
+                saw_upd = true;
+            }
+        }
+        assert!(saw_upd, "expected an UPD frame when reader advanced");
     }
 }

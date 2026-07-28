@@ -9,7 +9,7 @@ name = "kpprof"
 
 [dependencies]
 kio-rs = { path = "../kio-rs", default-features = false }
-pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"] }
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec", "frame-pointer"] }
 backtrace = "0.3"
 log = "0.4"
 anyhow = "1"

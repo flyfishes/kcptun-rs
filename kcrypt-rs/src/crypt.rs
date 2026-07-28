@@ -357,45 +357,13 @@ fn pad(k: &[u8], s: usize) -> Vec<u8> {
 ///
 /// Returns a boxed cipher and the canonical method name string.
 /// Unknown methods default to AES-256-CFB (`"aes"`).
+///
+/// Delegates to [`CryptEngine::select`] to avoid duplicating the cipher
+/// selection match — the only difference is the return type (`Box<dyn BlockCrypt>`
+/// vs `CryptEngine` enum).
 pub fn select_block_crypt(method: &str, pass: &[u8]) -> (Box<dyn BlockCrypt>, String) {
-    match method {
-        // Go's "null" means no cipher at all (nil BlockCrypt = no crypto header).
-        // "none" means NoneBlockCrypt (copies data, but still has crypto header).
-        "null" => (Box::new(NoneCrypt), "null".to_string()),
-        "none" => (Box::new(NoneCrypt), "none".to_string()),
-        "xor" => (Box::new(SimpleXORCrypt::new(pass)), method.to_string()),
-        "aes-128" => (
-            Box::new(AesCfbCrypt::new(&pad(pass, 16))),
-            method.to_string(),
-        ),
-        "aes-192" => (
-            Box::new(AesCfbCrypt::new(&pad(pass, 24))),
-            method.to_string(),
-        ),
-        "aes" | "aes-256" => (Box::new(AesCfbCrypt::new(pass)), "aes".to_string()),
-        "aes-128-gcm" => (
-            Box::new(Aes128GcmCrypt::new(pass)),
-            "aes-128-gcm".to_string(),
-        ),
-        "sm4" => (Box::new(Sm4Crypt::new(&pad(pass, 16))), method.to_string()),
-        "tea" => (Box::new(TeaCrypt::new(pass)), method.to_string()),
-        "xtea" => (Box::new(XteaCrypt::new(pass)), method.to_string()),
-        "salsa20" | "salsa" => (Box::new(Salsa20Crypt::new(pass)), "salsa20".to_string()),
-        "blowfish" => (Box::new(BlowfishCrypt::new(pass)), method.to_string()),
-        "twofish" => (
-            Box::new(TwofishCrypt::new(&pad(pass, 32))),
-            method.to_string(),
-        ),
-        "cast5" => (
-            Box::new(Cast5Crypt::new(&pad(pass, 16))),
-            method.to_string(),
-        ),
-        "3des" | "tripledes" => (
-            Box::new(TripleDesCrypt::new(&pad(pass, 24))),
-            "3des".to_string(),
-        ),
-        _ => (Box::new(AesCfbCrypt::new(pass)), "aes".to_string()),
-    }
+    let (engine, name) = CryptEngine::select(method, pass);
+    (Box::new(engine), name)
 }
 
 /// Select an [`AeadCrypt`] if the method is an AEAD variant.

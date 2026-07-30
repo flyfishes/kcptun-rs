@@ -13,10 +13,16 @@ Implementations:
   Rust-smol   target/smol-release/release/{kcptun-client,kcptun-server}
 
 Usage:
-  python3 bench_rust_vs_go.py [--conn N] [--size S] [--timeout T] [--quick]
+  python3 bench_rust_vs_go.py [--conn N] [--size S] [--timeout T] [--quick] [--runs N]
   python3 bench_rust_vs_go.py --rust-only   # only Rust-tokio
   python3 bench_rust_vs_go.py --smol-only   # only Rust-smol
   python3 bench_rust_vs_go.py --go-only     # only Go
+
+Noise reduction:
+  --runs N  repeats each (cipher, comp) config N times, reports median
+            (default: 3 with --quick, 1 otherwise)
+  --conn N  concurrent connections (default: 10, higher = less noise)
+  --size S  payload bytes (default: 1048576, bigger = more stable)
 """
 import socket
 import threading
@@ -312,7 +318,7 @@ def run_one_connection(conn_id, local_port, payload_size, timeout, results):
 
 def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
               crypt, nocomp, impl_name):
-    """Run a single benchmark configuration."""
+    """Run a single benchmark configuration and return result dict (or None)."""
     # Allocate a (echo, srv, cli) triple guaranteed bindable right now
     allocated = allocate_ports()
     if allocated is None:
@@ -429,9 +435,41 @@ def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
         result['latency_avg'] = sum(elapsed_list) / len(elapsed_list)
         result['latency_min'] = min(elapsed_list)
         result['latency_max'] = max(elapsed_list)
+
+    # Cleanup and free ports before next run
+    cli.terminate(); srv.terminate()
+    try: cli.wait(timeout=5)
+    except: cli.kill()
+    try: srv.wait(timeout=5)
+    except: srv.kill()
+    echo.close()
+    ensure_ports_free(echo_port, srv_port, cli_port, timeout=3.0)
     return result
 
-# ─── Test Matrix ──────────────────────────────────────────────────────────
+
+def _aggregate_runs_mean(bench_fn, runs, **kwargs):
+    """Run bench_fn N times, report aggregated mean throughput/latency."""
+    results = []
+    for i in range(runs):
+        log(f"  run {i+1}/{runs}...")
+        r = bench_fn(**kwargs)
+        if r and r['ok'] > 0:
+            results.append(r)
+    if not results:
+        return None
+    total_ok = sum(r['ok'] for r in results)
+    total_fail = sum(r['fail'] for r in results)
+    total_time = sum(r['total_time'] for r in results)
+    total_bytes = sum(r['total_bytes'] for r in results)
+    lat = sum(r.get('latency_avg', 0) * r['ok'] for r in results) / max(total_ok, 1)
+    return {
+        'label': kwargs.get('label', ''), 'crypt': kwargs.get('crypt', ''),
+        'nocomp': kwargs.get('nocomp', False), 'impl': kwargs.get('impl_name', ''),
+        'ok': total_ok, 'fail': total_fail,
+        'total_time': total_time, 'throughput': total_bytes / total_time if total_time > 0 else 0,
+        'total_bytes': total_bytes, 'latency_avg': lat,
+    }
+
 
 CIPHERS = [
     'null', 'none', 'xor', 'aes-128', 'aes-128-gcm',
@@ -450,10 +488,12 @@ def main():
     parser.add_argument('--size', type=int, default=1048576, help='payload size in bytes (default: 1M=1048576)')
     parser.add_argument('--timeout', type=int, default=30, help='per-connection timeout (s)')
     parser.add_argument('--quick', action='store_true', help='quick mode: fewer ciphers')
+    parser.add_argument('--runs', type=int, default=0, help='repeat each config N times, report median (0=auto: 3 for --quick, 1 otherwise)')
     parser.add_argument('--rust-only', action='store_true', help='only Rust-tokio (skip Go and Rust-smol)')
     parser.add_argument('--smol-only', action='store_true', help='only Rust-smol (skip Go and Rust-tokio)')
     parser.add_argument('--go-only', action='store_true', help='only Go (skip Rust-tokio and Rust-smol)')
     args = parser.parse_args()
+    runs = args.runs if args.runs > 0 else (3 if args.quick else 1)
 
     rust_server = os.path.join(REPO, 'target/release/kcptun-server')
     rust_client = os.path.join(REPO, 'target/release/kcptun-client')
@@ -491,7 +531,7 @@ def main():
     print()
     print("=" * 80)
     print(f"  kcptun Benchmark: {args.conn} conn × {args.size} bytes ({args.size/1024:.0f}K)")
-    print(f"  Ciphers: {len(ciphers)} | Compression: on+off | Implementations: ", end="")
+    print(f"  Ciphers: {len(ciphers)} | Compression: on+off | Runs per config: {runs} | Implementations: ", end="")
     impls = []
     if test_rust: impls.append("Rust-tokio")
     if test_smol: impls.append("Rust-smol")
@@ -512,8 +552,11 @@ def main():
             if test_rust:
                 test_num += 1
                 log(f"[{test_num}/{total_tests}] Rust-tokio {config}")
-                r = run_bench(rust_server, rust_client, False, args.conn, args.size,
-                             args.timeout, f"Rust-tokio {config}", crypt, nocomp, 'rust')
+                r = _aggregate_runs_mean(run_bench, runs, server_bin=rust_server, client_bin=rust_client,
+                    is_go=False, conn=args.conn, size=args.size, timeout=args.timeout,
+                    label=f"Rust-tokio {config}", crypt=crypt, nocomp=nocomp, impl_name='rust') if runs > 1 else \
+                    run_bench(rust_server, rust_client, False, args.conn, args.size,
+                              args.timeout, f"Rust-tokio {config}", crypt, nocomp, 'rust')
                 if r:
                     all_results.append(r)
                     tp = r['throughput'] / 1024 / 1024
@@ -526,8 +569,11 @@ def main():
             if test_smol:
                 test_num += 1
                 log(f"[{test_num}/{total_tests}] Rust-smol {config}")
-                r = run_bench(smol_server, smol_client, False, args.conn, args.size,
-                             args.timeout, f"Rust-smol {config}", crypt, nocomp, 'smol')
+                r = _aggregate_runs_mean(run_bench, runs, server_bin=smol_server, client_bin=smol_client,
+                    is_go=False, conn=args.conn, size=args.size, timeout=args.timeout,
+                    label=f"Rust-smol {config}", crypt=crypt, nocomp=nocomp, impl_name='smol') if runs > 1 else \
+                    run_bench(smol_server, smol_client, False, args.conn, args.size,
+                              args.timeout, f"Rust-smol {config}", crypt, nocomp, 'smol')
                 if r:
                     all_results.append(r)
                     tp = r['throughput'] / 1024 / 1024
@@ -540,8 +586,11 @@ def main():
             if test_go:
                 test_num += 1
                 log(f"[{test_num}/{total_tests}] Go {config}")
-                r = run_bench(go_server, go_client, True, args.conn, args.size,
-                             args.timeout, f"Go {config}", crypt, nocomp, 'go')
+                r = _aggregate_runs_mean(run_bench, runs, server_bin=go_server, client_bin=go_client,
+                    is_go=True, conn=args.conn, size=args.size, timeout=args.timeout,
+                    label=f"Go {config}", crypt=crypt, nocomp=nocomp, impl_name='go') if runs > 1 else \
+                    run_bench(go_server, go_client, True, args.conn, args.size,
+                              args.timeout, f"Go {config}", crypt, nocomp, 'go')
                 if r:
                     all_results.append(r)
                     tp = r['throughput'] / 1024 / 1024

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Perf — Eliminate vtable dispatch on hot crypto paths (kcp-rs)
+
+- **`CryptEngine` replaces `dyn BlockCrypt`**: Changed 4 function signatures in
+  `crypto_buf.rs` — `encrypt_cfb`, `encrypt_salsa_headerless`, `decrypt_cfb_in_place`,
+  `decrypt_cfb` — from `&dyn BlockCrypt` to `&CryptEngine`. Eliminates vtable
+  dispatch on every encrypt/decrypt call. For fast ciphers (xor/salsa20) where
+  the crypto work is trivial XOR, the vtable overhead exceeded the work.
+- **Cipher-aware `should_cpu_block_encrypt`**: 
+  - xor/salsa20/salsa: never offload (trivial work, dispatch costs more)
+  - AEAD (AES-GCM): never offload (AES-NI + buffer reuse, dispatch costs more)
+  - null: never offload (work is pointer moves)
+  - CFB ciphers: existing threshold (4+ packets or 4+ KiB)
+- **`encrypt_salsa_headerless` reuses `CryptoBuf.enc_buf`**: Replaced per-packet
+  `BytesMut::with_capacity` allocation with buffer reuse (same pattern as
+  `encrypt_cfb`), eliminating per-packet heap allocation for salsa20/xor.
+- **Skip parallel encrypt for fast ciphers**: Forced serial path for
+  salsa20/xor — thread spawn/sync overhead exceeds trivial XOR work.
+- **`should_cpu_block_compress` threshold 4 KiB → 64 KiB**: Old threshold
+  was ~6× below the cpu_block dispatch break-even point, triggering on every
+  flush and creating a 2-3× comp/no-comp asymmetry for slow ciphers (3des)
+  and fast ciphers (salsa20). New threshold based on Snappy throughput
+  (~500 MB/s → 64 KiB ≈ 128 μs work vs ~50 μs dispatch).
+
+**Benchmark impact** (conn=4, 64 KiB random data):
+  - aes-128/no-comp: +29% throughput (was 0.89× Go, now 1.15× Go)
+  - salsa20/no-comp: +52% throughput (buffer reuse + vtable elimination)
+  - 3des no-comp/comp gap: 2.15× → 1.01× (Snappy threshold fix)
+  - salsa20 no-comp/comp gap: 2.86× → 1.33× (Snappy threshold fix)
+
+**Testing:** all 237 workspace tests pass, clippy clean (`-D warnings`).
+
 ### Refactor — Rust idioms & style compliance (kcp-rs, kcrypt-rs, smux-rs)
 
 - **kcp-rs** — Go-style残留清理 + 性能优化:

@@ -309,18 +309,39 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         // ── HTML index ──────────────────────────────────────────────────
         if path == "/debug/pprof/" || path == "/debug/pprof" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
             let body = build_index_html();
-            respond(&mut stream, "200 OK", "text/html; charset=utf-8", "", body.as_bytes()).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                "",
+                body.as_bytes(),
+            )
+            .await;
             continue;
         }
 
         // ── CPU profile ─────────────────────────────────────────────────
         if path == "/debug/pprof/profile" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
             let mut seconds: u64 = 30;
@@ -365,7 +386,14 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     let msg = format!("{e}\n");
-                    respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", "", msg.as_bytes()).await;
+                    respond(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "text/plain; charset=utf-8",
+                        "",
+                        msg.as_bytes(),
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -383,14 +411,26 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 &body,
             )
             .await;
-            log::info!("pprof CPU profile complete ({} bytes gzipped from {} raw) peer={}", body.len(), profile_bytes.len(), peer);
+            log::info!(
+                "pprof CPU profile complete ({} bytes gzipped from {} raw) peer={}",
+                body.len(),
+                profile_bytes.len(),
+                peer
+            );
             continue;
         }
 
         // ── Command line ────────────────────────────────────────────────
         if path == "/debug/pprof/cmdline" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
             let args: Vec<Vec<u8>> = std::env::args()
@@ -401,14 +441,28 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 })
                 .collect();
             let body: Vec<u8> = args.into_iter().flatten().collect();
-            respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", &body).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                "",
+                &body,
+            )
+            .await;
             continue;
         }
 
         // ── Symbol lookup (Go-compatible: GET + POST, num_symbols format) ─
         if path == "/debug/pprof/symbol" {
             if method != "GET" && method != "POST" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
 
@@ -471,21 +525,36 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 }
             }
 
-            respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", symbols.as_bytes()).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                "",
+                symbols.as_bytes(),
+            )
+            .await;
             continue;
         }
 
         // ── Heap profile ────────────────────────────────────────────────
         if path == "/debug/pprof/heap" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
             // Go supports ?gc=1 to run GC before sampling.
             // In Rust we can't force mimalloc GC, but we can hint.
-            let gc_requested: bool = query
-                .split('&')
-                .any(|p| p.strip_prefix("gc=").is_some_and(|v| v.parse::<u32>().is_ok_and(|n| n > 0)));
+            let gc_requested: bool = query.split('&').any(|p| {
+                p.strip_prefix("gc=")
+                    .is_some_and(|v| v.parse::<u32>().is_ok_and(|n| n > 0))
+            });
             if gc_requested {
                 // mimalloc exposes mi_collect via FFI; a lightweight hint.
                 // For now just log — actual GC is handled by mimalloc internally.
@@ -499,15 +568,30 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
 
             let profile = build_heap_profile();
             if profile.is_empty() {
-                let msg = "heap profiling not enabled (build without ProfilingAllocator or rate=0)\n";
-                respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", msg.as_bytes()).await;
+                let msg =
+                    "heap profiling not enabled (build without ProfilingAllocator or rate=0)\n";
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    "",
+                    msg.as_bytes(),
+                )
+                .await;
             } else if debug_mode > 0 {
                 // Text format: just report summary (full text format is complex)
                 let summary = format!(
                     "heap profile (debug={}): {} bytes of profile data\nUse `go tool pprof` without debug for full analysis.\n",
                     debug_mode, profile.len()
                 );
-                respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", summary.as_bytes()).await;
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    "",
+                    summary.as_bytes(),
+                )
+                .await;
             } else {
                 let body = gzip_bytes(&profile);
                 respond(
@@ -525,7 +609,14 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         // ── Allocs profile ──────────────────────────────────────────────
         if path == "/debug/pprof/allocs" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
             let debug_mode: u64 = query
@@ -536,13 +627,27 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             let profile = build_allocs_profile();
             if profile.is_empty() {
                 let msg = "allocation profiling not enabled\n";
-                respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", msg.as_bytes()).await;
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    "",
+                    msg.as_bytes(),
+                )
+                .await;
             } else if debug_mode > 0 {
                 let summary = format!(
                     "allocs profile (debug={}): {} bytes of profile data\nUse `go tool pprof` without debug for full analysis.\n",
                     debug_mode, profile.len()
                 );
-                respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", summary.as_bytes()).await;
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    "",
+                    summary.as_bytes(),
+                )
+                .await;
             } else {
                 let body = gzip_bytes(&profile);
                 respond(
@@ -560,7 +665,14 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         // ── Goroutine (thread dump / empty protobuf) ────────────────────
         if path == "/debug/pprof/goroutine" {
             if method != "GET" && method != "HEAD" && !method.is_empty() {
-                respond(&mut stream, "405 Method Not Allowed", "text/plain; charset=utf-8", "", b"method not allowed\n").await;
+                respond(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"method not allowed\n",
+                )
+                .await;
                 continue;
             }
             let debug_mode: u64 = query
@@ -584,7 +696,14 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 .await;
             } else {
                 let body = dump_threads(debug_mode);
-                respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", body.as_bytes()).await;
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    "",
+                    body.as_bytes(),
+                )
+                .await;
             }
             continue;
         }
@@ -594,24 +713,53 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         // empty valid protobuf so `go tool pprof` doesn't error.
         if path == "/debug/pprof/block" {
             let body = gzip_bytes(&empty_profile("contentions", "events"));
-            respond(&mut stream, "200 OK", "application/octet-stream", "Content-Disposition: attachment; filename=\"block\"\r\n", &body).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/octet-stream",
+                "Content-Disposition: attachment; filename=\"block\"\r\n",
+                &body,
+            )
+            .await;
             continue;
         }
         if path == "/debug/pprof/mutex" {
             let body = gzip_bytes(&empty_profile("contentions", "events"));
-            respond(&mut stream, "200 OK", "application/octet-stream", "Content-Disposition: attachment; filename=\"mutex\"\r\n", &body).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/octet-stream",
+                "Content-Disposition: attachment; filename=\"mutex\"\r\n",
+                &body,
+            )
+            .await;
             continue;
         }
         if path == "/debug/pprof/threadcreate" {
             let body = gzip_bytes(&empty_profile("threads", "count"));
-            respond(&mut stream, "200 OK", "application/octet-stream", "Content-Disposition: attachment; filename=\"threadcreate\"\r\n", &body).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/octet-stream",
+                "Content-Disposition: attachment; filename=\"threadcreate\"\r\n",
+                &body,
+            )
+            .await;
             continue;
         }
 
         // ── Trace (not supported in Rust) ──────────────────────────────
         if path == "/debug/pprof/trace" {
-            let msg = "trace not supported in Rust runtime\nUse /debug/pprof/profile for CPU profiling\n";
-            respond(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", "", msg.as_bytes()).await;
+            let msg =
+                "trace not supported in Rust runtime\nUse /debug/pprof/profile for CPU profiling\n";
+            respond(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                "",
+                msg.as_bytes(),
+            )
+            .await;
             continue;
         }
 
@@ -619,7 +767,14 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
         #[cfg(feature = "deadlock")]
         if path == "/debug/pprof/deadlock" {
             let body = dump_deadlocks();
-            respond(&mut stream, "200 OK", "text/plain; charset=utf-8", "", body.as_bytes()).await;
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                "",
+                body.as_bytes(),
+            )
+            .await;
             continue;
         }
 
@@ -850,9 +1005,8 @@ fn dump_threads_linux(debug: u64) -> String {
 
         if debug >= 2 {
             // /proc/self/task/TID/stack requires CAP_SYS_PTRACE or root
-            let stack =
-                std::fs::read_to_string(format!("/proc/self/task/{tid}/stack"))
-                    .unwrap_or_else(|_| "  (no kernel stack available — need CAP_SYS_PTRACE)\n".into());
+            let stack = std::fs::read_to_string(format!("/proc/self/task/{tid}/stack"))
+                .unwrap_or_else(|_| "  (no kernel stack available — need CAP_SYS_PTRACE)\n".into());
             out.push_str("kernel stack:\n");
             out.push_str(&stack);
 
@@ -880,9 +1034,17 @@ fn dump_threads_linux(debug: u64) -> String {
         let deadlocks = parking_lot::deadlock::check_deadlock();
         if !deadlocks.is_empty() {
             let total: usize = deadlocks.iter().map(|v| v.len()).sum();
-            out.push_str(&format!("\n=== {} DEADLOCK CYCLES ({} threads) ===\n", deadlocks.len(), total));
+            out.push_str(&format!(
+                "\n=== {} DEADLOCK CYCLES ({} threads) ===\n",
+                deadlocks.len(),
+                total
+            ));
             for (i, threads) in deadlocks.iter().enumerate() {
-                out.push_str(&format!("\nDeadlock cycle #{} ({} threads):\n", i, threads.len()));
+                out.push_str(&format!(
+                    "\nDeadlock cycle #{} ({} threads):\n",
+                    i,
+                    threads.len()
+                ));
                 for t in threads {
                     out.push_str(&format!("  Thread Id {:#?}\n", t.thread_id()));
                     out.push_str(&format!("  {:#?}\n", t.backtrace()));

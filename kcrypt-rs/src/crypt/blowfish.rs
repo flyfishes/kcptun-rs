@@ -8,7 +8,7 @@
 //! Hot path: monomorphized CFB (no `Fn` closure) + reuse of a single
 //! `GenericArray` buffer for block encrypt.
 
-use super::{BlockCrypt, BlockCipher8, cfb8_encrypt, cfb8_decrypt};
+use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 use blowfish::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use blowfish::Blowfish;
 

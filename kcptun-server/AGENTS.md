@@ -5,15 +5,15 @@
 
 ## Purpose
 
-kcptun server binary: UDP/KCP accept → SMUX → target TCP. `KcpServerSession` per peer, DashMap session table, Snappy session codec, optional QPP, SNMP log, optional pprof. Stress integration tests live in `tests/stress_test.rs` (no AGENTS under `tests/`).
+kcptun server binary: UDP/KCP accept → SMUX → target TCP. `KcpServerSession` per peer, DashMap session table, optional QPP, SNMP log, optional pprof. Shared helpers live in `kcptun-common`. Stress tests in `tests/stress_test.rs` (no AGENTS under `tests/`).
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Features `tokio` (default) / `smol`; optional `pprof`; + `dashmap` vs client |
+| `Cargo.toml` | Features `tokio` (default) / `smol`; optional `pprof`; + `dashmap` / `kcptun-common` |
 | `build.rs` | Build-time glue |
-| `src/main.rs` | Entire binary: `Cli`, `KcpServerSession`, `SmuxStreamIo`, `handle_stream`, `pipe` idle timeout, pprof |
+| `src/main.rs` | Entire binary: `Cli`, `KcpServerSession`, `handle_stream`, `pipe` idle timeout, pprof |
 | `tests/stress_test.rs` | Multi-connection stress / data integrity (run via `make stress`) |
 
 ## Subdirectories
@@ -28,10 +28,11 @@ kcptun server binary: UDP/KCP accept → SMUX → target TCP. `KcpServerSession`
 
 - Stack: UDP → decrypt/FEC → KCP → Snappy → SMUX → (optional QPP) → target TCP.
 - `pipe` uses **idle** timeout (`closewait`), not total duration — matches Go; do not convert to hard total timeout.
-- Session demux by peer; inbound via `feed_data_mut(&mut [u8])` — CFB/null decrypt in place (`decrypt_cfb_in_place` / `inbound_null`), then FEC + `KCP::input` + inline SMUX.
+- Session cipher: `Arc<kcrypt_rs::CryptEngine>`; large non-FEC inbound may `feed_data_owned` on `cpu_block` (`should_cpu_block_decrypt`).
+- Inbound default: `feed_data_mut` — CFB/null in place, then FEC + `KCP::input` + SMUX.
 - Flush loop 4-phase like client; keep lock short.
-- Known open issue: proxy SMUX stream leak → RSS growth (`bugs/BUGREPORT_PROXY_MEMORY_GROWTH.md`).
-- PBKDF2 / crypt / mode / nocomp must match client.
+- Shared: `kcptun_common::{derive_key, apply_mode, SnappyStreamDecoder, pipe, snmp_logger, QPPPort?}`.
+- Known open issue history: proxy SMUX stream leak (`bugs/BUGREPORT_PROXY_MEMORY_GROWTH.md`).
 
 ### Testing Requirements
 
@@ -50,7 +51,7 @@ make e2e
 
 ### Internal
 
-- `kcp-rs`, `kcrypt-rs`, `smux-rs`, `qpp-rs`, `kio-rs`
+- `kcp-rs`, `kcrypt-rs`, `kcptun-common`, `smux-rs`, `qpp-rs`, `kio-rs`
 
 ### External
 

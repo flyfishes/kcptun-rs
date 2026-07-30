@@ -7,7 +7,7 @@
 //! This is ~5x faster than the RustCrypto twofish crate (v0.7.1) which
 //! recomputes sbox+gf_mult per block.
 
-use super::{BlockCrypt, BlockCipher16, cfb16_encrypt, cfb16_decrypt};
+use super::{cfb16_decrypt, cfb16_encrypt, BlockCipher16, BlockCrypt};
 
 // ─── Constants (from Go's twofish.go) ────────────────────────────────────
 

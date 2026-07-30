@@ -25,7 +25,6 @@ const CHUNK_DERIVE_LOOPS: u32 = 1024;
 const PAD_SWITCH: u8 = 8;
 const QUBITS: u8 = 8;
 
-
 // ─── Rand (xoshiro256** PRNG) ─────────────────────────────────────────────
 
 /// Stateful xoshiro256** PRNG matching Go's qpp.Rand.
@@ -398,7 +397,6 @@ fn qpp_minimum_seed_length_inner(qubits: u8) -> usize {
     }
     (bits.ceil() as usize).div_ceil(8)
 }
-
 
 // ─── Tests ───────────────────────────────────────────────────────────────
 

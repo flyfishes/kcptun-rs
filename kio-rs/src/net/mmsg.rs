@@ -59,7 +59,16 @@ fn sendmmsg_inner(
         msgs.push(hdr);
     }
 
-    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), n as libc::c_uint, 0) };
+    // MSG_DONTWAIT: match try_send semantics used on non-Linux paths.
+    // flags type differs by libc (musl: c_uint, glibc: c_int); `as _` infers.
+    let ret = unsafe {
+        libc::sendmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            n as libc::c_uint,
+            libc::MSG_DONTWAIT as _,
+        )
+    };
     if ret < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::WouldBlock {
@@ -76,11 +85,15 @@ fn socket_addr_to_storage(
     let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
     let len = match addr {
         std::net::SocketAddr::V4(a) => {
+            // `s_addr` is stored in network byte order in memory. `octets()` is
+            // already [a,b,c,d] in network order, so copy those bytes as-is via
+            // from_ne_bytes. from_be_bytes would swap on LE hosts and send to
+            // e.g. 1.0.0.127 instead of 127.0.0.1 — silent blackhole (hang).
             let sin = libc::sockaddr_in {
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: a.port().to_be(),
                 sin_addr: libc::in_addr {
-                    s_addr: u32::from_be_bytes(a.ip().octets()),
+                    s_addr: u32::from_ne_bytes(a.ip().octets()),
                 },
                 sin_zero: [0; 8],
             };
@@ -159,8 +172,18 @@ pub fn recvmmsg_from(
         msgs.push(hdr);
     }
 
-    let ret =
-        unsafe { libc::recvmmsg(fd, msgs.as_mut_ptr(), n as libc::c_uint, 0, ptr::null_mut()) };
+    // MSG_DONTWAIT: never block even if the runtime's non-blocking flag is
+    // lost/raced; callers (try_recv_batch_from) expect WouldBlock semantics.
+    // flags type differs by libc (musl: c_uint, glibc: c_int); `as _` infers.
+    let ret = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            n as libc::c_uint,
+            libc::MSG_DONTWAIT as _,
+            ptr::null_mut(),
+        )
+    };
     if ret < 0 {
         for b in bufs.iter_mut().take(n) {
             unsafe {

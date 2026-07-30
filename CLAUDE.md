@@ -72,7 +72,25 @@ The code must compile perfectly on the first try without any warnings, errors, o
 
 Ask yourself: "Will the CI/CD pipeline fail or throw a warning because of this change?" If yes, it is not ready.
 
----
+## 6. Gate Checks (Mandatory Before Completion)
+
+**Every change MUST pass all three gates before being declared complete. No exceptions.**
+
+```bash
+make gate
+```
+
+This runs, in order:
+1. `cargo fmt --all -- --check` — formatting must be clean (zero diff)
+2. `cargo test --workspace` — all tests must pass (zero failures)
+3. `cargo clippy --workspace -- -D warnings` — lint must be clean (zero warnings)
+
+If any gate fails:
+- **fmt --check fails** → run `cargo fmt --all` and re-check
+- **test fails** → fix the test or the code; never skip or `#[ignore]` without explicit request
+- **clippy fails** → fix the root cause; never suppress with `#[allow(...)]` unless explicitly requested
+
+These gates run in CI. A change that doesn't pass all three is not ready to commit.
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
@@ -144,6 +162,12 @@ cargo fmt --all
 # Snappy Go-Rust interop test
 cargo test test_snappy_go_rust_interop -- --nocapture
 
+# Benchmark (comprehensive cipher × compression matrix)
+python3 bench_rust_vs_go.py --quick --rust-only --conn 4 --size 65536 --runs 3
+
+# Rate limit test (per-connection token bucket)
+target/release/kcptun-server -l :29900 -t 127.0.0.1:8080 --key test --crypt null --ratelimit 1048576
+
 # Makefile shortcuts: make build/test/release/stress/clippy/fmt
 ```
 
@@ -183,6 +207,10 @@ Protocol stack (bottom→top): `UDP → BlockCrypt/FEC → KCP → Snappy → SM
 - `--key`, `--crypt`, `--mode`, and `--nocomp` must match between client and server.
 - Compression is **enabled by default** (`--nocomp` = false), matching Go behavior.
 - The `null` cipher has no crypto header at all (different from `none` which has the header but no encryption).
+- **All CFB ciphers use the same 20B wire header**: `[nonce 16B][CRC32 4B][ciphertext]`.
+  Go's `postProcess()` applies this uniformly to every non-AEAD cipher including `xor` and `salsa20`.
+  Per-cipher internals (e.g. salsa20 using first 8B of nonce for keystream) do NOT change the wire layout.
+  Never add per-cipher wire format dispatch — all CFB ciphers go through `encrypt_cfb` / `decrypt_cfb_in_place`.
 - TEA cipher uses 8 rounds (Go rounds/2) for compatibility.
 - SM4 uses tjfoc/gmsm S-box with specific CK fix.
 - Go requires segment ACKs on every received Push segment — `kcp_rs::KCP::input()` queues ACKs for all received push segments.
@@ -241,4 +269,3 @@ go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-*.pb
 ```
 
 Build with `--features pprof` to enable the Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock). Use `--features pprof-deadlock` for deadlock detection.
-

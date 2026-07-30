@@ -11,7 +11,7 @@ Async runtime + network I/O abstraction for kcptun (`lib` name: `kio`). Unified 
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Features `tokio` / `smol` (mutex exclusive); shared `async-lock`, `async-channel`, `socket2`, `libc` |
+| `Cargo.toml` | Features `tokio` / `smol` (mutex exclusive); shared `async-lock`, `async-channel`, `socket2` (feat `all`), `libc` |
 | `build.rs` | Feature checks / glue |
 | `src/lib.rs` | Facade: re-exports net/sync/task/time; `copy_bidirectional`, `copy_bidirectional_idle`, `ctrl_c`, `read_to_string` |
 | `src/tests.rs` | Crate tests |
@@ -54,7 +54,7 @@ None (consumed by smux + binaries).
 
 ### External
 
-- Shared: `async-lock`, `async-channel`, `socket2`, `log`, `libc`
+- Shared: `async-lock`, `async-channel`, `socket2` (features=`["all"]` for tcpraw), `log`, `libc`
 - Tokio feature: `tokio`
 - Smol feature: `smol`, `async-io`, `async-executor`, `futures-lite`, `num_cpus`, `event-listener`
 

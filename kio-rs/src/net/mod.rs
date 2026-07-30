@@ -96,3 +96,119 @@ pub use self::tokio::{TcpListener, TcpStream, UdpSocket};
 
 #[cfg(feature = "smol")]
 pub use self::smol::{TcpListener, TcpStream, UdpSocket};
+
+// ─── TCP raw transport (Linux only) ──────────────────────────────────────────
+#[cfg(target_os = "linux")]
+mod tcpraw;
+
+#[cfg(not(target_os = "linux"))]
+mod tcpraw_stub;
+
+#[cfg(target_os = "linux")]
+pub use self::tcpraw::{dial as tcpraw_dial, listen as tcpraw_listen, TcpRawConn, TcpRawListener};
+
+#[cfg(not(target_os = "linux"))]
+pub use self::tcpraw_stub::{
+    dial as tcpraw_dial, listen as tcpraw_listen, TcpRawConn, TcpRawListener,
+};
+
+// ─── DatagramSocket ──────────────────────────────────────────────────────────
+
+/// Unified datagram socket over UDP or TCP raw transport.
+///
+/// Match-based dispatch — no trait/generic overhead, and the transport set
+/// is closed (UDP + optionally TCP raw on Linux).
+pub enum DatagramSocket {
+    /// Standard UDP socket.
+    Udp(UdpSocket),
+    /// TCP raw socket (Linux only; compile-error on other platforms when
+    /// constructed, but the variant exists for code coherence).
+    TcpRaw(TcpRawConn),
+}
+
+impl DatagramSocket {
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(s) => s.recv_from(buf).await,
+            Self::TcpRaw(s) => s.recv_from(buf).await,
+        }
+    }
+
+    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.send_to(buf, target).await,
+            Self::TcpRaw(s) => s.send_to(buf, &target),
+        }
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.send(buf).await,
+            Self::TcpRaw(s) => s.send(buf),
+        }
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.recv(buf).await,
+            Self::TcpRaw(s) => s.recv(buf).await,
+        }
+    }
+
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_recv(buf),
+            Self::TcpRaw(s) => s.try_recv(buf),
+        }
+    }
+
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(s) => s.try_recv_from(buf),
+            Self::TcpRaw(s) => s.try_recv_from(buf),
+        }
+    }
+
+    pub async fn send_batch_to<B: AsRef<[u8]>>(
+        &self,
+        bufs: &[B],
+        target: SocketAddr,
+    ) -> io::Result<()> {
+        match self {
+            Self::Udp(s) => s.send_batch_to(bufs, target).await,
+            Self::TcpRaw(s) => s.send_batch_to(bufs, &target).await,
+        }
+    }
+
+    /// Send all `bufs` on a connected socket.
+    pub async fn send_batch<B: AsRef<[u8]>>(&self, bufs: &[B]) -> io::Result<()> {
+        match self {
+            Self::Udp(s) => s.send_batch(bufs).await,
+            Self::TcpRaw(s) => {
+                // TCP raw is point-to-point; send each buffer individually.
+                for buf in bufs {
+                    s.send(buf.as_ref())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn try_recv_batch_from(
+        &self,
+        packet_bufs: &mut [Vec<u8>],
+        out: &mut Vec<(Vec<u8>, SocketAddr)>,
+    ) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_recv_batch_from(packet_bufs, out),
+            Self::TcpRaw(s) => s.try_recv_batch_from(packet_bufs, out),
+        }
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Udp(s) => s.local_addr(),
+            Self::TcpRaw(s) => s.local_addr(),
+        }
+    }
+}

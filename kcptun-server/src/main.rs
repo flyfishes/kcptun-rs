@@ -24,37 +24,28 @@ static GLOBAL: kpprof::ProfilingAllocator = kpprof::ProfilingAllocator::new();
 
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Context as AnyContext, Result};
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use clap::Parser;
-#[cfg(feature = "tokio")]
-use kio::ReadBuf;
-use kio::{self, AsyncRead, AsyncWrite};
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 
 use kcp_rs::KCP;
 use kcp_rs::{fec_kcp_from_recovered, FecDecoder, FecEncoder};
-use kcrypt_rs::crypt as kcp_crypt;
+#[cfg(feature = "qpp")]
+use kcptun_common::QPPPort;
+use kcptun_common::{apply_mode, derive_key, pipe, snmp_logger, SnappyStreamDecoder};
+use kcrypt_rs::BlockCrypt;
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
 
-/// PBKDF2 salt matching the Go kcp-go SALT value.
-const SALT: &[u8] = b"kcp-go";
-
 /// Maximum UDP datagram size.
 const MAX_DATAGRAM: usize = 2048;
-
-/// Pipe buffer size.
-const PIPE_BUF_SIZE: usize = 65536;
 
 /// How often the KCP update loop fires (milliseconds).
 const KCP_UPDATE_INTERVAL_MS: u64 = 2;
@@ -64,94 +55,6 @@ const KCP_UPDATE_INTERVAL_MS: u64 = 2;
 // Note: Compression is handled by the persistent snap::write::FrameEncoder
 // in the KcpServerSession.compressor field, matching Go's snappy.NewBufferedWriter.
 // Decompression is handled by SnappyStreamDecoder, matching Go's snappy.NewReader.
-
-/// Persistent Snappy stream decoder. Uses manual Snappy framed format
-/// parsing (like client's GoSnappyStream) so it correctly handles the
-/// stream identifier that only appears once from a persistent encoder.
-/// This matches Go's snappy.NewReader behavior.
-struct SnappyStreamDecoder {
-    buf: Vec<u8>,
-    pos: usize,
-    hdr_ok: bool,
-}
-
-impl SnappyStreamDecoder {
-    fn new() -> Self {
-        SnappyStreamDecoder {
-            buf: Vec::new(),
-            pos: 0,
-            hdr_ok: false,
-        }
-    }
-    fn feed(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
-        self.buf.extend_from_slice(data);
-        if self.pos > 65536 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-        let mut out = Vec::new();
-        loop {
-            let avail = self.buf.len() - self.pos;
-            // Skip stream identifier (0xFF 0x06 0x00 0x00 "sNaPpY")
-            if !self.hdr_ok {
-                if avail < 10 {
-                    break;
-                }
-                if self.buf[self.pos] != 0xff || &self.buf[self.pos + 4..self.pos + 10] != b"sNaPpY"
-                {
-                    // Not a stream identifier — skip one byte and try to resync
-                    self.pos += 1;
-                    continue;
-                }
-                self.pos += 10;
-                self.hdr_ok = true;
-                continue;
-            }
-            // Read chunk header: [type 1B][length 3B LE]
-            if avail < 4 {
-                break;
-            }
-            let ct = self.buf[self.pos];
-            let chunk_len = u32::from_le_bytes([
-                self.buf[self.pos + 1],
-                self.buf[self.pos + 2],
-                self.buf[self.pos + 3],
-                0,
-            ]) as usize;
-            if chunk_len > 16_777_216 {
-                self.pos += 4 + chunk_len.min(avail - 4);
-                continue;
-            }
-            if 4 + chunk_len > avail {
-                break;
-            }
-            let chunk_data = &self.buf[self.pos + 4..self.pos + 4 + chunk_len];
-            self.pos += 4 + chunk_len;
-            match ct {
-                0x00 => {
-                    // Compressed chunk: [CRC32 4B][snappy block]
-                    if chunk_data.len() < 4 {
-                        continue;
-                    }
-                    let snappy_data = &chunk_data[4..];
-                    match snap::raw::Decoder::new().decompress_vec(snappy_data) {
-                        Ok(d) => out.extend(d),
-                        Err(_) => continue,
-                    }
-                }
-                0x01 => {
-                    // Uncompressed chunk: [CRC32 4B][raw data]
-                    if chunk_data.len() >= 4 {
-                        out.extend_from_slice(&chunk_data[4..]);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(out)
-    }
-}
-
 // ─── Log file rotation ─────────────────────────────────────────────────────────
 
 /// Rotate log file if it exceeds max_size bytes. Keeps up to 5 rotated copies.
@@ -205,7 +108,9 @@ pub struct Config {
     pub quiet: Option<bool>,
     pub tcp: Option<bool>,
     pub pprof: Option<String>,
+    #[cfg(feature = "qpp")]
     pub qpp: Option<bool>,
+    #[cfg(feature = "qpp")]
     pub qppcount: Option<u16>,
 }
 
@@ -341,10 +246,12 @@ pub struct Cli {
     pub pprof: Option<String>,
 
     /// Enable QPP encryption.
+    #[cfg(feature = "qpp")]
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub qpp: bool,
 
     /// QPP pad count (should be prime).
+    #[cfg(feature = "qpp")]
     #[arg(long)]
     pub qppcount: Option<u16>,
 
@@ -443,11 +350,13 @@ impl Cli {
                 cfg.tcp.unwrap_or(false)
             },
             pprof: cli.pprof.or(cfg.pprof),
+            #[cfg(feature = "qpp")]
             qpp: if cli.qpp {
                 true
             } else {
                 cfg.qpp.unwrap_or(false)
             },
+            #[cfg(feature = "qpp")]
             qppcount: cli.qppcount.or(cfg.qppcount),
             c: cli.c,
             version_flag: false, // never from config file
@@ -456,41 +365,11 @@ impl Cli {
 }
 
 // ─── Key Derivation ─────────────────────────────────────────────────────────────
-
-/// Derive a 32-byte key from a password using PBKDF2-HMAC-SHA1.
-///
-/// Matches the Go kcp-go key derivation:
-/// `pkcs5.PBKDF2(password, salt, 4096, 32, sha1.New)`
-fn derive_key(password: &str) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), SALT, 4096, &mut key);
-    key
-}
-
 // ─── Mode Profiles ──────────────────────────────────────────────────────────────
-
-/// Apply a mode profile to a KCP instance.
-fn apply_mode(kcp: &mut KCP, mode: &str) {
-    let (nodelay, interval, resend, nc) = match mode {
-        "normal" => (0, 40, 2, 1),
-        "fast" => (0, 30, 2, 1),
-        "fast2" => (1, 20, 2, 1),
-        "fast3" => (1, 10, 2, 1),
-        _ => {
-            warn!("unknown mode '{}', falling back to 'fast'", mode);
-            (0, 30, 2, 1)
-        }
-    };
-    info!(
-        "applying mode '{}': nodelay={}, interval={}, resend={}, nc={}",
-        mode, nodelay, interval, resend, nc
-    );
-    kcp.set_nodelay(nodelay, interval, resend, nc);
-}
-
 // ─── MultiPort Parser ───────────────────────────────────────────────────────────
 
 /// Parse a "host:port" string into a SocketAddr.
+#[allow(dead_code)]
 fn parse_addr(addr: &str) -> Result<SocketAddr> {
     // Handle ":port" shorthand by defaulting to "0.0.0.0"
     if addr.starts_with(':') {
@@ -500,235 +379,38 @@ fn parse_addr(addr: &str) -> Result<SocketAddr> {
     addr.parse::<SocketAddr>().context("invalid address")
 }
 
-/// Get the current wall clock time in milliseconds as a u32 (wrapping).
-#[allow(dead_code)]
-fn now_ms() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32
-}
-
-struct QPPPort<T: AsyncRead + AsyncWrite + Unpin> {
-    inner: T,
-    qpp: parking_lot::Mutex<qpp_rs::QuantumPermutationPad>,
-    prng_enc: parking_lot::Mutex<qpp_rs::Rand>,
-    prng_dec: parking_lot::Mutex<qpp_rs::Rand>,
-    read_buf: BytesMut,
-    /// Reusable buffer for inner.poll_read — eliminates vec![0u8; PIPE_BUF_SIZE] per call.
-    read_io_buf: Vec<u8>,
-    /// Reusable buffer for QPP encryption — eliminates buf.to_vec() per write.
-    write_enc_buf: Vec<u8>,
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
-    fn new(inner: T, key: &[u8], count: u16) -> Self {
-        QPPPort {
-            inner,
-            qpp: parking_lot::Mutex::new(qpp_rs::QuantumPermutationPad::new(key, count)),
-            prng_enc: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
-            prng_dec: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
-            read_buf: BytesMut::with_capacity(PIPE_BUF_SIZE),
-            read_io_buf: vec![0u8; PIPE_BUF_SIZE],
-            write_enc_buf: Vec::with_capacity(PIPE_BUF_SIZE),
+/// Create a UDP socket bound to `addr` with the given buffer sizes and DSCP.
+fn create_udp_socket(addr: SocketAddr, sockbuf: u32, dscp: u32) -> Result<kio::UdpSocket> {
+    let socket = socket2::Socket::new(
+        if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        },
+        socket2::Type::DGRAM,
+        None,
+    )?;
+    if let Err(e) = socket.set_recv_buffer_size(sockbuf as usize) {
+        warn!("set_recv_buffer_size failed: {}", e);
+    }
+    if let Err(e) = socket.set_send_buffer_size(sockbuf as usize) {
+        warn!("set_send_buffer_size failed: {}", e);
+    }
+    if dscp > 0 {
+        let dscp_shifted = dscp << 2;
+        if let Err(e) = socket.set_tos(dscp_shifted) {
+            warn!("set_tos (DSCP) failed: {}", e);
         }
     }
-}
-
-// ── tokio QPPPort AsyncRead/AsyncWrite (uses ReadBuf) ──
-#[cfg(feature = "tokio")]
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        if !this.read_buf.is_empty() {
-            let n = buf.remaining().min(this.read_buf.len());
-            buf.put_slice(&this.read_buf[..n]);
-            this.read_buf.advance(n);
-            return Poll::Ready(Ok(()));
-        }
-
-        let mut tmp = std::mem::take(&mut this.read_io_buf);
-        tmp.resize(PIPE_BUF_SIZE, 0);
-        let mut read_buf = ReadBuf::new(&mut tmp);
-        match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let filled = read_buf.filled().len();
-                if filled == 0 {
-                    this.read_io_buf = tmp;
-                    return Poll::Ready(Ok(()));
-                }
-                // Decrypt in-place in the read buffer (eliminates to_vec())
-                {
-                    let qpp = this.qpp.lock();
-                    let mut prng = this.prng_dec.lock();
-                    qpp_rs::decrypt_with_pads(
-                        &qpp.rpads,
-                        &mut tmp[..filled],
-                        &mut prng,
-                        qpp.count(),
-                    );
-                }
-                let n = buf.remaining().min(filled);
-                buf.put_slice(&tmp[..n]);
-                if n < filled {
-                    this.read_buf.extend_from_slice(&tmp[n..filled]);
-                }
-                this.read_io_buf = tmp;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => {
-                this.read_io_buf = tmp;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                this.read_io_buf = tmp;
-                Poll::Pending
-            }
-        }
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for QPPPort<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        this.write_enc_buf.clear();
-        this.write_enc_buf.extend_from_slice(buf);
-        {
-            let qpp = this.qpp.lock();
-            let mut prng = this.prng_enc.lock();
-            qpp_rs::encrypt_with_pads(&qpp.pads, &mut this.write_enc_buf, &mut prng, qpp.count());
-        }
-        Pin::new(&mut this.inner).poll_write(cx, &this.write_enc_buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-// ── smol QPPPort AsyncRead/AsyncWrite (uses &mut [u8]) ──
-#[cfg(feature = "smol")]
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for QPPPort<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-
-        if !this.read_buf.is_empty() {
-            let n = buf.len().min(this.read_buf.len());
-            buf[..n].copy_from_slice(&this.read_buf[..n]);
-            this.read_buf.advance(n);
-            return Poll::Ready(Ok(n));
-        }
-
-        let mut tmp = std::mem::take(&mut this.read_io_buf);
-        tmp.resize(PIPE_BUF_SIZE, 0);
-        match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
-            Poll::Ready(Ok(0)) => {
-                this.read_io_buf = tmp;
-                Poll::Ready(Ok(0))
-            }
-            Poll::Ready(Ok(filled)) => {
-                {
-                    let qpp = this.qpp.lock();
-                    let mut prng = this.prng_dec.lock();
-                    qpp_rs::decrypt_with_pads(
-                        &qpp.rpads,
-                        &mut tmp[..filled],
-                        &mut prng,
-                        qpp.count(),
-                    );
-                }
-                let n = buf.len().min(filled);
-                buf[..n].copy_from_slice(&tmp[..n]);
-                if n < filled {
-                    this.read_buf.extend_from_slice(&tmp[n..filled]);
-                }
-                this.read_io_buf = tmp;
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(Err(e)) => {
-                this.read_io_buf = tmp;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                this.read_io_buf = tmp;
-                Poll::Pending
-            }
-        }
-    }
-}
-
-#[cfg(feature = "smol")]
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for QPPPort<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        this.write_enc_buf.clear();
-        this.write_enc_buf.extend_from_slice(buf);
-        {
-            let qpp = this.qpp.lock();
-            let mut prng = this.prng_enc.lock();
-            qpp_rs::encrypt_with_pads(&qpp.pads, &mut this.write_enc_buf, &mut prng, qpp.count());
-        }
-        Pin::new(&mut this.inner).poll_write(cx, &this.write_enc_buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_close(cx)
-    }
-}
-
-// ─── Pipe ───────────────────────────────────────────────────────────────────────
-
-/// Bidirectional copy between two AsyncRead + AsyncWrite streams.
-///
-/// `idle_secs` is an **idle** timeout (not a total timeout): the timer
-/// resets after every successful data transfer. If no data flows in either
-/// direction for `idle_secs` seconds, the pipe breaks gracefully.
-///
-/// This matches Go kcptun's behavior where `closeWait` is an idle/cleanup
-/// period, NOT a total pipe duration limit. Using a total timeout here caused
-/// intermittent test failures under load: with 100 concurrent connections
-/// each transferring 192 KB, the bidirectional copy could exceed the 30-second
-/// `closewait` default, causing the server to close the SMUX stream before
-/// all echo data was delivered.
-async fn pipe<A, B>(a: &mut A, b: &mut B, idle_secs: u64) -> Result<(u64, u64)>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    kio::copy_bidirectional_idle(a, b, idle_secs)
-        .await
-        .map_err(Into::into)
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(kio::UdpSocket::from_std(socket.into())?)
 }
 
 /// Handle a single SMUX stream: connect to the TCP target and pipe data
 /// bidirectionally with optional QPP. Compression is handled at the
 /// KCP/SMUX session level (matching Go kcptun architecture).
+#[cfg_attr(not(feature = "qpp"), allow(unused_variables))]
 async fn handle_stream(
     target: String,
     smux_stream: Arc<smux_rs::stream::Stream>,
@@ -751,24 +433,26 @@ async fn handle_stream(
     let smux_io = smux_rs::SmuxIo::new(smux_stream.clone(), flush_notify);
 
     // Default idle timeout to prevent FD leaks when close_wait is 0.
-    // If neither side sends data for this duration, the pipe is closed.
-    const DEFAULT_IDLE_TIMEOUT: u64 = 300; // 5 minutes
-    let effective_close_wait = if close_wait > 0 {
-        close_wait
-    } else {
-        DEFAULT_IDLE_TIMEOUT
-    };
-
+    // Matches Go kcptun semantics: after both sides reach EOF, wait close_wait
+    // seconds before tearing down. close_wait=0 means no wait.
+    // Go server default is 30; Rust mirrors this.
     let pipe_result = if qpp_enabled {
-        let qpp_port = QPPPort::new(smux_io, &qpp_key, qpp_count);
-        let mut tcp_pin = tcp;
-        let mut qpp_pin = qpp_port;
-        pipe(&mut tcp_pin, &mut qpp_pin, effective_close_wait).await
+        #[cfg(feature = "qpp")]
+        {
+            let qpp_port = QPPPort::new(smux_io, &qpp_key, qpp_count);
+            let mut tcp_pin = tcp;
+            let mut qpp_pin = qpp_port;
+            pipe(&mut tcp_pin, &mut qpp_pin, close_wait).await
+        }
+        #[cfg(not(feature = "qpp"))]
+        {
+            unreachable!("qpp_enabled should be false when qpp feature disabled")
+        }
     } else {
         let mut tcp_pin = tcp;
         let mut smux_pin = smux_io;
         debug!("server pipe started for stream {}", stream_id);
-        pipe(&mut tcp_pin, &mut smux_pin, effective_close_wait).await
+        pipe(&mut tcp_pin, &mut smux_pin, close_wait).await
     };
 
     // Local half-close only. Do NOT mark_fin_sent here — that made flush skip
@@ -812,15 +496,37 @@ async fn handle_stream(
 /// background flush loop. Incoming encrypted datagrams are fed via `feed_data`,
 /// which decrypts, strips the Go kcp-go v5 outer header, and drives the KCP
 /// state machine to extract reassembled user data (SMUX frames).
+/// KCP + SMUX session parameters (shared create path).
+#[derive(Clone, Debug)]
+struct SessionConfig {
+    crypt: String,
+    mode: String,
+    mtu: u32,
+    sndwnd: u32,
+    rcvwnd: u32,
+    datashard: u32,
+    parityshard: u32,
+    acknodelay: bool,
+    nodelay: u32,
+    interval: u32,
+    resend: u32,
+    nc: u32,
+    smuxver: u8,
+    smuxbuf: usize,
+    streambuf: usize,
+    framesize: usize,
+    keepalive: u64,
+    nocomp: bool,
+    ratelimit: u32,
+}
+
 struct KcpServerSession {
     /// KCP state machine (shared between the recv and flush tasks).
     kcp: Arc<parking_lot::Mutex<KCP>>,
-    /// Block cipher for encrypting/decrypting KCP wire data.
-    /// Stored as `Arc<dyn BlockCrypt>` (no Mutex) because `encrypt`/`decrypt`
-    /// take `&self` — the cipher is stateless after construction.
-    crypt: Arc<dyn kcrypt_rs::BlockCrypt>,
-    /// AEAD crypt for GCM mode (separate from BlockCrypt).
-    aead: Option<Arc<dyn kcrypt_rs::AeadCrypt>>,
+    /// Session cipher — concrete [`kcrypt_rs::CryptEngine`] (enum match, no
+    /// `dyn` vtable). Shared without Mutex; AEAD is the `Aes128Gcm` variant
+    /// (`crypt.as_aead()` / `crypt.is_aead()`).
+    crypt: Arc<kcrypt_rs::CryptEngine>,
     /// SMUX server session multiplexing streams over KCP.
     smux: Arc<smux_rs::Session>,
     /// Set of SMUX stream IDs that have already been accepted and dispatched.
@@ -839,8 +545,8 @@ struct KcpServerSession {
     raw_packets: Arc<parking_lot::Mutex<Vec<bytes::Bytes>>>,
     /// Persistent Snappy framing decoder (Go interop fallback).
     snappy_fallback: Option<parking_lot::Mutex<SnappyStreamDecoder>>,
-    /// UDP socket for sending (shared with the recv loop).
-    udp: Arc<kio::UdpSocket>,
+    /// Data socket for sending (shared with the recv loop).
+    socket: Arc<kio::DatagramSocket>,
     /// Whether encryption is enabled.
     has_encryption: bool,
     /// Whether ACK nodelay is enabled.
@@ -871,43 +577,40 @@ struct KcpServerSession {
     /// KCP dead_link (20 retransmits) or SMUX keepalive timeout (typically
     /// a few seconds). 4-10s end-to-end is acceptable per requirements.
     dead: Arc<AtomicBool>,
+    /// Per-connection rate limiter (token bucket). 0 = unlimited.
+    ratelimiter: Arc<kcptun_common::RateLimiter>,
 }
 
 impl KcpServerSession {
     /// Create a new server-side KCP session for the given peer.
-    #[allow(clippy::too_many_arguments)]
     fn new(
         conv: u32,
         peer: SocketAddr,
-        udp: &Arc<kio::UdpSocket>,
+        socket: &Arc<kio::DatagramSocket>,
         key: &[u8; 32],
-        crypt_method: &str,
-        mode: &str,
-        mtu: u32,
-        sndwnd: u32,
-        rcvwnd: u32,
-        datashard: u32,
-        parityshard: u32,
-        acknodelay: bool,
-        nodelay: u32,
-        interval: u32,
-        resend: u32,
-        nc: u32,
-        smuxver: u8,
-        smuxbuf: usize,
-        streambuf: usize,
-        framesize: usize,
-        keepalive: u64,
-        nocomp: bool,
+        cfg: &SessionConfig,
     ) -> Self {
-        // CryptEngine: match-based dispatch on encrypt/decrypt hot path.
+        let crypt_method = cfg.crypt.as_str();
+        let mode = cfg.mode.as_str();
+        let mtu = cfg.mtu;
+        let sndwnd = cfg.sndwnd;
+        let rcvwnd = cfg.rcvwnd;
+        let datashard = cfg.datashard;
+        let parityshard = cfg.parityshard;
+        let acknodelay = cfg.acknodelay;
+        let nodelay = cfg.nodelay;
+        let interval = cfg.interval;
+        let resend = cfg.resend;
+        let nc = cfg.nc;
+        let smuxver = cfg.smuxver;
+        let smuxbuf = cfg.smuxbuf;
+        let streambuf = cfg.streambuf;
+        let framesize = cfg.framesize;
+        let keepalive = cfg.keepalive;
+        let nocomp = cfg.nocomp;
+        // Single CryptEngine for CFB + AEAD (no separate Arc<dyn AeadCrypt>).
         let (engine, _) = kcrypt_rs::CryptEngine::select(crypt_method, &key[..]);
-        let crypt_state: Arc<dyn kcrypt_rs::BlockCrypt> = Arc::new(engine);
-
-        let aead: Option<Arc<dyn kcrypt_rs::AeadCrypt>> =
-            kcp_crypt::select_aead_crypt(crypt_method, &key[..]).map(|a| Arc::from(a));
-        let has_aead = aead.is_some();
-        let _has_encryption = crypt_method != "null" && !has_aead;
+        let crypt_state = Arc::new(engine);
 
         // Create KCP instance with output callback that collects raw packets.
         // Same optimization as client: the callback just collects raw KCP
@@ -989,7 +692,6 @@ impl KcpServerSession {
         let mut session = KcpServerSession {
             kcp,
             crypt: crypt_state,
-            aead,
             smux,
             handled_streams,
             peer,
@@ -1001,7 +703,7 @@ impl KcpServerSession {
             } else {
                 Some(parking_lot::Mutex::new(SnappyStreamDecoder::new()))
             },
-            udp: udp.clone(),
+            socket: socket.clone(),
             has_encryption,
             ack_nodelay: acknodelay,
             fec_decoder,
@@ -1016,6 +718,7 @@ impl KcpServerSession {
             crypto_buf: Arc::new(parking_lot::Mutex::new(kcp_rs::CryptoBuf::new(conv as u64))),
             flush_notify: Arc::new(kio::Notify::new()),
             dead: Arc::new(AtomicBool::new(false)),
+            ratelimiter: Arc::new(kcptun_common::RateLimiter::new(cfg.ratelimit)),
         };
 
         session.start_flush_loop();
@@ -1060,17 +763,17 @@ impl KcpServerSession {
         let raw_packets = self.raw_packets.clone();
         let compressor = self.compressor.clone();
         let smuxver = self.smux.version();
-        let udp = self.udp.clone();
+        let socket = self.socket.clone();
         let crypt = self.crypt.clone();
-        let aead = self.aead.clone();
         let peer = self.peer;
         let has_encryption = self.has_encryption;
-        let has_aead = aead.is_some();
+        let has_aead = crypt.is_aead();
         let handled_streams = self.handled_streams.clone();
         let crypto_buf = self.crypto_buf.clone();
         let flush_notify = self.flush_notify.clone();
         let fec_encoder = self.fec_encoder.clone();
         let dead = self.dead.clone();
+        let ratelimiter = self.ratelimiter.clone();
 
         let h = kio::spawn_task(async move {
             let mut next_update: u64 = KCP_UPDATE_INTERVAL_MS;
@@ -1123,7 +826,8 @@ impl KcpServerSession {
                 // Same zero-copy path. Returns stream IDs whose FINs were encoded;
                 // mark_fin_sent only after kcp.send succeeds.
                 const MAX_DRAIN_BYTES: usize = 64 * 1024;
-                let fin_streams: Vec<u32> = smux.prepare_outbound_into(&mut out_buf, MAX_DRAIN_BYTES, smuxver);
+                let fin_streams: Vec<u32> =
+                    smux.prepare_outbound_into(&mut out_buf, MAX_DRAIN_BYTES, smuxver);
 
                 // ── Phase 1a: Clean up closed / stale streams ──
                 // Stale = local_closed past linger without peer FIN (proxy short-connect).
@@ -1282,7 +986,16 @@ impl KcpServerSession {
                 // Batch-encrypt raw KCP packets. Offload to cpu_block only when the
                 // batch is large enough that thread-pool scheduling tax is
                 // amortized (P0.2). Small batches encrypt inline on this task.
-                let packets: Vec<bytes::Bytes> = std::mem::take(&mut *raw_packets.lock());
+                let packets: Vec<bytes::Bytes> = {
+                    let mut g = raw_packets.lock();
+                    let n = g.len();
+                    let cap = g.capacity();
+                    let p = std::mem::take(&mut *g);
+                    if cap < n {
+                        g.reserve(n - cap);
+                    }
+                    p
+                };
                 if packets.is_empty() {
                     kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.empty_flush, 1);
                 }
@@ -1301,33 +1014,46 @@ impl KcpServerSession {
                         has_aead,
                         packets.len(),
                         total_bytes,
+                        &crypt,
                     );
 
                     let crypt_sb = crypt.clone();
                     let crypto_buf_sb = crypto_buf.clone();
-                    let aead_sb = aead.clone();
-                    // When offloaded to cpu_block, disable nested thread::scope
-                    // parallel encrypt (already on a pool worker). Inline path
-                    // may still parallelize large CFB batches (P1.1).
                     let allow_parallel = !use_cpu_block;
-                    let encrypt_fn = move || {
-                        kcp_rs::encrypt_batch(
+                    let mut enc_out: Vec<bytes::Bytes> = Vec::new();
+                    if use_cpu_block {
+                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.encrypt_offload, 1);
+                        let crypt_c = crypt_sb.clone();
+                        let cb_c = crypto_buf_sb.clone();
+                        enc_out = kio::cpu_block(move || {
+                            kcp_rs::encrypt_batch(
+                                packets,
+                                crypt_c.as_ref(),
+                                &cb_c,
+                                has_encryption,
+                                allow_parallel,
+                            )
+                        })
+                        .await;
+                    } else {
+                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.encrypt_inline, 1);
+                        kcp_rs::encrypt_batch_into(
                             packets,
                             crypt_sb.as_ref(),
                             &crypto_buf_sb,
-                            aead_sb.as_deref(),
                             has_encryption,
                             allow_parallel,
-                        )
-                    };
+                            &mut enc_out,
+                        );
+                    }
+                    let encrypted = enc_out;
+                    // Rate limit the send (token bucket, 0 = unlimited).
+                    {
+                        let total_bytes: usize = encrypted.iter().map(|b| b.len()).sum();
+                        ratelimiter.acquire(total_bytes);
+                    }
 
-                    let encrypted: Vec<bytes::Bytes> = if use_cpu_block {
-                        kio::cpu_block(encrypt_fn).await
-                    } else {
-                        encrypt_fn()
-                    };
-
-                    match udp.send_batch_to(&encrypted, peer).await {
+                    match socket.send_batch_to(&encrypted, peer).await {
                         Ok(()) => {
                             let nbytes: u64 = encrypted.iter().map(|b| b.len() as u64).sum();
                             kcp_rs::snmp_add(
@@ -1367,34 +1093,16 @@ impl KcpServerSession {
         self._handles.push(h);
     }
 
-    /// Feed incoming encrypted data from the UDP socket into this session.
+    /// Owned-data variant of feed_data_mut for cpu_block offload.
     ///
-    /// This is the core data path:
-    /// 1. Decrypt the payload using the block cipher
-    /// 2. Verify CRC32 checksum (matching Go kcp-go v5 behavior)
-    /// 3. Strip the 20-byte crypto header [nonce 16B][CRC32 4B] via slice
-    /// 4. Detect and handle FEC header (if present) — feed through FecDecoder
-    ///    for erasure recovery
-    /// 5. Feed the KCP segment to the KCP state machine
-    /// 6. Extract reassembled user messages via KCP recv → SMUX
-    ///
-    /// Go kcp-go v5 wire format:
-    ///   No FEC:  [nonce 16B][CRC32 4B][KCP segment 24+ bytes]
-    ///   With FEC: [nonce 16B][CRC32 4B][FEC seq 4B][FEC type 2B][FEC plen 2B][KCP segment 24+ bytes]
-    ///
-    /// FEC types (matching Go): 0x00f1 = data, 0x00f2 = parity, 0x00f3 = OOB
-    ///
-    /// CFB header probe: if byte 4 is a KCP cmd (0x51–0x54), treat as raw
-    /// (no crypto header) — server historical/compat path via
-    /// `decrypt_cfb_in_place(..., probe_header=true)`.
-    ///
-    /// `data` is the unique mutable receive buffer for this datagram; CFB
-    /// decrypts in place. The body slice is only used for synchronous
-    /// `KCP::input` before the next recv overwrites the buffer.
+    /// Use this when the caller has decided (via should_cpu_block_decrypt)
+    /// that the decrypt + KCP input + SMUX processing for this datagram
+    /// should run on the blocking thread pool to avoid stalling the main
+    /// UDP receiver task.
     fn feed_data_mut(&self, data: &mut [u8]) {
         // AEAD open still allocates; CFB/null use `data` in place.
         // Branch then call feed_body so lifetimes stay simple.
-        if let Some(ref aead) = self.aead {
+        if let Some(aead) = self.crypt.as_aead() {
             match aead.open(data) {
                 Ok(plain) => self.feed_body(&plain),
                 Err(_) => {
@@ -1404,7 +1112,10 @@ impl KcpServerSession {
             return;
         }
         if self.has_encryption {
-            match kcp_rs::decrypt_cfb_in_place(data, self.crypt.as_ref(), true) {
+            // All ciphers with CFB headers (including xor/salsa20) use the
+            // standard 20-byte header. probe_header=false because the header
+            // is always present for encrypted traffic (unlike legacy "none").
+            match kcp_rs::decrypt_cfb_in_place(data, self.crypt.as_ref(), false) {
                 Ok(body) => self.feed_body(body),
                 Err(_) => {
                     kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
@@ -1549,84 +1260,22 @@ impl KcpServerSession {
         new_streams
     }
 }
-
-// ─── SNMP Logger ────────────────────────────────────────────────────────────────
-
-/// Periodically log KCP SNMP statistics to a CSV file.
-async fn snmp_logger(path: String, period: Duration, stop: Arc<AtomicBool>) {
-    kio::sleep_ms(period.as_millis() as u64).await;
-
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to open SNMP log file '{}': {}", path, e);
-            return;
-        }
-    };
-    let mut writer = std::io::BufWriter::new(file);
-
-    // Write CSV header
-    let headers = kcp_rs::SNMP::header();
-    if let Err(e) = writeln!(writer, "timestamp,{}", headers.join(",")) {
-        error!("SNMP log write error: {}", e);
-        return;
-    }
-
-    while !stop.load(Ordering::Relaxed) {
-        kio::sleep_ms(period.as_millis() as u64).await;
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Read process-wide counters updated by KCP hot paths.
-        // SNMP::new() is a fresh zeroed instance — that always prints zeros.
-        let values = kcp_rs::DEFAULT_SNMP.to_slice();
-        if let Err(e) = writeln!(writer, "{},{}", ts, values.join(",")) {
-            error!("SNMP log write error: {}", e);
-        }
-        if let Err(e) = writer.flush() {
-            error!("SNMP log flush error: {}", e);
-        }
-    }
-}
-
 // ─── Main ───────────────────────────────────────────────────────────────────────
 
 /// Get or create a KCP server session for a peer connection.
 /// Extracted to avoid block-in-let parsing issues.
-#[allow(clippy::too_many_arguments)]
 fn get_or_create_session(
     sessions: &Arc<DashMap<SocketAddr, Arc<KcpServerSession>>>,
     peer: &SocketAddr,
     buf: &[u8],
-    datashard: u32,
-    parityshard: u32,
-    crypt_method: &str,
     key_arr: &[u8; 32],
-    udp: &Arc<kio::UdpSocket>,
-    mode: &str,
-    mtu: u32,
-    sndwnd: u32,
-    rcvwnd: u32,
-    acknodelay: bool,
-    nodelay: u32,
-    interval: u32,
-    resend: u32,
-    nc: u32,
-    smuxver: u8,
-    smuxbuf: usize,
-    streambuf: usize,
-    framesize: usize,
-    keepalive: u64,
-    nocomp: bool,
+    socket: &Arc<kio::DatagramSocket>,
+    session_cfg: &SessionConfig,
 ) -> Arc<KcpServerSession> {
+    let datashard = session_cfg.datashard;
+    let parityshard = session_cfg.parityshard;
+    let crypt_method = session_cfg.crypt.as_str();
+    let nocomp = session_cfg.nocomp;
     // Step 1: Try to get an existing session WITHOUT locking (DashMap shard read).
     // If we have a session for this peer but it is dead (KCP dead_link or
     // SMUX keepalive timeout), evict it so a reconnecting client (after server
@@ -1655,10 +1304,10 @@ fn get_or_create_session(
     } else {
         0
     };
-    let _conv_offset = 20 + fec_offset;
     let conv = if buf.len() >= 12 && crypt_method == "aes-128-gcm" {
-        // AEAD: open the first packet to extract conv
-        if let Some(aead) = kcp_crypt::select_aead_crypt(crypt_method, &key_arr[..]) {
+        // AEAD: open the first packet to extract conv via CryptEngine.
+        let (engine, _) = kcrypt_rs::CryptEngine::select(crypt_method, &key_arr[..]);
+        if let Some(aead) = engine.as_aead() {
             match aead.open(buf) {
                 Ok(plain) if plain.len() >= 4 => {
                     // Check for FEC header (matching Go's kcpInput logic)
@@ -1687,10 +1336,12 @@ fn get_or_create_session(
         // Go approach: decrypt first, then check FEC flag at data[4..6]
         // to determine conv offset (matching kcp-go's packetInput)
         let mut hdr = buf[..(32 + fec_offset).min(buf.len())].to_vec();
-        let (block_crypt, _) = kcp_crypt::select_block_crypt(crypt_method, &key_arr[..]);
+        let (block_crypt, _) = kcrypt_rs::CryptEngine::select(crypt_method, &key_arr[..]);
         block_crypt.decrypt(&mut hdr);
-        // After decrypt: [nonce 16][CRC4][payload], strip nonce+CRC
-        let payload = &hdr[20..];
+        // After decrypt, strip the standard 20-byte crypto header:
+        // [nonce 16B][CRC32 4B] — same for ALL BlockCrypt ciphers including xor/salsa20.
+        let crypt_header = 20;
+        let payload = &hdr[crypt_header..];
         // Extract conv directly from the KCP segment header.
         // The KCP segment header (including conv) is NOT compressed — only
         // the KCP segment's DATA payload is compressed (and that's decompressed
@@ -1734,26 +1385,9 @@ fn get_or_create_session(
     let session = Arc::new(KcpServerSession::new(
         conv,
         *peer,
-        udp,
+        socket,
         key_arr,
-        crypt_method,
-        mode,
-        mtu,
-        sndwnd,
-        rcvwnd,
-        datashard,
-        parityshard,
-        acknodelay,
-        nodelay,
-        interval,
-        resend,
-        nc,
-        smuxver,
-        smuxbuf,
-        streambuf,
-        framesize,
-        keepalive,
-        nocomp,
+        session_cfg,
     ));
     // Insert with entry API — only locks one shard
     // If another thread inserted a session for this peer while we were
@@ -1768,11 +1402,43 @@ fn get_or_create_session(
     }
 }
 
+/// Recv loop for a TCP raw KCP session. Reads datagrams and feeds KCP+SMUX.
+#[cfg(target_os = "linux")]
+fn spawn_tcp_recv_loop(session: Arc<KcpServerSession>, socket: Arc<kio::DatagramSocket>) {
+    let dead = session.dead.clone();
+    let flush = session.flush_notify.clone();
+    kio::spawn_task(async move {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        loop {
+            if dead.load(Ordering::Acquire) {
+                break;
+            }
+            match socket.recv_from(&mut buf).await {
+                Ok((n, _)) if n > 0 => {
+                    session.feed_data_mut(&mut buf[..n]);
+                    flush.notify_one();
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
+    kcp_rs::set_offload_profile(match kio::runtime_kind() {
+        kio::RuntimeKind::Tokio => kcp_rs::OffloadProfile::Tokio,
+        kio::RuntimeKind::Smol => kcp_rs::OffloadProfile::Smol,
+    });
     kio::block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
+    // Ignore SIGPIPE to prevent crashes when writing to closed sockets.
+    kio::ignore_sigpipe();
+    // Install SIGUSR1 handler for SNMP stats dump (matching Go kcptun).
+    kio::install_sigusr1_handler();
+
     let cli = Cli::parse();
     if cli.version_flag {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -1841,8 +1507,30 @@ async fn async_main() -> Result<()> {
     let ratelimit_val = cli.ratelimit;
     let close_wait_val = cli.closewait.unwrap_or(30);
     let quiet = cli.quiet;
+    #[cfg(feature = "qpp")]
     let qpp_enabled = cli.qpp;
+    #[cfg(not(feature = "qpp"))]
+    let qpp_enabled = false;
+    #[cfg(feature = "qpp")]
     let qpp_count = cli.qppcount.unwrap_or(61);
+    #[cfg(not(feature = "qpp"))]
+    let qpp_count: u16 = 0;
+
+    // Validate QPP parameters (matching Go's ValidateQPPParams)
+    #[cfg(feature = "qpp")]
+    if qpp_enabled {
+        match kcptun_common::validate_qpp_params(qpp_count, key_str.as_bytes()) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    warn!("{}", w);
+                }
+            }
+            Err(e) => {
+                error!("QPP configuration error: {}", e);
+                return Err(anyhow::anyhow!("QPP: {}", e));
+            }
+        }
+    }
 
     // Derive encryption key
     let key = derive_key(key_str);
@@ -1851,41 +1539,98 @@ async fn async_main() -> Result<()> {
         crypt_method, key[0], key[31]
     );
 
-    // Bind UDP listener
-    let listen_addr: SocketAddr = parse_addr(listen).context("invalid listen address")?;
-    let udp = {
-        let socket = socket2::Socket::new(
-            if listen_addr.is_ipv4() {
-                socket2::Domain::IPV4
-            } else {
-                socket2::Domain::IPV6
-            },
-            socket2::Type::DGRAM,
-            None,
-        )?;
+    // Bind listen address(es) — multi-port "host:min-max" matches Go ParseMultiPort.
+    let listen_addrs = kcptun_common::parse_multi_port(listen).context("invalid listen address")?;
 
-        // Apply socket buffer sizes
-        if let Err(e) = socket.set_recv_buffer_size(sockbuf as usize) {
-            warn!("set_recv_buffer_size failed: {}", e);
-        }
-        if let Err(e) = socket.set_send_buffer_size(sockbuf as usize) {
-            warn!("set_send_buffer_size failed: {}", e);
-        }
-
-        // Apply DSCP
-        if dscp_val > 0 {
-            let dscp_shifted = dscp_val << 2; // DSCP is 6 bits, shift to DS field
-            if let Err(e) = socket.set_tos(dscp_shifted as u32) {
-                warn!("set_tos (DSCP) failed: {}", e);
-            }
-        }
-
-        socket.bind(&listen_addr.into())?;
-        socket.set_nonblocking(true)?;
-        kio::UdpSocket::from_std(socket.into())?
+    // Prepare shared state (needed by both TCP and UDP paths).
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let target_str = target.to_string();
+    let key_arr = key;
+    let session_cfg = SessionConfig {
+        crypt: crypt_method.to_string(),
+        mode: mode.to_string(),
+        mtu,
+        sndwnd,
+        rcvwnd,
+        datashard,
+        parityshard,
+        acknodelay,
+        nodelay,
+        interval,
+        resend,
+        nc,
+        smuxver,
+        smuxbuf,
+        streambuf,
+        framesize,
+        keepalive,
+        nocomp,
+        ratelimit: ratelimit_val,
     };
-    let udp = Arc::new(udp);
-    info!("listening on {} for KCP connections", listen_addr);
+
+    // TCP mode: accept raw TCP connections, each is a dedicated KCP session.
+    // Do NOT also bind UDP on the same ports — that was only for the UDP path
+    // and confused logs / wasted sockets when --tcp is set.
+    if cli.tcp {
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("--tcp requires Linux (raw sockets + TCP_REPAIR)");
+
+        #[cfg(target_os = "linux")]
+        {
+            let key = key_arr;
+            let cfg = session_cfg.clone();
+            for &addr in &listen_addrs {
+                let listener = kio::tcpraw_listen(&addr)?;
+                info!("listening on {} for TCP raw KCP connections", addr);
+                let key = key;
+                let cfg = cfg.clone();
+                kio::spawn_task(async move {
+                    loop {
+                        let (conn, peer) = match listener.accept().await {
+                            Ok(c) => c,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::Interrupted =>
+                            {
+                                // Should not happen with blocking accept; retry.
+                                kio::sleep_ms(10).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("TCP accept error on {}: {}", addr, e);
+                                break;
+                            }
+                        };
+                        info!("TCP raw session from {}", peer);
+                        let socket = Arc::new(kio::DatagramSocket::TcpRaw(conn));
+                        let session = Arc::new(KcpServerSession::new(0, peer, &socket, &key, &cfg));
+                        spawn_tcp_recv_loop(session, socket);
+                    }
+                });
+            }
+            info!("forwarding to TCP target {}", target);
+            if ratelimit_val > 0 {
+                info!("ratelimit: {} bytes/sec", ratelimit_val);
+            }
+            info!("sockbuf: {}", sockbuf);
+            // Wait for Ctrl-C.
+            loop {
+                kio::sleep_ms(500).await;
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            info!("bye");
+            return Ok(());
+        }
+    }
+
+    let mut udp_sockets: Vec<Arc<kio::DatagramSocket>> = Vec::with_capacity(listen_addrs.len());
+    for addr in &listen_addrs {
+        let socket = create_udp_socket(*addr, sockbuf, dscp_val)?;
+        let socket = Arc::new(kio::DatagramSocket::Udp(socket));
+        info!("listening on {} for KCP connections", addr);
+        udp_sockets.push(socket);
+    }
     info!("forwarding to TCP target {}", target);
     if ratelimit_val > 0 {
         info!("ratelimit: {} bytes/sec", ratelimit_val);
@@ -1899,7 +1644,6 @@ async fn async_main() -> Result<()> {
     let sessions: Arc<DashMap<SocketAddr, Arc<KcpServerSession>>> = Arc::new(DashMap::new());
 
     // Start SNMP logger if configured
-    let stop_flag = Arc::new(AtomicBool::new(false));
     // SNMP collection is off by default (zero hot-path cost). Enable only when
     // a log path is set and period > 0.
     if let Some(ref snmplog_path) = cli.snmplog {
@@ -1936,10 +1680,6 @@ async fn async_main() -> Result<()> {
         log::warn!("--pprof requested but binary built without `pprof` feature; rebuild with --features pprof");
     }
 
-    // Prepare per-connection parameters for session creation
-    let target_str = target.to_string();
-    let key_arr = key;
-
     // Spawn Ctrl-C handler (runtime-agnostic)
     {
         let stop = stop_flag.clone();
@@ -1949,118 +1689,112 @@ async fn async_main() -> Result<()> {
         });
     }
 
-    // ── Main UDP recv loop ──
-    // First packet via async recv_from; then drain ready packets with
-    // try_recv_batch_from (Linux: recvmmsg) before awaiting again (P1.3).
-    let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut batch_slots: Vec<Vec<u8>> = (0..16).map(|_| Vec::with_capacity(MAX_DATAGRAM)).collect();
-    let mut batch_extra: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(16);
+    // ── Per-socket UDP recv tasks ──
+    // Spawn one recv loop per UDP socket (matches Go multi-port listener pattern).
+    for udp in &udp_sockets {
+        let udp_recv = udp.clone();
+        let target_str = target_str.clone();
+        let sessions = sessions.clone();
+        let session_cfg = session_cfg.clone();
+        let qpp_key = key_arr.to_vec();
+        let stop_flag = stop_flag.clone();
 
-    // Local helper: process one encrypted datagram for a peer.
-    // `data` is the unique mut buffer for this packet (main recv or batch slot).
-    let process_datagram = |peer: SocketAddr, data: &mut [u8]| {
-        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_pkts, 1);
-        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_bytes, data.len() as u64);
-        let session = get_or_create_session(
-            &sessions,
-            &peer,
-            data,
-            datashard,
-            parityshard,
-            crypt_method,
-            &key_arr,
-            &udp,
-            mode,
-            mtu,
-            sndwnd,
-            rcvwnd,
-            acknodelay,
-            nodelay,
-            interval,
-            resend,
-            nc,
-            smuxver,
-            smuxbuf,
-            streambuf,
-            framesize,
-            keepalive,
-            nocomp,
-        );
-        let new_streams = {
-            session.feed_data_mut(data);
-            // Peer UDP may open send window — wake flush promptly.
-            session.flush_notify.notify_one();
-            session.drain_new_streams()
-        };
-        for (stream_id, smux_stream) in new_streams {
-            if !quiet {
-                info!(
-                    "accepting stream {} from {} -> target {}",
-                    stream_id, peer, target_str
+        kio::spawn_task(async move {
+            let mut buf = vec![0u8; MAX_DATAGRAM];
+            let mut batch_slots: Vec<Vec<u8>> =
+                (0..16).map(|_| Vec::with_capacity(MAX_DATAGRAM)).collect();
+            let mut batch_extra: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(16);
+
+            // Process one encrypted datagram for a peer.
+            let process_datagram = |peer: SocketAddr, data: &mut [u8]| {
+                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_pkts, 1);
+                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_bytes, data.len() as u64);
+                let session = get_or_create_session(
+                    &sessions,
+                    &peer,
+                    data,
+                    &key_arr,
+                    &udp_recv,
+                    &session_cfg,
                 );
-            }
-            let target = target_str.clone();
-            let qpp_key = key_arr.to_vec();
-            let qp = quiet;
-            let cw = close_wait_val;
-            let fn_notify = session.flush_notify.clone();
-            kio::spawn_task(async move {
-                if let Err(e) = handle_stream(
-                    target,
-                    smux_stream,
-                    stream_id,
-                    qpp_enabled,
-                    qpp_key,
-                    qpp_count,
-                    qp,
-                    cw,
-                    fn_notify,
-                )
-                .await
-                {
-                    error!("stream {} handler error: {:?}", stream_id, e);
+                let target_str = target_str.clone();
+                session.feed_data_mut(data);
+                session.flush_notify.notify_one();
+                for (stream_id, smux_stream) in session.drain_new_streams() {
+                    if !quiet {
+                        info!(
+                            "accepting stream {} from {} -> target {}",
+                            stream_id, peer, target_str
+                        );
+                    }
+                    let target = target_str.clone();
+                    let qpp_key = qpp_key.clone();
+                    let fn_notify = session.flush_notify.clone();
+                    kio::spawn_task(async move {
+                        if let Err(e) = handle_stream(
+                            target,
+                            smux_stream,
+                            stream_id,
+                            qpp_enabled,
+                            qpp_key,
+                            qpp_count,
+                            quiet,
+                            close_wait_val,
+                            fn_notify,
+                        )
+                        .await
+                        {
+                            error!("stream {} handler error: {:?}", stream_id, e);
+                        }
+                        if !quiet {
+                            info!("stream {} closed", stream_id);
+                        }
+                    });
                 }
-                if !qp {
-                    info!("stream {} closed", stream_id);
-                }
-            });
-        }
-    };
+            };
 
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                match kio::timeout(Duration::from_millis(500), udp_recv.recv_from(&mut buf)).await {
+                    Ok(Ok((n, peer))) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        process_datagram(peer, &mut buf[..n]);
+                        batch_extra.clear();
+                        match udp_recv.try_recv_batch_from(&mut batch_slots, &mut batch_extra) {
+                            Ok(count) if count > 0 => {
+                                for (mut pkt, peer) in batch_extra.drain(..) {
+                                    process_datagram(peer, pkt.as_mut_slice());
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => {
+                                error!("UDP try_recv_batch_from error: {}", e);
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        error!("UDP recv_from error: {}", e);
+                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        });
+    }
+
+    // Main task waits for stop signal (Ctrl-C).
     loop {
+        kio::sleep_ms(500).await;
         if stop_flag.load(Ordering::Relaxed) {
             info!("received Ctrl+C, shutting down...");
             break;
-        }
-
-        match kio::timeout(Duration::from_millis(500), udp.recv_from(&mut buf)).await {
-            Ok(Ok((n, peer))) => {
-                if n == 0 {
-                    continue;
-                }
-                process_datagram(peer, &mut buf[..n]);
-                // Drain any further ready datagrams without yielding.
-                batch_extra.clear();
-                match udp.try_recv_batch_from(&mut batch_slots, &mut batch_extra) {
-                    Ok(count) if count > 0 => {
-                        for (mut pkt, peer) in batch_extra.drain(..) {
-                            process_datagram(peer, pkt.as_mut_slice());
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        error!("UDP try_recv_batch_from error: {}", e);
-                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                error!("UDP recv_from error: {}", e);
-                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_errs, 1);
-                continue;
-            }
-            Err(_) => continue, // timeout, loop back to check stop_flag
         }
     }
 
@@ -2411,6 +2145,13 @@ mod tests {
 
             let _ = writer.await;
         });
+    }
+
+    fn now_ms() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32
     }
 
     #[test]

@@ -16,7 +16,7 @@ KCP ARQ (Automatic Repeat-reQuest) reliable UDP protocol state machine — port 
 | `src/kcp.rs` | Core `KCP` state machine: windows, RTO, flush, input, NoDelay |
 | `src/segment.rs` | 24-byte LE wire header, `Command` enum, `SegmentPool` (SegQueue) |
 | `src/fec.rs` | `FecEncoder` / `FecDecoder` / `fec_expand_packets` / `fec_kcp_from_recovered`; header types `0x00f1` / `0x00f2` / `0x00f3` |
-| `src/crypto_buf.rs` | CFB pack: nonce counter + CRC32; `prepare_encrypt`, `encrypt_batch`, `should_cpu_block_*`; inbound `decrypt_cfb_in_place` / `strip_cfb_header_if_present` / `inbound_null` |
+| `src/crypto_buf.rs` | CFB/salsa/xor/AEAD pack: nonce counter + CRC32; `encrypt_packet` / `seal_aead` / `prepare_encrypt` / `encrypt_batch`; `should_cpu_block_*`; inbound `decrypt_cfb_in_place` / `strip_cfb_header_if_present` / `inbound_null` |
 | `src/session.rs` | `UDPSession` helper around KCP + UDP |
 | `src/snmp.rs` | Global `DEFAULT_SNMP` atomic counters; `snmp_enable` / `snmp_add` / `snmp_store` |
 
@@ -48,7 +48,10 @@ None (flat `src/`).
 - NoDelay modes applied by binaries via `nodelay/interval/resend/nc`
 - FEC optional at **session layer** only (`FecEncoder`/`FecDecoder`); no KCP-level FEC API
 - Recovered FEC payload: `fec_kcp_from_recovered` (Go `r[2:sz]`); reconstruct present-flag is `true` = present
-- Public re-exports: `KCP`, `CryptoBuf`, `encrypt_batch`, `decrypt_cfb_in_place`, `strip_cfb_header_if_present`, `inbound_null`, `InboundCryptError`, `CRYPT_HDR`/`NONCE_SZ`, `FecEncoder`/`FecDecoder`, `fec_expand_packets`, `fec_kcp_from_recovered`, `DEFAULT_SNMP`, `BlockCrypt`/`select_block_crypt`
+- Public re-exports: `KCP`, `CryptoBuf`, `CryptEngine`, `encrypt_batch`, `decrypt_cfb_in_place`, `should_cpu_block_{encrypt,decrypt,compress}`, `strip_cfb_header_if_present`, `inbound_null`, `InboundCryptError`, `CRYPT_HDR`/`NONCE_SZ`, FEC + SNMP helpers, `BlockCrypt`/`select_block_crypt`
+- `encrypt_batch(packets, &CryptEngine, crypto_buf, has_encryption, allow_parallel)` — AEAD via `crypt.as_aead()` + reused `CryptoBuf.aead_buf`; salsa/xor use headerless wire
+- ACK / mixed-cipher path: prefer `CryptoBuf::encrypt_packet` (dispatches salsa/xor headerless vs CFB) — never bare `encrypt_cfb` on salsa/xor
+- `should_cpu_block_encrypt`: null never; xor/salsa/AEAD offload when pkts≥8 or bytes≥8KiB; other CFB when pkts≥4 or bytes≥4KiB
 - Inbound CFB hot path: use `decrypt_cfb_in_place` (no `enc_buf` copy); `CryptoBuf::decrypt_cfb` still copies into reusable buffer for callers that need owned `Bytes`
 
 ## Dependencies

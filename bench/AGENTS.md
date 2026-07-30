@@ -11,8 +11,8 @@ Throughput and CPU-profile tooling for Rust vs Go kcptun. Go-compatible pprof pr
 
 | File | Description |
 |------|-------------|
-| `run_bench.sh` | Bench orchestration helper |
-| `throughput.py` | Throughput measurement utility |
+| `run_bench.sh` | Bench orchestration; labels are **Client → Server** (bulk stream direction) |
+| `throughput.py` | Throughput measurement (loadgen → client listen port → server → echo) |
 | `profile_rust_go_pprof.sh` | Rust CPU → Go pprof protobuf (`make profile`) |
 | `profile_go_pprof.sh` | Go side pprof helper |
 | `PROFILE_RUNBOOK.md` | How to run and interpret profiles |
@@ -32,6 +32,7 @@ Throughput and CPU-profile tooling for Rust vs Go kcptun. Go-compatible pprof pr
 - Prefer evidence from `profiles/HOTSPOTS.md` + re-bench over guesswork.
 - One optimization class per change; keep wire compatibility; shared `encrypt_batch` paths.
 - Root also has `bench_rust_vs_go.py` / `bench_results.json` for 3-way throughput.
+- `run_bench.sh` path labels are always **Client → Server** (not server→client). `run_bench <label> <client_bin> <server_bin>`.
 
 ### Testing Requirements
 

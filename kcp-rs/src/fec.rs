@@ -731,18 +731,12 @@ mod tests {
             let size = u16::from_le_bytes([data[6], data[7]]) as usize;
             assert_eq!(size, data.len() - 6);
             assert_eq!(&data[8..], &kcp[..]);
-            assert_eq!(
-                u16::from_le_bytes([data[4], data[5]]),
-                FEC_TYPE_DATA
-            );
+            assert_eq!(u16::from_le_bytes([data[4], data[5]]), FEC_TYPE_DATA);
             data_frames.push(data);
             if i == 2 {
                 assert_eq!(parity.len(), 2);
                 for p in &parity {
-                    assert_eq!(
-                        u16::from_le_bytes([p[4], p[5]]),
-                        FEC_TYPE_PARITY
-                    );
+                    assert_eq!(u16::from_le_bytes([p[4], p[5]]), FEC_TYPE_PARITY);
                     assert_eq!(p.len(), data_frames[0].len());
                 }
                 parity_frames = parity;

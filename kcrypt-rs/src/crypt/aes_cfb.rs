@@ -4,9 +4,9 @@
 //! The cipher instance is created ONCE in the constructor and reused —
 //! re-creating it per block (key schedule) was the original perf bug.
 
-use super::{BlockCrypt, BlockCipher16, cfb16_encrypt, cfb16_decrypt};
-use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use super::{cfb16_decrypt, cfb16_encrypt, BlockCipher16, BlockCrypt};
 use aes::cipher::consts::U16;
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 
 enum AesCipher {
     Aes128(aes::Aes128),

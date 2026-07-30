@@ -37,8 +37,8 @@ thread_local! {
     static IN_SAMPLE: Cell<bool> = const { Cell::new(false) };
 }
 
-use pprof::protos::{self as protos, Message};
 use parking_lot::Mutex;
+use pprof::protos::{self as protos, Message};
 
 // ─── Global sampling state ───────────────────────────────────────────────────
 
@@ -359,7 +359,11 @@ fn build_profile(heap: bool) -> Vec<u8> {
     //    gets 100% flat attribution, masking the real allocation caller.
     let mut symbolized: HashMap<u64, (Vec<Frame>, &AllocSample)> = HashMap::new();
     for (hash, sample) in &samples {
-        let all_frames: Vec<Frame> = sample.addresses.iter().map(|&a| resolve_address(a)).collect();
+        let all_frames: Vec<Frame> = sample
+            .addresses
+            .iter()
+            .map(|&a| resolve_address(a))
+            .collect();
         let frames: Vec<Frame> = skip_profiling_frames(all_frames);
         symbolized.insert(*hash, (frames, sample));
     }
@@ -611,10 +615,16 @@ mod tests {
         // Go-compatible behavior: we still emit a valid Profile (0 samples) so
         // /debug/pprof/heap is always usable, matching net/http/pprof semantics.
         let heap_bytes = build_heap_profile();
-        assert!(!heap_bytes.is_empty(), "heap profile should be a valid (possibly empty) protobuf");
+        assert!(
+            !heap_bytes.is_empty(),
+            "heap profile should be a valid (possibly empty) protobuf"
+        );
 
         let allocs_bytes = build_allocs_profile();
-        assert!(!allocs_bytes.is_empty(), "allocs profile should be a valid (possibly empty) protobuf");
+        assert!(
+            !allocs_bytes.is_empty(),
+            "allocs profile should be a valid (possibly empty) protobuf"
+        );
 
         // Parse and validate structure for heap
         let prof = protos::Profile::parse_from_bytes(&heap_bytes).expect("parse heap profile");
@@ -643,7 +653,12 @@ mod tests {
         let names: Vec<_> = prof
             .sample_type
             .iter()
-            .map(|vt| prof.string_table.get(vt.ty as usize).cloned().unwrap_or_default())
+            .map(|vt| {
+                prof.string_table
+                    .get(vt.ty as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            })
             .collect();
         assert!(names.contains(&"inuse_space".to_string()));
         assert!(names.contains(&"inuse_objects".to_string()));
@@ -665,7 +680,12 @@ mod tests {
         let names: Vec<_> = prof
             .sample_type
             .iter()
-            .map(|vt| prof.string_table.get(vt.ty as usize).cloned().unwrap_or_default())
+            .map(|vt| {
+                prof.string_table
+                    .get(vt.ty as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            })
             .collect();
         assert!(names.contains(&"alloc_space".to_string()));
         assert!(names.contains(&"alloc_objects".to_string()));

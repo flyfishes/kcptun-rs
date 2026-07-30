@@ -28,11 +28,13 @@ Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.
 ### Working In This Directory
 
 - **CFB uses fixed IV** `GO_CFB_IV` (16 bytes hardcoded to match Go). Never randomize per-packet IV.
-- `BlockCrypt::{encrypt,decrypt}` take `&self` — ciphers are **stateless after construction**. Callers store `Arc<dyn BlockCrypt>` without Mutex.
+- `BlockCrypt::{encrypt,decrypt}` take `&self` — ciphers are **stateless after construction**.
+- **Hot path:** prefer `Arc<CryptEngine>` (enum match) over `Arc<dyn BlockCrypt>`. Helpers: `is_aead()`, `as_aead()`, `uses_cfb_header(method)`.
+- `select_block_crypt` still returns `Box<dyn BlockCrypt>` for tests/legacy; it delegates to `CryptEngine::select`.
 - CFB helpers are generic `<F: Fn>` for monomorphization/inlining — keep them generic, not `&dyn Fn`.
-- Key selection: `select_block_crypt(name, password)` / `select_aead_crypt` — password typically already PBKDF2-derived 32B key from binaries (`SALT = b"kcp-go"`).
+- Key selection: `CryptEngine::select` / `select_block_crypt` / `select_aead_crypt` — password typically already PBKDF2-derived 32B key from binaries (`SALT = b"kcp-go"`).
 - TEA: **8 rounds** (Go uses rounds/2). SM4: tjfoc/gmsm S-box + CK fix. Do not "upgrade" defaults that break interop.
-- `null`/`none` both map to no-op encrypt; packet **header** difference is handled in binaries / `CryptoBuf`.
+- `null`/`none` both map to no-op encrypt; packet **header** difference is handled in binaries / `CryptoBuf` via `has_encryption` / `uses_cfb_header`.
 - Hot CFB paths (AES, 3DES, XTEA, Blowfish, …) are monomorphized — prefer that pattern for new ciphers.
 - On aarch64, `.cargo/config.toml` sets `--cfg aes_armv8` so AES is not soft fixslice.
 
@@ -45,12 +47,18 @@ Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.
 ### Common Patterns
 
 ```rust
+// Preferred on session hot path:
+let (engine, name) = CryptEngine::select("aes-128", &key);
+let crypt = Arc::new(engine);
+crypt.encrypt(&mut data);
+
+// Legacy / tests:
 let (cipher, name) = select_block_crypt("aes-128", &key);
 cipher.encrypt(&mut data);
-cipher.decrypt(&mut data);
 ```
 
 Wire packing (CFB nonce+CRC) is done by `kcp_rs::CryptoBuf`, not this crate.
+`encrypt_batch` takes `&CryptEngine` (AEAD via `crypt.as_aead()`).
 
 ## Dependencies
 

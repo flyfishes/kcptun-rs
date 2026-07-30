@@ -107,6 +107,13 @@ pub struct SNMP {
     // ── Rust-only (not in Go CSV) ──
     /// Flush cycles that produced no UDP output (P2.2 observability).
     pub empty_flush: AtomicU64,
+    /// Encrypt batches run inline on the flush/recv task (not cpu_block).
+    pub encrypt_inline: AtomicU64,
+    /// Encrypt batches offloaded to `cpu_block`.
+    pub encrypt_offload: AtomicU64,
+    /// Inbound datagrams that matched the heavy-decrypt heuristic but stayed
+    /// inline for ordering safety (offload disabled / FEC / comp).
+    pub decrypt_offload_skipped: AtomicU64,
 }
 
 impl SNMP {
@@ -144,6 +151,9 @@ impl SNMP {
             ring_buffer_rcv_queue: AtomicU64::new(0),
             ring_buffer_snd_buffer: AtomicU64::new(0),
             empty_flush: AtomicU64::new(0),
+            encrypt_inline: AtomicU64::new(0),
+            encrypt_offload: AtomicU64::new(0),
+            decrypt_offload_skipped: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +190,9 @@ impl SNMP {
             ring_buffer_rcv_queue: self.ring_buffer_rcv_queue.load(Ordering::Acquire),
             ring_buffer_snd_buffer: self.ring_buffer_snd_buffer.load(Ordering::Acquire),
             empty_flush: self.empty_flush.load(Ordering::Acquire),
+            encrypt_inline: self.encrypt_inline.load(Ordering::Acquire),
+            encrypt_offload: self.encrypt_offload.load(Ordering::Acquire),
+            decrypt_offload_skipped: self.decrypt_offload_skipped.load(Ordering::Acquire),
         }
     }
 
@@ -287,6 +300,9 @@ impl SNMP {
         self.ring_buffer_rcv_queue.store(0, Ordering::Release);
         self.ring_buffer_snd_buffer.store(0, Ordering::Release);
         self.empty_flush.store(0, Ordering::Release);
+        self.encrypt_inline.store(0, Ordering::Release);
+        self.encrypt_offload.store(0, Ordering::Release);
+        self.decrypt_offload_skipped.store(0, Ordering::Release);
     }
 
     /// Record a new established session. `active=true` for client dial.
@@ -356,6 +372,9 @@ pub(crate) struct SnmpSnapshot {
     pub ring_buffer_rcv_queue: u64,
     pub ring_buffer_snd_buffer: u64,
     pub empty_flush: u64,
+    pub encrypt_inline: u64,
+    pub encrypt_offload: u64,
+    pub decrypt_offload_skipped: u64,
 }
 
 impl fmt::Display for SnmpSnapshot {
@@ -391,6 +410,9 @@ impl fmt::Display for SnmpSnapshot {
         writeln!(f, "RingBufferRcvQueue: {}", self.ring_buffer_rcv_queue)?;
         writeln!(f, "RingBufferSndBuffer: {}", self.ring_buffer_snd_buffer)?;
         writeln!(f, "EmptyFlush: {}", self.empty_flush)?;
+        writeln!(f, "EncryptInline: {}", self.encrypt_inline)?;
+        writeln!(f, "EncryptOffload: {}", self.encrypt_offload)?;
+        writeln!(f, "DecryptOffloadSkipped: {}", self.decrypt_offload_skipped)?;
         Ok(())
     }
 }

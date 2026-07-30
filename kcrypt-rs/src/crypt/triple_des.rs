@@ -12,7 +12,7 @@
 //!
 //! Operates in CFB-8 mode. Wire-compatible with Go's `crypto/des`.
 
-use super::{BlockCrypt, BlockCipher8, cfb8_encrypt, cfb8_decrypt};
+use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 use crate::des::TripleDesCipher;
 
 #[derive(Debug)]

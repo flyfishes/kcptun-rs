@@ -391,6 +391,165 @@ fn test_copy_bidirectional_idle_fires_when_quiet() {
         .unwrap();
 }
 
+// ─── copy_bidirectional_postwait: Go closeWait semantics ─────────────────────
+// Postwait delays AFTER the copy completes (not idle timeout during copy).
+// Matches Go kcptun's Pipe: copy both directions, then wait closeWait seconds.
+//
+// These tests use two paired sockets with both sides shut down immediately
+// so the bidirectional copy completes instantly, then the post-wait fires.
+
+/// postwait=0: copy completes, returns immediately (no delay).
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn test_copy_bidirectional_postwait_immediate() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+
+    // Shut down both sides so the copy completes immediately.
+    use crate::AsyncWriteExt;
+    let _ = client.shutdown().await;
+    let _ = server.shutdown().await;
+
+    let start = Instant::now();
+    let (ab, ba) = copy_bidirectional_postwait(&mut client, &mut server, 0)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!((ab, ba), (0, 0));
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "postwait=0 must return immediately; got {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "smol")]
+#[test]
+fn test_copy_bidirectional_postwait_immediate() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                    .await
+                    .unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+
+                // Shut down both sides so copy completes immediately.
+                use crate::AsyncWriteExt;
+                let _ = client.close().await;
+                let _ = server.close().await;
+
+                let start = Instant::now();
+                let (ab, ba) = copy_bidirectional_postwait(&mut client, &mut server, 0)
+                    .await
+                    .unwrap();
+                let elapsed = start.elapsed();
+                assert_eq!((ab, ba), (0, 0));
+                assert!(
+                    elapsed < std::time::Duration::from_millis(500),
+                    "postwait=0 must return immediately; got {elapsed:?}"
+                );
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// postwait=1: copy completes (both sides EOF), then waits ~1s.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn test_copy_bidirectional_postwait_delays() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+
+    // Shut down both sides immediately — copy completes, then postwait fires.
+    use crate::AsyncWriteExt;
+    let _ = client.shutdown().await;
+    let _ = server.shutdown().await;
+
+    let start = Instant::now();
+    let (ab, ba) = copy_bidirectional_postwait(&mut client, &mut server, 1)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!((ab, ba), (0, 0));
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "postwait=1 must delay >=900ms; got {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "postwait=1 delay too long; got {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "smol")]
+#[test]
+fn test_copy_bidirectional_postwait_delays() {
+    use crate::net::{TcpListener, TcpStream};
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                    .await
+                    .unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+
+                // Shut down both sides immediately.
+                use crate::AsyncWriteExt;
+                let _ = client.close().await;
+                let _ = server.close().await;
+
+                let start = Instant::now();
+                let (ab, ba) = copy_bidirectional_postwait(&mut client, &mut server, 1)
+                    .await
+                    .unwrap();
+                let elapsed = start.elapsed();
+                assert_eq!((ab, ba), (0, 0));
+                assert!(
+                    elapsed >= std::time::Duration::from_millis(900),
+                    "postwait=1 must delay >=900ms; got {elapsed:?}"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(3),
+                    "postwait=1 delay too long; got {elapsed:?}"
+                );
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 // ─── spawn_task throughput micro-benchmark ──────────────────────────────────
 // Measures fire-and-forget `spawn_task` overhead. The `#[inline(always)]`
 // attribute guarantees the thin delegation is erased at compile time, so this

@@ -296,7 +296,9 @@ impl SmuxConn {
             // ── Flush outbound (SYN + PSH + FIN + UPD) ──
             write_buf.clear();
             let ver = self.session.version();
-            let mut fin_ids = self.session.prepare_outbound_into(&mut write_buf, 65536, ver);
+            let mut fin_ids = self
+                .session
+                .prepare_outbound_into(&mut write_buf, 65536, ver);
 
             // Reap zombie streams and append their FINs.
             // Reaped streams are removed from the map by reap_stale_streams.
@@ -430,13 +432,7 @@ impl SmuxConn {
                     // on the wire this batch (consistent with "can't lose FIN").
                     let need_fin = session.reap_stale_streams(REAP_LINGER);
                     for id in &need_fin {
-                        Frame::encode_header_into(
-                            &mut buf,
-                            ver,
-                            crate::frame::Cmd::Fin,
-                            *id,
-                            0,
-                        );
+                        Frame::encode_header_into(&mut buf, ver, crate::frame::Cmd::Fin, *id, 0);
                     }
                     fin_ids.extend(need_fin);
                 }
@@ -471,11 +467,11 @@ mod tests {
     use super::*;
     use crate::frame::{Cmd, FrameCodec};
     use crate::session::DEFAULT_CONFIG;
+    use bytes::BytesMut;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
-    use bytes::BytesMut;
 
     /// Verify that SmuxConn is Clone and shares the same session.
     #[test]
@@ -677,7 +673,10 @@ mod tests {
                     saw_fin = true;
                 }
             }
-            assert!(saw_fin, "expected a FIN frame for the reaped stream id on the wire");
+            assert!(
+                saw_fin,
+                "expected a FIN frame for the reaped stream id on the wire"
+            );
 
             // The reaper should have removed it from the map.
             assert!(
@@ -771,7 +770,10 @@ mod tests {
             kio::sleep_ms(20).await;
 
             let data = written.lock().unwrap().clone();
-            assert!(!data.is_empty(), "expected flush bytes via spawn write half");
+            assert!(
+                !data.is_empty(),
+                "expected flush bytes via spawn write half"
+            );
 
             let mut codec = FrameCodec::new(65536);
             codec.feed(&data);
@@ -781,7 +783,10 @@ mod tests {
                     saw_fin = true;
                 }
             }
-            assert!(saw_fin, "expected a FIN frame for the reaped stream via spawn");
+            assert!(
+                saw_fin,
+                "expected a FIN frame for the reaped stream via spawn"
+            );
 
             assert!(conn.session().streams().lock().get(&sid).is_none());
         }

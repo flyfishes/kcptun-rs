@@ -26,7 +26,11 @@ RUST_SMOL_CLIENT=./target/smol-release/release/kcptun-client
 
 # kcptun args — aligned on both sides for fair cross-impl comparison.
 # Default Rust client sndwnd is 128 vs server 1024; leave them implicit and
-# the Rust→Go path is not comparable. Force the same windows/mode/smuxver.
+# cross-impl paths are not comparable. Force the same windows/mode/smuxver.
+#
+# Traffic direction (measured by throughput.py):
+#   loadgen ──TCP──► client(-l) ──KCP/UDP──► server(-l) ──TCP──► echo
+# Labels are always "Client → Server" (who encrypts/sends the bulk stream).
 CRYPT="${BENCH_CRYPT:-aes}"
 MODE="${BENCH_MODE:-fast}"
 SNDWND="${BENCH_SNDWND:-1024}"
@@ -135,20 +139,22 @@ start_client() {
     fi
 }
 
+# run_bench <label> <client_bin> <server_bin>
+# Label convention: "Client → Server" (bulk data leaves the client toward the server).
 run_bench() {
     local label=$1
-    local server_bin=$2
-    local client_bin=$3
+    local client_bin=$2
+    local server_bin=$3
 
     echo "━━━ $label ━━━"
 
-    if [ ! -x "$server_bin" ]; then
-        echo "  ⏭️  Skipped (binary not found: $server_bin)"
+    if [ ! -x "$client_bin" ]; then
+        echo "  ⏭️  Skipped (binary not found: $client_bin)"
         echo ""
         return
     fi
-    if [ ! -x "$client_bin" ]; then
-        echo "  ⏭️  Skipped (binary not found: $client_bin)"
+    if [ ! -x "$server_bin" ]; then
+        echo "  ⏭️  Skipped (binary not found: $server_bin)"
         echo ""
         return
     fi
@@ -197,13 +203,15 @@ echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
 # Run benchmarks
+# Labels = Client → Server (matches bulk traffic direction).
 # ═══════════════════════════════════════════════════════════════════════
-run_bench "Go → Go"                    "$GO_SERVER"           "$GO_CLIENT"
-run_bench "Rust-Tokio → Rust-Tokio"    "$RUST_TOKIO_SERVER"   "$RUST_TOKIO_CLIENT"
-run_bench "Rust-Smol → Rust-Smol"      "$RUST_SMOL_SERVER"    "$RUST_SMOL_CLIENT"
-run_bench "Go → Rust-Tokio"            "$GO_SERVER"           "$RUST_TOKIO_CLIENT"
-run_bench "Rust-Tokio → Go"            "$RUST_TOKIO_SERVER"   "$GO_CLIENT"
-run_bench "Rust-Smol → Rust-Tokio"     "$RUST_SMOL_SERVER"    "$RUST_TOKIO_CLIENT"
-run_bench "Rust-Tokio → Rust-Smol"     "$RUST_TOKIO_SERVER"   "$RUST_SMOL_CLIENT"
+run_bench "Go → Go"                    "$GO_CLIENT"           "$GO_SERVER"
+run_bench "Rust-Tokio → Rust-Tokio"    "$RUST_TOKIO_CLIENT"   "$RUST_TOKIO_SERVER"
+run_bench "Rust-Smol → Rust-Smol"      "$RUST_SMOL_CLIENT"    "$RUST_SMOL_SERVER"
+# Cross-impl: bulk stream is encrypted/sent by the client side of the label.
+run_bench "Rust-Tokio → Go"            "$RUST_TOKIO_CLIENT"   "$GO_SERVER"
+run_bench "Go → Rust-Tokio"            "$GO_CLIENT"           "$RUST_TOKIO_SERVER"
+run_bench "Rust-Tokio → Rust-Smol"     "$RUST_TOKIO_CLIENT"   "$RUST_SMOL_SERVER"
+run_bench "Rust-Smol → Rust-Tokio"     "$RUST_SMOL_CLIENT"    "$RUST_TOKIO_SERVER"
 
 echo "Benchmark complete."

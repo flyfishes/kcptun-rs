@@ -3,8 +3,29 @@
 //! - [`spawn_task`]: fire-and-forget async task (tokio::spawn / global Executor)
 //! - [`cpu_block`]: offload CPU-intensive work to a blocking thread pool
 //! - [`block_on`]: runtime entry point (multi-threaded on both backends)
+//! - [`runtime_kind`]: compile-time tokio vs smol (offload policy only)
 
 use std::future::Future;
+
+/// Which async backend this binary was built with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKind {
+    Tokio,
+    Smol,
+}
+
+/// Compile-time runtime (`tokio` / `smol` features are mutually exclusive).
+#[inline(always)]
+pub const fn runtime_kind() -> RuntimeKind {
+    #[cfg(feature = "tokio")]
+    {
+        RuntimeKind::Tokio
+    }
+    #[cfg(feature = "smol")]
+    {
+        RuntimeKind::Smol
+    }
+}
 
 /// Handle to a spawned task.
 ///

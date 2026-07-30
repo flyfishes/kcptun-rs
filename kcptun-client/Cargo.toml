@@ -7,8 +7,9 @@ description = "kcptun client binary"
 [dependencies]
 kcp-rs = { path = "../kcp-rs" }
 kcrypt-rs = { path = "../kcrypt-rs" }
+kcptun-common = { path = "../kcptun-common", default-features = false }
 smux-rs = { path = "../smux-rs", default-features = false }
-qpp-rs = { path = "../qpp-rs" }
+qpp-rs = { path = "../qpp-rs", optional = true }
 kio-rs = { path = "../kio-rs", default-features = false }
 clap = { version = "4", default-features = false, features = ["derive", "env", "std", "help", "usage", "error-context"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,14 +28,16 @@ mimalloc = { version = "0.1", default-features = false }
 kpprof-rs = { path = "../kpprof-rs", optional = true, default-features = false }
 
 [features]
-default = ["tokio"]
+default = ["tokio", "qpp"]
 # Optional Go-compatible pprof HTTP endpoint (--pprof). Off by default to keep ARM bins small.
 # Includes CPU profile + heap/allocs + goroutine (thread dump).
 pprof = ["dep:kpprof-rs"]
 # Deadlock detection (adds parking_lot deadlock_detection overhead).
 pprof-deadlock = ["pprof", "kpprof-rs/deadlock"]
-tokio = ["kio-rs/tokio", "smux-rs/tokio", "kpprof-rs?/tokio"]
-smol = ["kio-rs/smol", "smux-rs/smol", "kpprof-rs?/smol"]
+tokio = ["kio-rs/tokio", "smux-rs/tokio", "kcptun-common/tokio", "kpprof-rs?/tokio"]
+smol = ["kio-rs/smol", "smux-rs/smol", "kcptun-common/smol", "kpprof-rs?/smol"]
+# Quantum Permutation Pad stream obfuscation. Optional to keep ARM binaries small.
+qpp = ["dep:qpp-rs", "kcptun-common/qpp"]
 
 [[bin]]
 name = "kcptun-client"

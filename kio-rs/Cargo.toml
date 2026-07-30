@@ -11,7 +11,8 @@ name = "kio"
 # Shared (runtime-agnostic) — always present
 async-lock = "3"
 async-channel = "2"
-socket2 = "0.5"
+# `all` enables Type::RAW + set_header_included_v4 needed by Linux tcpraw.
+socket2 = { version = "0.5", features = ["all"] }
 log = "0.4"
 libc = "0.2"
 

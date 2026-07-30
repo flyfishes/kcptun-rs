@@ -6,6 +6,7 @@ members = [
     "qpp-rs",
     "kio-rs",
     "kpprof-rs",
+    "kcptun-common",
     "kcptun-client",
     "kcptun-server",
 ]

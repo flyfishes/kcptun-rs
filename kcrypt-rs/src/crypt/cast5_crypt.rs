@@ -4,7 +4,7 @@
 //! `golang.org/x/crypto/cast5` (see [`crate::cast5`]). Wire-compatible
 //! with Go's cast5 cipher. Operates in CFB-8 mode.
 
-use super::{BlockCrypt, BlockCipher8, cfb8_decrypt, cfb8_encrypt};
+use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 
 #[derive(Debug)]
 pub struct Cast5Crypt {

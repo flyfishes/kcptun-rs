@@ -146,8 +146,14 @@ pub fn cfb8_encrypt<C: BlockCipher8>(data: &mut [u8], c: &C) {
         return;
     }
     let mut tbl = [
-        GO_CFB_IV[0], GO_CFB_IV[1], GO_CFB_IV[2], GO_CFB_IV[3],
-        GO_CFB_IV[4], GO_CFB_IV[5], GO_CFB_IV[6], GO_CFB_IV[7],
+        GO_CFB_IV[0],
+        GO_CFB_IV[1],
+        GO_CFB_IV[2],
+        GO_CFB_IV[3],
+        GO_CFB_IV[4],
+        GO_CFB_IV[5],
+        GO_CFB_IV[6],
+        GO_CFB_IV[7],
     ];
     let mut i = 0;
     while i + 64 <= data.len() {
@@ -194,8 +200,14 @@ pub fn cfb8_decrypt<C: BlockCipher8>(data: &mut [u8], c: &C) {
         return;
     }
     let mut tbl = [
-        GO_CFB_IV[0], GO_CFB_IV[1], GO_CFB_IV[2], GO_CFB_IV[3],
-        GO_CFB_IV[4], GO_CFB_IV[5], GO_CFB_IV[6], GO_CFB_IV[7],
+        GO_CFB_IV[0],
+        GO_CFB_IV[1],
+        GO_CFB_IV[2],
+        GO_CFB_IV[3],
+        GO_CFB_IV[4],
+        GO_CFB_IV[5],
+        GO_CFB_IV[6],
+        GO_CFB_IV[7],
     ];
     let mut i = 0;
     while i + 8 <= data.len() {
@@ -237,17 +249,14 @@ pub fn cfb16_encrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
             let chunk = &mut data[i..i + 16];
             let mut b = [0u8; 16];
             c.encrypt_block(&mut b, &tbl);
-            let b0 = u64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]);
-            let b1 = u64::from_le_bytes([
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-            ]);
+            let b0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            let b1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
             let s0 = u64::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             ]);
             let s1 = u64::from_le_bytes([
-                chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+                chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14],
+                chunk[15],
             ]);
             let out0 = (s0 ^ b0).to_le_bytes();
             let out1 = (s1 ^ b1).to_le_bytes();
@@ -261,12 +270,8 @@ pub fn cfb16_encrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
         let chunk = &mut data[i..i + 16];
         let mut b = [0u8; 16];
         c.encrypt_block(&mut b, &tbl);
-        let b0 = u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]);
-        let b1 = u64::from_le_bytes([
-            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-        ]);
+        let b0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        let b1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
         let s0 = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
@@ -310,12 +315,8 @@ pub fn cfb16_decrypt<C: BlockCipher16>(data: &mut [u8], c: &C) {
         ];
         let mut b = [0u8; 16];
         c.encrypt_block(&mut b, &tbl);
-        let b0 = u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]);
-        let b1 = u64::from_le_bytes([
-            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-        ]);
+        let b0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        let b1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
         let s0 = u64::from_le_bytes([
             src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
         ]);
@@ -402,6 +403,12 @@ pub enum CryptEngine {
 impl CryptEngine {
     /// Build a [`CryptEngine`] from a method name (same selection as
     /// [`select_block_crypt`]).
+    ///
+    /// For `"null"` vs `"none"`: both use the no-op cipher body, but the
+    /// **wire header policy** differs (null = no crypto header; none = CFB
+    /// header with identity cipher). Callers must keep the original method
+    /// string (or the returned name) for that policy — see
+    /// [`Self::uses_cfb_header`] / session `has_encryption`.
     pub fn select(method: &str, pass: &[u8]) -> (Self, String) {
         match method {
             "null" | "none" => (CryptEngine::None(NoneCrypt), method.to_string()),
@@ -459,6 +466,10 @@ impl CryptEngine {
     }
 
     /// Canonical method name for this engine.
+    ///
+    /// Note: both `"null"` and `"none"` map to the `None` variant; this
+    /// returns `"none"`. Prefer the name string from [`Self::select`] when
+    /// distinguishing wire header policy.
     pub fn name(&self) -> &'static str {
         match self {
             CryptEngine::None(_) => "none",
@@ -474,6 +485,34 @@ impl CryptEngine {
             CryptEngine::Cast5(_) => "cast5",
             CryptEngine::TripleDes(_) => "3des",
         }
+    }
+
+    /// True when this engine is AES-128-GCM (AEAD wire layout).
+    #[inline]
+    pub fn is_aead(&self) -> bool {
+        matches!(self, CryptEngine::Aes128Gcm(_))
+    }
+
+    /// Borrow the AEAD implementation when this is GCM; otherwise `None`.
+    ///
+    /// Prefer this over a separate `Arc<dyn AeadCrypt>` so the session holds
+    /// a single monomorphized [`CryptEngine`].
+    #[inline]
+    pub fn as_aead(&self) -> Option<&dyn AeadCrypt> {
+        match self {
+            CryptEngine::Aes128Gcm(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Whether the method name implies a CFB-style crypto header on the wire.
+    ///
+    /// - `"null"`: **no** header (raw KCP / FEC)
+    /// - `"none"` and all CFB ciphers: `[nonce 16][CRC32 4][payload]`
+    /// - `"aes-128-gcm"`: AEAD layout (not CFB header) — returns `false`
+    #[inline]
+    pub fn uses_cfb_header(method: &str) -> bool {
+        method != "null" && method != "aes-128-gcm"
     }
 }
 

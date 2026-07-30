@@ -111,8 +111,7 @@ impl SmuxIo {
             let snd_wnd = bp.snd_wnd;
             kio::spawn_task(async move {
                 kio::sleep_ms(1).await;
-                if wait_send.load(Ordering::Relaxed) < snd_wnd
-                    || !bp_armed.load(Ordering::Acquire)
+                if wait_send.load(Ordering::Relaxed) < snd_wnd || !bp_armed.load(Ordering::Acquire)
                 {
                     // Window has room, or previous waiter finished while still
                     // blocked — wake so we re-enter poll_write and re-arm.

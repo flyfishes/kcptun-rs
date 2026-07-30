@@ -46,10 +46,12 @@ pub mod task;
 pub mod time;
 
 // ─── Convenience re-exports ────────────────────────────────────────────────────
-pub use net::{TcpListener, TcpStream, UdpSocket};
+pub use net::{tcpraw_dial, tcpraw_listen};
+pub use net::{DatagramSocket, TcpListener, TcpStream, UdpSocket};
+pub use net::{TcpRawConn, TcpRawListener};
 pub use sync::Notify;
-pub use task::{block_on, cpu_block, spawn_task, JoinHandle};
-pub use time::{sleep, sleep_ms, timeout, Elapsed, mono_ms};
+pub use task::{block_on, cpu_block, runtime_kind, spawn_task, JoinHandle, RuntimeKind};
+pub use time::{mono_ms, sleep, sleep_ms, timeout, Elapsed};
 
 /// Read a file to a string, using a blocking thread pool to avoid stalling
 /// the async runtime. Replaces `tokio::fs::read_to_string`.
@@ -78,6 +80,31 @@ where
     B: AsyncRead + AsyncWrite + Unpin,
 {
     cfg_copy_bidirectional_idle(a, b, idle_secs).await
+}
+
+/// Bidirectionally copy data, then wait `postwait_secs` after completion.
+///
+/// This matches Go kcptun's `closeWait` semantics: data is copied until both
+/// sides reach EOF, then the function waits `postwait_secs` seconds before
+/// returning. This allows the remote side to receive and acknowledge final
+/// data before the connection is torn down.
+///
+/// If `postwait_secs == 0`, returns immediately after copy completes
+/// (no wait). This is the Go default for the client side.
+pub async fn copy_bidirectional_postwait<A, B>(
+    a: &mut A,
+    b: &mut B,
+    postwait_secs: u64,
+) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let result = cfg_copy_bidirectional(a, b).await;
+    if postwait_secs > 0 {
+        sleep_ms(postwait_secs * 1000).await;
+    }
+    result
 }
 
 #[cfg(feature = "tokio")]
@@ -528,6 +555,52 @@ pub async fn ctrl_c() -> std::io::Result<()> {
         sleep_ms(100).await;
     }
 }
+
+/// Ignore SIGPIPE to prevent process termination when writing to a closed
+/// socket/pipe. Matches Go kcptun's `signal.Ignore(syscall.SIGPIPE)`.
+///
+/// Call once at process startup. On non-Unix targets this is a no-op.
+pub fn ignore_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// Install a handler for SIGUSR1 that logs KCP SNMP statistics.
+/// Matches Go kcptun's SIGUSR1 → `log.Printf("KCP SNMP:%+v", kcp.DefaultSnmp.Copy())`.
+///
+/// Call once at process startup. On non-Unix targets this is a no-op.
+pub fn install_sigusr1_handler() {
+    #[cfg(unix)]
+    {
+        extern "C" fn sigusr1_handler(_sig: i32) {
+            // Read process-wide counters — minimal work inside signal handler.
+            // The actual log output is deferred to the next SNMP poll or
+            // handled by reading the static counters from user code.
+            // SAFETY: only reads AtomicU64 fields; safe in signal context.
+            crate::SIGUSR1_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        unsafe {
+            libc::signal(
+                libc::SIGUSR1,
+                sigusr1_handler as *const () as libc::sighandler_t,
+            );
+        }
+    }
+}
+
+/// True if SIGUSR1 was received since the last call to this function.
+/// Resets the flag on each call (one-shot semantics matching Go).
+pub fn sigusr1_received() -> bool {
+    SIGUSR1_FIRED.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+static SIGUSR1_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(not(unix))]
+static SIGUSR1_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests;

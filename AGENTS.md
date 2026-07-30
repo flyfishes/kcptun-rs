@@ -16,7 +16,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Workspace of 8 crates; release: `opt-level=3`, LTO, `panic=abort`, strip; `profiling` profile for pprof |
+| `Cargo.toml` | Workspace of 9 crates; release: `opt-level=3`, LTO, `panic=abort`, strip; `profiling` profile for pprof |
 | `Makefile` | Build/test/clippy/bench/e2e/profile for tokio & smol; ARMv7/ARM64 cross; vendor |
 | `CLAUDE.md` | AI behavioral rules + project gotchas (authoritative for *how to work*) |
 | `README.md` / `README.zh.md` | User-facing docs (EN/ZH) |
@@ -44,6 +44,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `qpp-rs/` | Quantum Permutation Pad stream obfuscation (see `qpp-rs/AGENTS.md`) |
 | `kio-rs/` | Runtime-agnostic async I/O tokio\|smol (see `kio-rs/AGENTS.md`) |
 | `kpprof-rs/` | Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock) (see `kpprof-rs/AGENTS.md`) |
+| `kcptun-common/` | Shared client/server helpers: key derive, KCP modes, Snappy framing (see `kcptun-common/AGENTS.md`) |
 | `kcptun-client/` | Client binary (see `kcptun-client/AGENTS.md`) |
 | `kcptun-server/` | Server binary + stress tests (see `kcptun-server/AGENTS.md`) |
 | `bench/` | Bench/profile runners (see `bench/AGENTS.md`) |
@@ -93,8 +94,9 @@ Runtime-agnostic: `kcp-rs`, `kcrypt-rs`, `qpp-rs`.
 
 ```
 kcptun-client ──┐
-                ├──► kcp-rs ──► kcrypt-rs
+                ├──► kcptun-common ──► kcp-rs ──► kcrypt-rs
 kcptun-server ──┤
+                ├──► kcp-rs ──► kcrypt-rs
                 ├──► smux-rs ──► kio-rs  (feature: tokio | smol)
                 ├──► qpp-rs
                 ├──► kio-rs

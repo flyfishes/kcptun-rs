@@ -59,11 +59,12 @@ pub use kcrypt_rs::cast5;
 pub use kcrypt_rs::crypt;
 
 // Re-export the primary public API.
-pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt};
+pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine};
 pub use crypto_buf::{
-    decrypt_cfb_in_place, encrypt_batch, inbound_null, should_cpu_block_compress,
-    should_cpu_block_encrypt, strip_cfb_header_if_present, CryptoBuf, InboundCryptError, CRYPT_HDR,
-    NONCE_SZ,
+    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null, offload_profile,
+    set_offload_profile, should_cpu_block_compress, should_cpu_block_decrypt,
+    should_cpu_block_encrypt, strip_cfb_header_if_present, CryptoBuf, InboundCryptError,
+    OffloadProfile, CRYPT_HDR, NONCE_SZ,
 };
 pub use fec::{
     fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncoder, FEC_HEADER_SIZE,
@@ -72,7 +73,4 @@ pub use fec::{
 pub use kcp::KCP;
 pub use segment::SegmentPool;
 pub use session::UDPSession;
-pub use snmp::{
-    add as snmp_add, enable as snmp_enable, store as snmp_store,
-    DEFAULT_SNMP, SNMP,
-};
+pub use snmp::{add as snmp_add, enable as snmp_enable, store as snmp_store, DEFAULT_SNMP, SNMP};

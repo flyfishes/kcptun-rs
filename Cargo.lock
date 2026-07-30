@@ -901,6 +901,7 @@ dependencies = [
  "crc32fast",
  "env_logger",
  "kcp-rs",
+ "kcptun-common",
  "kcrypt-rs",
  "kio-rs",
  "kpprof-rs",
@@ -918,6 +919,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcptun-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "kcp-rs",
+ "kio-rs",
+ "log",
+ "parking_lot 0.12.5",
+ "pbkdf2",
+ "qpp-rs",
+ "sha1",
+ "snap",
+]
+
+[[package]]
 name = "kcptun-server"
 version = "0.1.0"
 dependencies = [
@@ -928,6 +945,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "kcp-rs",
+ "kcptun-common",
  "kcrypt-rs",
  "kio-rs",
  "kpprof-rs",

@@ -16,7 +16,7 @@ SMUX stream multiplexer over a single async transport (typically KCP+Snappy). Ru
 | `src/lib.rs` | Public re-exports: `Session`, `Stream`, `Frame`, `Config`, … |
 | `src/frame.rs` | 8B header codec; `Cmd`, `Frame`, `FrameCodec`; `FRAME_HEADER_SIZE=8`, `MAX_FRAME_SIZE` |
 | `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive, SYN queue |
-| `src/stream.rs` | Logical `Stream` (AsyncRead/AsyncWrite via session), window / state |
+| `src/stream.rs` | Logical `Stream` (AsyncRead/AsyncWrite); R4: `RecvInner`/`SendInner` split locks |
 | `src/conn.rs` | `SmuxConn` high-level wrapper (auto read/flush/keepalive/reap) |
 | `src/io.rs` | `SmuxIo` wrapper with optional transport backpressure |
 
@@ -33,6 +33,7 @@ None (flat `src/`).
 - Session owns stream map and read loop; streams are half-close aware.
 - Keepalive via periodic ping frames — do not break idle timeout semantics expected by binaries.
 - Compression is **not** in this crate; binaries wrap transport with Snappy before/after SMUX.
+- **R4 lock model (`Stream`):** `recv: Mutex<RecvInner>` (state + recv queue + read_waker + local_closed_at) and `send: Mutex<SendInner>` (send queue + write_waker). If both locks are needed: **recv then send**. Take wakers under lock, **wake after release**. No legacy contiguous `recv_buf`; only `VecDeque<Bytes>`. Peer window / half-close flags stay atomic.
 
 ### Testing Requirements
 

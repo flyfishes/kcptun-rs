@@ -6,7 +6,7 @@
 //! Hot path: monomorphized CFB (no `Fn` closure) + two-round loop matching
 //! Go `encryptBlock` for better ILP.
 
-use super::{BlockCrypt, BlockCipher8, cfb8_encrypt, cfb8_decrypt};
+use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 
 #[derive(Debug)]
 pub struct XteaCrypt {

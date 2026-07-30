@@ -16,24 +16,19 @@ use std::time::Duration;
 pub fn start_deadlock_detector() {
     std::thread::Builder::new()
         .name("pprof-deadlock".into())
-        .spawn(move || {
-            loop {
-                let deadlocks = parking_lot::deadlock::check_deadlock();
-                if !deadlocks.is_empty() {
-                    log::error!(
-                        "=== DEADLOCK DETECTED ({} cycles) ===",
-                        deadlocks.len()
-                    );
-                    for (i, threads) in deadlocks.iter().enumerate() {
-                        log::error!("  Deadlock cycle #{} ({} threads):", i, threads.len());
-                        for t in threads {
-                            log::error!("    Thread Id {:#?}", t.thread_id());
-                            log::error!("    {:#?}", t.backtrace());
-                        }
+        .spawn(move || loop {
+            let deadlocks = parking_lot::deadlock::check_deadlock();
+            if !deadlocks.is_empty() {
+                log::error!("=== DEADLOCK DETECTED ({} cycles) ===", deadlocks.len());
+                for (i, threads) in deadlocks.iter().enumerate() {
+                    log::error!("  Deadlock cycle #{} ({} threads):", i, threads.len());
+                    for t in threads {
+                        log::error!("    Thread Id {:#?}", t.thread_id());
+                        log::error!("    {:#?}", t.backtrace());
                     }
                 }
-                std::thread::sleep(Duration::from_secs(5));
             }
+            std::thread::sleep(Duration::from_secs(5));
         })
         .expect("failed to spawn deadlock detector thread");
 
@@ -51,7 +46,11 @@ pub fn dump_deadlocks() -> String {
 
     let mut out = format!("=== {} DEADLOCK CYCLES ===\n\n", deadlocks.len());
     for (i, threads) in deadlocks.iter().enumerate() {
-        out.push_str(&format!("Deadlock cycle #{} ({} threads):\n", i, threads.len()));
+        out.push_str(&format!(
+            "Deadlock cycle #{} ({} threads):\n",
+            i,
+            threads.len()
+        ));
         for t in threads {
             out.push_str(&format!("  Thread Id {:#?}\n", t.thread_id()));
             out.push_str(&format!("  {:#?}\n\n", t.backtrace()));

@@ -1,0 +1,23 @@
+[package]
+name = "kcptun-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared helpers for kcptun-client and kcptun-server"
+
+[features]
+default = ["tokio"]
+tokio = ["kio-rs/tokio"]
+smol = ["kio-rs/smol"]
+qpp = ["dep:qpp-rs"]
+
+[dependencies]
+kcp-rs = { path = "../kcp-rs" }
+kio-rs = { path = "../kio-rs", default-features = false }
+pbkdf2 = "0.12"
+sha1 = "0.10"
+snap = "1"
+log = "0.4"
+bytes = "1"
+parking_lot = "0.12"
+anyhow = "1"
+qpp-rs = { path = "../qpp-rs", optional = true }

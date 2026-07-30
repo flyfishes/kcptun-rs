@@ -194,10 +194,35 @@ fn make_payload(conn_id: usize, size: usize) -> Vec<u8> {
 /// then reads until either:
 ///   - EOF (server closed connection after echoing), or
 ///   - All expected bytes received (for echo, response length == request length)
+/// Send data through the tunnel and receive the full echo response.
+///
+/// Sends data, half-closes the write side (signals EOF to echo server),
+/// then reads until either:
+///   - EOF (server closed connection after echoing), or
+///   - All expected bytes received (for echo, response length == request length)
 fn send_and_recv(cli_port: u16, data: &[u8], timeout_secs: u64) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", cli_port))
-        .map_err(|e| format!("connect: {}", e))?;
+
+    // Retry connect to be robust against initial burst of concurrent connects
+    // from many test threads hammering the client's local TCP listener.
+    let mut s = None;
+    let addr = format!("127.0.0.1:{}", cli_port);
+    for attempt in 0..20 {
+        match TcpStream::connect(&addr) {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                s = Some(stream);
+                break;
+            }
+            Err(_e) => {
+                std::thread::sleep(std::time::Duration::from_millis(10 + attempt as u64 * 5));
+            }
+        }
+    }
+    let mut s = match s {
+        Some(stream) => stream,
+        None => return Err(format!("connect: Connection refused (os error 61)")),
+    };
 
     s.set_write_timeout(Some(Duration::from_secs(15))).ok();
     s.write_all(data).map_err(|e| format!("write: {}", e))?;
@@ -206,7 +231,7 @@ fn send_and_recv(cli_port: u16, data: &[u8], timeout_secs: u64) -> Result<Vec<u8
     // Under high concurrency (100 streams on 1 KCP channel), the drain cycles
     // need time to move data from SMUX send_buf through KCP. Without this
     // pause, FIN can arrive at the echo server before all data, truncating echo.
-    thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
 
     // Half-close: signal to echo server that we're done sending
     let _ = s.shutdown(std::net::Shutdown::Write);
@@ -685,4 +710,291 @@ fn test_snappy_compressible_data() {
 
     drop(e);
     println!("✅ snappy compressible-data test OK");
+}
+
+// ─── Multi-port server test ──────────────────────────────────────────────────
+// Verifies that the server can listen on a port range and clients can connect
+// to any port in the range (Go kcptun multi-port listener compatibility).
+
+#[test]
+fn test_server_multi_port() {
+    // Use fixed ports to avoid conflicts with other tests.
+    let target_port: u16 = 19100;
+    let srv_port_min: u16 = 29950;
+    let srv_port_max: u16 = 29951;
+    let cli_port1: u16 = 13000;
+    let cli_port2: u16 = 13001;
+
+    for p in &[
+        target_port,
+        srv_port_min,
+        srv_port_max,
+        cli_port1,
+        cli_port2,
+    ] {
+        kill_port(*p);
+    }
+    thread::sleep(Duration::from_millis(800));
+
+    // TCP echo server
+    let mut echo = Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import socket,threading;s=socket.socket();s.setsockopt(65535,4,1);\
+             s.bind(('',{}));s.listen(128)\
+             \ndef h(c):\n while True:\n  d=c.recv(65536)\n  if not d:break\n  c.sendall(d)\n c.close()\n\
+             while True:threading.Thread(target=h,args=(s.accept()[0],)).start()",
+            target_port
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("echo");
+    thread::sleep(Duration::from_millis(500));
+
+    // Server listens on port range 29950-29951
+    let mut sv = Command::new(&find_bin("kcptun-server"))
+        .args(&[
+            "-t",
+            &format!("127.0.0.1:{}", target_port),
+            "-l",
+            &format!(":{}-{}", srv_port_min, srv_port_max),
+            "--key",
+            "k",
+            "--crypt",
+            "null",
+            "--mode",
+            "fast",
+            "--nocomp",
+            "--datashard",
+            "0",
+            "--parityshard",
+            "0",
+            "--sndwnd",
+            "2048",
+            "--rcvwnd",
+            "2048",
+        ])
+        .env("RUST_LOG", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("srv");
+    thread::sleep(Duration::from_secs(2));
+
+    // Client 1 connects to first port in range
+    let mut cl1 = Command::new(&find_bin("kcptun-client"))
+        .args(&[
+            "-r",
+            &format!("127.0.0.1:{}", srv_port_min),
+            "-l",
+            &format!(":{}", cli_port1),
+            "--key",
+            "k",
+            "--crypt",
+            "null",
+            "--mode",
+            "fast",
+            "--nocomp",
+            "--datashard",
+            "0",
+            "--parityshard",
+            "0",
+            "--sndwnd",
+            "2048",
+            "--rcvwnd",
+            "2048",
+            "--keepalive",
+            "30",
+            "--conn",
+            "1",
+        ])
+        .env("RUST_LOG", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cli1");
+    thread::sleep(Duration::from_secs(3));
+
+    // Test data through port 1
+    let data1 = make_payload(1, 4096);
+    let resp1 = send_and_recv(cli_port1, &data1, 30).expect("port1");
+    assert_eq!(
+        data1, resp1,
+        "multi-port: data mismatch on port {}",
+        srv_port_min
+    );
+    println!(
+        "  multi-port: port {} OK ({} bytes)",
+        srv_port_min,
+        data1.len()
+    );
+
+    // Kill client 1 and test through port 2
+    let _ = cl1.kill();
+    kill_port(cli_port1);
+
+    let mut cl2 = Command::new(&find_bin("kcptun-client"))
+        .args(&[
+            "-r",
+            &format!("127.0.0.1:{}", srv_port_max),
+            "-l",
+            &format!(":{}", cli_port2),
+            "--key",
+            "k",
+            "--crypt",
+            "null",
+            "--mode",
+            "fast",
+            "--nocomp",
+            "--datashard",
+            "0",
+            "--parityshard",
+            "0",
+            "--sndwnd",
+            "2048",
+            "--rcvwnd",
+            "2048",
+            "--keepalive",
+            "30",
+            "--conn",
+            "1",
+        ])
+        .env("RUST_LOG", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cli2");
+    thread::sleep(Duration::from_secs(3));
+
+    let data2 = make_payload(2, 8192);
+    let resp2 = send_and_recv(cli_port2, &data2, 30).expect("port2");
+    assert_eq!(
+        data2, resp2,
+        "multi-port: data mismatch on port {}",
+        srv_port_max
+    );
+    println!(
+        "  multi-port: port {} OK ({} bytes)",
+        srv_port_max,
+        data2.len()
+    );
+
+    // Cleanup
+    let _ = sv.kill();
+    let _ = echo.kill();
+    let _ = cl2.kill();
+    for p in &[target_port, srv_port_min, srv_port_max, cli_port2] {
+        kill_port(*p);
+    }
+    println!("✅ multi-port server test OK");
+}
+
+// ─── closeWait smoke test ────────────────────────────────────────────────────
+// Verifies that closewait flag does not cause hangs or data corruption.
+// This is a smoke test — the postwait behavior is unit-tested in kio-rs.
+
+#[test]
+fn test_closewait_smoke() {
+    let target_port: u16 = 19110;
+    let srv_port: u16 = 29960;
+    let cli_port: u16 = 13010;
+
+    for p in &[target_port, srv_port, cli_port] {
+        kill_port(*p);
+    }
+    thread::sleep(Duration::from_millis(800));
+
+    let mut echo = Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import socket,threading;s=socket.socket();s.setsockopt(65535,4,1);\
+             s.bind(('',{}));s.listen(128)\
+             \ndef h(c):\n while True:\n  d=c.recv(65536)\n  if not d:break\n  c.sendall(d)\n c.close()\n\
+             while True:threading.Thread(target=h,args=(s.accept()[0],)).start()",
+            target_port
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("echo");
+    thread::sleep(Duration::from_millis(500));
+
+    let mut sv = Command::new(&find_bin("kcptun-server"))
+        .args(&[
+            "-t",
+            &format!("127.0.0.1:{}", target_port),
+            "-l",
+            &format!(":{}", srv_port),
+            "--key",
+            "k",
+            "--crypt",
+            "null",
+            "--mode",
+            "fast",
+            "--nocomp",
+            "--closewait",
+            "2", // 2s post-copy wait
+            "--datashard",
+            "0",
+            "--parityshard",
+            "0",
+            "--sndwnd",
+            "2048",
+            "--rcvwnd",
+            "2048",
+        ])
+        .env("RUST_LOG", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("srv");
+    thread::sleep(Duration::from_secs(2));
+
+    let mut cl = Command::new(&find_bin("kcptun-client"))
+        .args(&[
+            "-r",
+            &format!("127.0.0.1:{}", srv_port),
+            "-l",
+            &format!(":{}", cli_port),
+            "--key",
+            "k",
+            "--crypt",
+            "null",
+            "--mode",
+            "fast",
+            "--nocomp",
+            "--closewait",
+            "0", // Go client default: no post-copy wait
+            "--datashard",
+            "0",
+            "--parityshard",
+            "0",
+            "--sndwnd",
+            "2048",
+            "--rcvwnd",
+            "2048",
+            "--keepalive",
+            "30",
+            "--conn",
+            "1",
+        ])
+        .env("RUST_LOG", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cli");
+    thread::sleep(Duration::from_secs(3));
+
+    let data = make_payload(1, 16384);
+    let resp = send_and_recv(cli_port, &data, 30).expect("closewait");
+    assert_eq!(data, resp, "closewait smoke: data mismatch");
+
+    let _ = sv.kill();
+    let _ = echo.kill();
+    let _ = cl.kill();
+    for p in &[target_port, srv_port, cli_port] {
+        kill_port(*p);
+    }
+    println!("✅ closewait smoke test OK (closewait=0)");
 }

@@ -7,7 +7,7 @@
 //! Hot path: monomorphized CFB (no `Fn` closure) matching XTEA/3DES style,
 //! so CFB XOR + block encrypt can inline through `encrypt_batch`.
 
-use super::{BlockCrypt, BlockCipher8, cfb8_encrypt, cfb8_decrypt};
+use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 
 #[derive(Debug)]
 pub struct TeaCrypt {

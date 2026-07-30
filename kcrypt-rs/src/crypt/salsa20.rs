@@ -57,8 +57,22 @@ fn saltwenty(key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 64]) {
     // State matrix layout matching Go's golang.org/x/crypto/salsa20/salsa/salsa20_ref.go
     let s = 0x61707865u32;
     let (
-        mut x0, mut x1, mut x2, mut x3, mut x4, mut x5, mut x6, mut x7, mut x8, mut x9, mut x10,
-        mut x11, mut x12, mut x13, mut x14, mut x15,
+        mut x0,
+        mut x1,
+        mut x2,
+        mut x3,
+        mut x4,
+        mut x5,
+        mut x6,
+        mut x7,
+        mut x8,
+        mut x9,
+        mut x10,
+        mut x11,
+        mut x12,
+        mut x13,
+        mut x14,
+        mut x15,
     ) = (
         s,
         u32from(key, 0),
@@ -93,10 +107,22 @@ fn saltwenty(key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 64]) {
         qr!(x15, x12, x13, x14);
     }
     let v = [
-        x0.wrapping_add(i0), x1.wrapping_add(i1), x2.wrapping_add(i2), x3.wrapping_add(i3),
-        x4.wrapping_add(i4), x5.wrapping_add(i5), x6.wrapping_add(i6), x7.wrapping_add(i7),
-        x8.wrapping_add(i8), x9.wrapping_add(i9), x10.wrapping_add(i10), x11.wrapping_add(i11),
-        x12.wrapping_add(i12), x13.wrapping_add(i13), x14.wrapping_add(i14), x15.wrapping_add(i15),
+        x0.wrapping_add(i0),
+        x1.wrapping_add(i1),
+        x2.wrapping_add(i2),
+        x3.wrapping_add(i3),
+        x4.wrapping_add(i4),
+        x5.wrapping_add(i5),
+        x6.wrapping_add(i6),
+        x7.wrapping_add(i7),
+        x8.wrapping_add(i8),
+        x9.wrapping_add(i9),
+        x10.wrapping_add(i10),
+        x11.wrapping_add(i11),
+        x12.wrapping_add(i12),
+        x13.wrapping_add(i13),
+        x14.wrapping_add(i14),
+        x15.wrapping_add(i15),
     ];
     for i in 0..16 {
         out[i * 4..(i + 1) * 4].copy_from_slice(&v[i].to_le_bytes());
@@ -128,9 +154,7 @@ mod sse2 {
 
     /// Salsa20 quarter-round on 4 blocks simultaneously.
     #[inline(always)]
-    unsafe fn sqr(
-        a: &mut __m128i, b: &mut __m128i, c: &mut __m128i, d: &mut __m128i,
-    ) {
+    unsafe fn sqr(a: &mut __m128i, b: &mut __m128i, c: &mut __m128i, d: &mut __m128i) {
         let t = _mm_add_epi32(*a, *d);
         *b = _mm_xor_si128(*b, rotl7(t));
         let t = _mm_add_epi32(*b, *a);
@@ -145,7 +169,10 @@ mod sse2 {
     /// block-contiguous.
     #[inline(always)]
     unsafe fn transpose_4x4(
-        a: __m128i, b: __m128i, c: __m128i, d: __m128i,
+        a: __m128i,
+        b: __m128i,
+        c: __m128i,
+        d: __m128i,
     ) -> (__m128i, __m128i, __m128i, __m128i) {
         let t0 = _mm_unpacklo_epi32(a, b);
         let t1 = _mm_unpackhi_epi32(a, b);
@@ -164,12 +191,8 @@ mod sse2 {
     ///
     /// Each XMM register holds one state word from 4 different blocks
     /// (lane 0 = block 0, lane 1 = block 1, etc.).
-    pub unsafe fn saltwenty_x4(
-        key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 256],
-    ) {
-        let u32le = |b: &[u8], i: usize| {
-            u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-        };
+    pub unsafe fn saltwenty_x4(key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 256]) {
+        let u32le = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
 
         // Broadcast shared state words to all 4 lanes
         let s0 = _mm_set1_epi32(0x61707865u32 as i32);
@@ -261,6 +284,177 @@ mod sse2 {
     }
 }
 
+// ─── NEON 4-block parallel implementation (aarch64) ──────────────────────
+//
+// Same lane layout as the SSE2 path: each 128-bit register holds one state
+// word from 4 independent blocks. Confirmed need: on Apple Silicon, scalar
+// saltwenty was ~0.84× Go salsa.core microbench; multi-block NEON closes that
+// without changing the wire format (first 8B still nonce, keystream from 8).
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn rotl7(x: uint32x4_t) -> uint32x4_t {
+        vorrq_u32(vshlq_n_u32(x, 7), vshrq_n_u32(x, 25))
+    }
+    #[inline(always)]
+    unsafe fn rotl9(x: uint32x4_t) -> uint32x4_t {
+        vorrq_u32(vshlq_n_u32(x, 9), vshrq_n_u32(x, 23))
+    }
+    #[inline(always)]
+    unsafe fn rotl13(x: uint32x4_t) -> uint32x4_t {
+        vorrq_u32(vshlq_n_u32(x, 13), vshrq_n_u32(x, 19))
+    }
+    #[inline(always)]
+    unsafe fn rotl18(x: uint32x4_t) -> uint32x4_t {
+        vorrq_u32(vshlq_n_u32(x, 18), vshrq_n_u32(x, 14))
+    }
+
+    #[inline(always)]
+    unsafe fn sqr(
+        a: &mut uint32x4_t,
+        b: &mut uint32x4_t,
+        c: &mut uint32x4_t,
+        d: &mut uint32x4_t,
+    ) {
+        let t = vaddq_u32(*a, *d);
+        *b = veorq_u32(*b, rotl7(t));
+        let t = vaddq_u32(*b, *a);
+        *c = veorq_u32(*c, rotl9(t));
+        let t = vaddq_u32(*c, *b);
+        *d = veorq_u32(*d, rotl13(t));
+        let t = vaddq_u32(*d, *c);
+        *a = veorq_u32(*a, rotl18(t));
+    }
+
+    /// 4×4 transpose of 32-bit lanes (block-interleaved → block-contiguous).
+    #[inline(always)]
+    unsafe fn transpose_4x4(
+        a: uint32x4_t,
+        b: uint32x4_t,
+        c: uint32x4_t,
+        d: uint32x4_t,
+    ) -> (uint32x4_t, uint32x4_t, uint32x4_t, uint32x4_t) {
+        // Interleave 32-bit: a0 b0 a1 b1 / a2 b2 a3 b3
+        let a0 = vzip1q_u32(a, b);
+        let a1 = vzip2q_u32(a, b);
+        let b0 = vzip1q_u32(c, d);
+        let b1 = vzip2q_u32(c, d);
+        // Interleave 64-bit halves
+        let r0 = vreinterpretq_u32_u64(vzip1q_u64(
+            vreinterpretq_u64_u32(a0),
+            vreinterpretq_u64_u32(b0),
+        ));
+        let r1 = vreinterpretq_u32_u64(vzip2q_u64(
+            vreinterpretq_u64_u32(a0),
+            vreinterpretq_u64_u32(b0),
+        ));
+        let r2 = vreinterpretq_u32_u64(vzip1q_u64(
+            vreinterpretq_u64_u32(a1),
+            vreinterpretq_u64_u32(b1),
+        ));
+        let r3 = vreinterpretq_u32_u64(vzip2q_u64(
+            vreinterpretq_u64_u32(a1),
+            vreinterpretq_u64_u32(b1),
+        ));
+        (r0, r1, r2, r3)
+    }
+
+    /// 256 bytes keystream for counters ctr..ctr+3 (4×64B blocks).
+    pub unsafe fn saltwenty_x4(key: &[u8; 32], nonce: &[u8; 8], ctr: u64, out: &mut [u8; 256]) {
+        let u32le = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+
+        let s0 = vdupq_n_u32(0x61707865);
+        let s1 = vdupq_n_u32(u32le(key, 0));
+        let s2 = vdupq_n_u32(u32le(key, 4));
+        let s3 = vdupq_n_u32(u32le(key, 8));
+        let s4 = vdupq_n_u32(u32le(key, 12));
+        let s5 = vdupq_n_u32(0x3320646e);
+        let s6 = vdupq_n_u32(u32le(nonce, 0));
+        let s7 = vdupq_n_u32(u32le(nonce, 4));
+
+        let c0 = ctr;
+        let c1 = ctr.wrapping_add(1);
+        let c2 = ctr.wrapping_add(2);
+        let c3 = ctr.wrapping_add(3);
+        // Lane order: [c0, c1, c2, c3] — must match SSE2 _mm_set_epi32 reverse packing:
+        // SSE2 _mm_set_epi32(e3,e2,e1,e0) stores lane0=e0 … so use ascending c0..c3.
+        let s8 = {
+            let mut t = [0u32; 4];
+            t[0] = (c0 & 0xFFFF_FFFF) as u32;
+            t[1] = (c1 & 0xFFFF_FFFF) as u32;
+            t[2] = (c2 & 0xFFFF_FFFF) as u32;
+            t[3] = (c3 & 0xFFFF_FFFF) as u32;
+            vld1q_u32(t.as_ptr())
+        };
+        let s9 = {
+            let mut t = [0u32; 4];
+            t[0] = (c0 >> 32) as u32;
+            t[1] = (c1 >> 32) as u32;
+            t[2] = (c2 >> 32) as u32;
+            t[3] = (c3 >> 32) as u32;
+            vld1q_u32(t.as_ptr())
+        };
+
+        let s10 = vdupq_n_u32(0x79622d32);
+        let s11 = vdupq_n_u32(u32le(key, 16));
+        let s12 = vdupq_n_u32(u32le(key, 20));
+        let s13 = vdupq_n_u32(u32le(key, 24));
+        let s14 = vdupq_n_u32(u32le(key, 28));
+        let s15 = vdupq_n_u32(0x6b206574);
+
+        let (mut x0, mut x1, mut x2, mut x3) = (s0, s1, s2, s3);
+        let (mut x4, mut x5, mut x6, mut x7) = (s4, s5, s6, s7);
+        let (mut x8, mut x9, mut x10, mut x11) = (s8, s9, s10, s11);
+        let (mut x12, mut x13, mut x14, mut x15) = (s12, s13, s14, s15);
+
+        for _ in 0..10 {
+            sqr(&mut x0, &mut x4, &mut x8, &mut x12);
+            sqr(&mut x5, &mut x9, &mut x13, &mut x1);
+            sqr(&mut x10, &mut x14, &mut x2, &mut x6);
+            sqr(&mut x15, &mut x3, &mut x7, &mut x11);
+            sqr(&mut x0, &mut x1, &mut x2, &mut x3);
+            sqr(&mut x5, &mut x6, &mut x7, &mut x4);
+            sqr(&mut x10, &mut x11, &mut x8, &mut x9);
+            sqr(&mut x15, &mut x12, &mut x13, &mut x14);
+        }
+
+        x0 = vaddq_u32(x0, s0);
+        x1 = vaddq_u32(x1, s1);
+        x2 = vaddq_u32(x2, s2);
+        x3 = vaddq_u32(x3, s3);
+        x4 = vaddq_u32(x4, s4);
+        x5 = vaddq_u32(x5, s5);
+        x6 = vaddq_u32(x6, s6);
+        x7 = vaddq_u32(x7, s7);
+        x8 = vaddq_u32(x8, s8);
+        x9 = vaddq_u32(x9, s9);
+        x10 = vaddq_u32(x10, s10);
+        x11 = vaddq_u32(x11, s11);
+        x12 = vaddq_u32(x12, s12);
+        x13 = vaddq_u32(x13, s13);
+        x14 = vaddq_u32(x14, s14);
+        x15 = vaddq_u32(x15, s15);
+
+        let base = out.as_mut_ptr();
+        macro_rules! store_group {
+            ($a:expr, $b:expr, $c:expr, $d:expr, $off0:expr, $off1:expr, $off2:expr, $off3:expr) => {{
+                let (r0, r1, r2, r3) = transpose_4x4($a, $b, $c, $d);
+                vst1q_u32(base.add($off0) as *mut u32, r0);
+                vst1q_u32(base.add($off1) as *mut u32, r1);
+                vst1q_u32(base.add($off2) as *mut u32, r2);
+                vst1q_u32(base.add($off3) as *mut u32, r3);
+            }};
+        }
+        store_group!(x0, x1, x2, x3, 0, 64, 128, 192);
+        store_group!(x4, x5, x6, x7, 16, 80, 144, 208);
+        store_group!(x8, x9, x10, x11, 32, 96, 160, 224);
+        store_group!(x12, x13, x14, x15, 48, 112, 176, 240);
+    }
+}
+
 // ─── BlockCrypt impl ─────────────────────────────────────────────────────
 
 impl BlockCrypt for Salsa20Crypt {
@@ -297,27 +491,46 @@ impl BlockCrypt for Salsa20Crypt {
             }
         }
 
-        // Scalar tail (also the only path on non-x86_64)
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let mut ks = [0u8; 256];
+            while off + 256 <= data.len() {
+                unsafe { neon::saltwenty_x4(&self.key, &nonce, ctr, &mut ks) };
+                for j in (0..256).step_by(16) {
+                    unsafe {
+                        let dp = data.as_mut_ptr().add(off + j);
+                        let d = vld1q_u8(dp);
+                        let k = vld1q_u8(ks.as_ptr().add(j));
+                        vst1q_u8(dp, veorq_u8(d, k));
+                    }
+                }
+                ctr += 4;
+                off += 256;
+            }
+        }
+
+        // Scalar tail (and full path if no SIMD body ran)
         let mut ks = [0u8; 64];
         while off < data.len() {
             saltwenty(&self.key, &nonce, ctr, &mut ks);
             let end = (off + 64).min(data.len());
-            // u64 XOR for 8× throughput on the tail
+            // u64 XOR for 8× throughput on the tail — unaligned ptr ops avoid
+            // per-byte index + array construction bounds checks.
             let mut j = 0usize;
-            while j + 8 <= end - off {
-                let d = u64::from_le_bytes([
-                    data[off + j], data[off + j + 1], data[off + j + 2], data[off + j + 3],
-                    data[off + j + 4], data[off + j + 5], data[off + j + 6], data[off + j + 7],
-                ]);
-                let k = u64::from_le_bytes([
-                    ks[j], ks[j + 1], ks[j + 2], ks[j + 3],
-                    ks[j + 4], ks[j + 5], ks[j + 6], ks[j + 7],
-                ]);
-                let r = (d ^ k).to_le_bytes();
-                data[off + j..off + j + 8].copy_from_slice(&r);
+            let block_len = end - off;
+            while j + 8 <= block_len {
+                // SAFETY: j+8 <= block_len and end <= data.len(); ks is 64B and
+                // j+8 <= 64 because block_len <= 64.
+                unsafe {
+                    let dp = data.as_mut_ptr().add(off + j);
+                    let d = std::ptr::read_unaligned(dp as *const u64);
+                    let k = std::ptr::read_unaligned(ks.as_ptr().add(j) as *const u64);
+                    std::ptr::write_unaligned(dp as *mut u64, d ^ k);
+                }
                 j += 8;
             }
-            while off + j < end {
+            while j < block_len {
                 data[off + j] ^= ks[j];
                 j += 1;
             }
@@ -385,7 +598,8 @@ mod tests {
     #[test]
     fn sse2_matches_scalar() {
         // Verify SSE2 4-block output matches 4× scalar output
-        let key = *b"test-key-12345-test-key-67890\0\0\0";
+        let mut key = [0u8; 32];
+        key[..29].copy_from_slice(b"test-key-12345-test-key-67890");
         let nonce = *b"nonce123";
         let ctr = 7u64;
 
@@ -400,8 +614,34 @@ mod tests {
         unsafe { sse2::saltwenty_x4(&key, &nonce, ctr, &mut sse2_out) };
 
         assert_eq!(
-            &scalar_out[..], &sse2_out[..],
+            &scalar_out[..],
+            &sse2_out[..],
             "SSE2 keystream must match scalar"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar() {
+        let mut key = [0u8; 32];
+        key[..29].copy_from_slice(b"test-key-12345-test-key-67890");
+        let nonce = *b"nonce123";
+        let ctr = 7u64;
+
+        let mut scalar_out = [0u8; 256];
+        for i in 0..4 {
+            let mut block = [0u8; 64];
+            saltwenty(&key, &nonce, ctr + i as u64, &mut block);
+            scalar_out[i * 64..(i + 1) * 64].copy_from_slice(&block);
+        }
+
+        let mut neon_out = [0u8; 256];
+        unsafe { neon::saltwenty_x4(&key, &nonce, ctr, &mut neon_out) };
+
+        assert_eq!(
+            &scalar_out[..],
+            &neon_out[..],
+            "NEON keystream must match scalar"
         );
     }
 }

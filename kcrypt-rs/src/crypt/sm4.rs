@@ -7,7 +7,7 @@
 //! Uses the **tjfoc/gmsm/sm4** S-box, NOT the standard GB/T 32907 S-box.
 //! The tjfoc/gmsm implementation has a different S-box from the standard!
 
-use super::{BlockCrypt, BlockCipher16, cfb16_encrypt, cfb16_decrypt};
+use super::{cfb16_decrypt, cfb16_encrypt, BlockCipher16, BlockCrypt};
 
 /// SM4 S-box from Go's tjfoc/gmsm/sm4/sm4.go (NOT the standard SM4 S-box!)
 const SBOX: [u8; 256] = [

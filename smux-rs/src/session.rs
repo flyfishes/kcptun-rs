@@ -534,12 +534,14 @@ impl Session {
 
     /// Update last inbound activity timestamp.
     pub fn update_activity(&self) {
-        self.last_activity_ms.store(kio::mono_ms(), Ordering::Relaxed);
+        self.last_activity_ms
+            .store(kio::mono_ms(), Ordering::Relaxed);
     }
 
     /// Mark that a keepalive NOP was just sent (resets the interval).
     pub fn mark_keepalive_sent(&self) {
-        self.last_keepalive_ms.store(kio::mono_ms(), Ordering::Relaxed);
+        self.last_keepalive_ms
+            .store(kio::mono_ms(), Ordering::Relaxed);
     }
 
     /// Returns true if no inbound activity within keepalive_timeout.
@@ -871,7 +873,11 @@ mod tests {
         // Drain any residual (should be none) and request FIN.
         let mut buf2 = BytesMut::new();
         let fin_ids2 = session.prepare_outbound_into(&mut buf2, 64 * 1024, 2);
-        assert_eq!(fin_ids2, vec![id], "should have encoded FIN for this stream");
+        assert_eq!(
+            fin_ids2,
+            vec![id],
+            "should have encoded FIN for this stream"
+        );
         assert!(!s.is_fin_sent(), "FIN not yet sent until mark_fins_sent");
 
         // Simulate transport acceptance: mark FINs sent.

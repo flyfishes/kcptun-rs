@@ -25,20 +25,21 @@ impl SimpleXORCrypt {
     #[inline]
     fn xor_inplace(d: &mut [u8], key: &[u8]) {
         let n = d.len().min(key.len());
-        let mut i = 0;
-        // Fast path: 8-byte u64 XOR (matching Go's subtle.XORBytes word-size)
-        while i + 8 <= n {
-            let k = u64::from_le_bytes(key[i..i + 8].try_into().unwrap());
-            let v = u64::from_le_bytes(d[i..i + 8].try_into().unwrap());
-            d[i..i + 8].copy_from_slice(&(v ^ k).to_le_bytes());
-            i += 8;
+        // Fast path: 8-byte u64 XOR via chunks_exact — bounds are proven by
+        // the chunk splitter so LLVM can elide panic paths (unlike try_into).
+        let (d_body, d_tail) = d[..n].split_at_mut(n & !7);
+        let (k_body, k_tail) = key[..n].split_at(n & !7);
+        for (dc, kc) in d_body.chunks_exact_mut(8).zip(k_body.chunks_exact(8)) {
+            // SAFETY: chunks_exact(8) yields exactly 8-byte slices.
+            let k = u64::from_le_bytes(kc.try_into().unwrap());
+            let v = u64::from_le_bytes(dc.try_into().unwrap());
+            dc.copy_from_slice(&(v ^ k).to_le_bytes());
         }
-        // Tail bytes
-        while i < n {
-            d[i] ^= key[i];
-            i += 1;
+        for (db, kb) in d_tail.iter_mut().zip(k_tail.iter()) {
+            *db ^= *kb;
         }
         // Wrap if data longer than key (shouldn't happen: key=1500, MTU=1350)
+        let mut i = n;
         while i < d.len() {
             d[i] ^= key[i % key.len()];
             i += 1;

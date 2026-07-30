@@ -40,6 +40,4 @@ pub mod crypt;
 pub mod des;
 
 // Re-export the primary public API at the crate root for convenience.
-pub use crypt::{
-    select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine,
-};
+pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine};

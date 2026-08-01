@@ -59,6 +59,9 @@ impl TcpRawConn {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Self::unsupported()
     }
+    pub fn set_dscp(&self, _dscp: u32) -> io::Result<()> {
+        Self::unsupported()
+    }
 }
 
 /// Stub: tcpraw transport requires Linux.
@@ -66,6 +69,12 @@ pub struct TcpRawListener;
 
 impl TcpRawListener {
     pub fn bind(_addr: &SocketAddr) -> io::Result<Self> {
+        TcpRawConn::unsupported()
+    }
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        TcpRawConn::unsupported()
+    }
+    pub fn set_dscp(&self, _dscp: u32) -> io::Result<()> {
         TcpRawConn::unsupported()
     }
     pub async fn accept(&self) -> io::Result<(TcpRawConn, SocketAddr)> {

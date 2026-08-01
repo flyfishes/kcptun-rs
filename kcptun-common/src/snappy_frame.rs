@@ -84,11 +84,9 @@ impl SnappyStreamDecoder {
                         Err(_) => continue,
                     }
                 }
-                0x01 => {
+                0x01 if chunk_data.len() >= 4 => {
                     // Uncompressed chunk: [CRC32 4B][raw data]
-                    if chunk_data.len() >= 4 {
-                        out.extend_from_slice(&chunk_data[4..]);
-                    }
+                    out.extend_from_slice(&chunk_data[4..]);
                 }
                 _ => {}
             }

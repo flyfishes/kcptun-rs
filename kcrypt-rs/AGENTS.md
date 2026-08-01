@@ -1,19 +1,20 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-31 (B2: wire packing moved here) -->
 
 # kcrypt-rs
 
 ## Purpose
 
-Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.go` with full wire compatibility for 13 methods. Extracted from `kcp-rs` so crypto can evolve independently; `kcp-rs` re-exports this crate.
+Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.go` with full wire compatibility for 13 methods. Extracted from `kcp-rs` so crypto can evolve independently. `kcp-rs` has **no** dependency on this crate — consume `kcrypt-rs` directly. Hosts **wire packing** (`CryptoBuf`, `encrypt_batch`, offload heuristics) in `wire.rs` since B2 (2026-07-31).
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | `aes`, `aes-gcm`, `twofish`, `blowfish`, `des`, `pbkdf2`, `hmac`, `sha1`, `bytes` |
-| `src/lib.rs` | Public API: `select_block_crypt`, `select_aead_crypt`, traits, `CryptEngine` |
+| `Cargo.toml` | `aes`, `aes-gcm`, `twofish`, `blowfish`, `des`, `pbkdf2`, `hmac`, `sha1`, `bytes`, `crc32fast`, `parking_lot` |
+| `src/lib.rs` | Public API: `select_block_crypt`, `select_aead_crypt`, traits, `CryptEngine`; re-exports `wire::*` |
 | `src/crypt.rs` | Traits `BlockCrypt` / `AeadCrypt`; CFB helpers; `GO_CFB_IV`; factory; re-exports ciphers |
+| `src/wire.rs` | **Wire packing** (B2): `CryptoBuf`, `encrypt_batch(_into)`, `decrypt_cfb_in_place`, `strip_cfb_header_if_present`, `inbound_null`, `should_cpu_block_*`, `OffloadProfile`, `CRYPT_HDR`/`NONCE_SZ` |
 | `src/cast5.rs` | Full CAST-128 (RFC 2144) block implementation (Go-compatible) |
 | `src/des.rs` | Go-style DES/3DES Feistel boxes (~2× vs soft RustCrypto path) |
 
@@ -57,8 +58,9 @@ let (cipher, name) = select_block_crypt("aes-128", &key);
 cipher.encrypt(&mut data);
 ```
 
-Wire packing (CFB nonce+CRC) is done by `kcp_rs::CryptoBuf`, not this crate.
+Wire packing (CFB nonce+CRC, AEAD, offload heuristics) lives here in `wire.rs` — `CryptoBuf`, `encrypt_batch`, `decrypt_cfb_in_place`, `should_cpu_block_*`, `OffloadProfile`. Moved from `kcp-rs` (B2, 2026-07-31).
 `encrypt_batch` takes `&CryptEngine` (AEAD via `crypt.as_aead()`).
+- `null` vs `none` header policy: `uses_cfb_header(method)` / caller `has_encryption` flag — see `wire::encrypt_batch`.
 
 ## Dependencies
 
@@ -68,6 +70,6 @@ None (leaf crypto crate).
 
 ### External
 
-- `aes`, `aes-gcm`, `twofish`, `blowfish`, `des`, `pbkdf2`, `hmac`, `sha1`, `bytes`
+- `aes`, `aes-gcm`, `twofish`, `blowfish`, `des`, `pbkdf2`, `hmac`, `sha1`, `bytes`, `crc32fast`, `parking_lot`
 
 <!-- MANUAL: -->

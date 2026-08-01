@@ -25,8 +25,13 @@ None (flat binary crate).
 
 - Stack: local TCP → (optional QPP) → SMUX stream → Snappy session → KCP → BlockCrypt → UDP.
 - Flush loop is **4-phase** to minimize KCP mutex hold; keep crypto/snappy outside the lock.
+- **Experimental lib path (M1-A)**: `--experimental-lib-kcp` (default off) routes connections through
+  `LibKcpConn` (`kcp_rs::KcpConn` via `dial_kcp_session`) instead of the inlined KCP loop. The accept
+  loop / scavenger dispatch through the `SessionHandle` trait (`Vec<Box<dyn SessionHandle>>`).
+  A flaky tail-loss on large transfers was fixed via the SMUX EOF grace in `smux_rs::Stream::read`
+  (see CHANGELOG / production migration plan §0.3). Do not enable by default until M2 flips the flag.
 - Session cipher: `Arc<kcrypt_rs::CryptEngine>` (no separate `Arc<dyn AeadCrypt>`).
-- Shared: `kcptun_common::{derive_key, apply_mode, SnappyStreamDecoder, pipe, snmp_logger, QPPPort?}`.
+- Shared: `kcptun_common::{derive_key, apply_mode, SnappyStreamDecoder, SnappyPipe, pipe, snmp_logger, QPPPort?}`.
 - Global allocator: `mimalloc`.
 - Prefer `kio::*` for async; dual impl blocks for tokio/smol on AsyncRead/Write wrappers.
 - SNMP logger only meaningful when SNMP collection is enabled in kcp-rs.

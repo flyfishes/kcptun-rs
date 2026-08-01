@@ -313,12 +313,7 @@ mod neon {
     }
 
     #[inline(always)]
-    unsafe fn sqr(
-        a: &mut uint32x4_t,
-        b: &mut uint32x4_t,
-        c: &mut uint32x4_t,
-        d: &mut uint32x4_t,
-    ) {
+    unsafe fn sqr(a: &mut uint32x4_t, b: &mut uint32x4_t, c: &mut uint32x4_t, d: &mut uint32x4_t) {
         let t = vaddq_u32(*a, *d);
         *b = veorq_u32(*b, rotl7(t));
         let t = vaddq_u32(*b, *a);

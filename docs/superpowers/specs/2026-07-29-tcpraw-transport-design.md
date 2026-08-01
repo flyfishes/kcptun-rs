@@ -2,7 +2,7 @@
 
 **Date**: 2026-07-29
 **Status**: draft
-**Go Reference**: `vendor/github.com/xtaci/tcpraw/` (kcptun upstream)
+**Go Reference**: `/Users/yangzhiqin/Documents/Project/kcptun/vendor/github.com/xtaci/tcpraw/`
 
 ## Overview
 

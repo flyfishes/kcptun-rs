@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-31 (Task 7: Builder + no backpressure) -->
 
 # smux-rs
 
@@ -13,16 +13,24 @@ SMUX stream multiplexer over a single async transport (typically KCP+Snappy). Ru
 |------|-------------|
 | `Cargo.toml` | Features `tokio` (default) / `smol` via `kio-rs`; deps `bytes`, `log`, `parking_lot` |
 | `build.rs` | Runtime feature glue if present |
-| `src/lib.rs` | Public re-exports: `Session`, `Stream`, `Frame`, `Config`, … |
+| `src/lib.rs` | Public re-exports: `Session`, `Stream`, `Frame`, `Config`, `SmuxConn`, `SmuxConnBuilder`, … |
 | `src/frame.rs` | 8B header codec; `Cmd`, `Frame`, `FrameCodec`; `FRAME_HEADER_SIZE=8`, `MAX_FRAME_SIZE` |
 | `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive, SYN queue |
-| `src/stream.rs` | Logical `Stream` (AsyncRead/AsyncWrite); R4: `RecvInner`/`SendInner` split locks |
-| `src/conn.rs` | `SmuxConn` high-level wrapper (auto read/flush/keepalive/reap) |
-| `src/io.rs` | `SmuxIo` wrapper with optional transport backpressure |
+| `src/stream.rs` | Logical `Stream`: `AsyncRead`/`AsyncWrite` + optional `set_flush_notify`; R4 locks |
+| `src/conn.rs` | `SmuxConn` + `SmuxConnBuilder` (`connect`/`serve` → `.build().await`); `open_stream`/`accept` → `Arc<Stream>`; legacy `client`/`server` thin wrappers |
+| `src/io.rs` | Thin `SmuxIo` (flush notify only; **no** KCP `with_backpressure` — removed) |
 
 ## Subdirectories
 
 None (flat `src/`).
+
+## API notes (Tasks 5–6)
+
+- **Preferred:** `SmuxConn::connect(transport)` / `SmuxConn::serve(transport)` → chain `.version` / `.keepalive` / `.config` → `.build().await`.
+- `open_stream()` / `accept()` return `Arc<Stream>` which implements `AsyncRead`+`AsyncWrite` directly (no required `SmuxIo` wrapper).
+- Stream writes wake the driver via **`flush_notify`** set by SmuxConn; do not reintroduce KCP-specific `with_backpressure`.
+- `client`/`server` remain as thin sync wrappers (spawn driver) for older call sites.
+- Production kcptun binaries still drive **`Session` low-level** with custom flush loops; SmuxConn is library-ready for TCP or `KcpConn`-as-transport.
 
 ## For AI Agents
 
@@ -33,25 +41,35 @@ None (flat `src/`).
 - Session owns stream map and read loop; streams are half-close aware.
 - Keepalive via periodic ping frames — do not break idle timeout semantics expected by binaries.
 - Compression is **not** in this crate; binaries wrap transport with Snappy before/after SMUX.
+- **Do not restore `with_backpressure`.** KCP backpressure belongs on the transport / KcpConn layer, not SmuxIo.
 - **R4 lock model (`Stream`):** `recv: Mutex<RecvInner>` (state + recv queue + read_waker + local_closed_at) and `send: Mutex<SendInner>` (send queue + write_waker). If both locks are needed: **recv then send**. Take wakers under lock, **wake after release**. No legacy contiguous `recv_buf`; only `VecDeque<Bytes>`. Peer window / half-close flags stay atomic.
 
 ### Testing Requirements
 
-- Crate/unit tests if present
+- `cargo test -p smux-rs --features tokio`
 - Interop: `bash test_e2e.sh` with smuxver matrix after frame/session changes
 - Stress: `make stress` exercises many concurrent streams
 
 ### Common Patterns
 
 ```rust
-// High-level (recommended for standalone use):
-use smux_rs::{SmuxConn, Config};
-let conn = SmuxConn::new(Config::default(), true)?;
-let stream = conn.open_stream()?; // SmuxIo: AsyncRead + AsyncWrite
+// High-level Builder (recommended for standalone use; aligns with KcpConn):
+use smux_rs::{SmuxConn, Config, DEFAULT_CONFIG};
+let conn = SmuxConn::connect(tcp)
+    .version(2)
+    .keepalive(10)
+    .build()
+    .await?;
+// or server: SmuxConn::serve(tcp).config(cfg).build().await?
+let stream = conn.open_stream()?; // Arc<Stream> with flush_notify set
 
-// Low-level (for kcptun / custom transport):
+// Compatibility (thin wrappers over connect/serve):
+// SmuxConn::client(cfg, tcp)? / SmuxConn::server(cfg, tcp)?
+
+// Low-level (for kcptun production / custom transport):
 use smux_rs::{Config, Session, DEFAULT_CONFIG};
-let session = Session::new_client(&Config::default())?;
+let session = Session::new_client(&Config { version: 2, ..DEFAULT_CONFIG.clone() })?;
+// stream.set_flush_notify(flush); SmuxIo::new(stream) only if sharing Arc without notify
 ```
 
 ## Dependencies

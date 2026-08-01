@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,13 @@ pub enum StreamState {
     Reset,
 }
 
+/// Grace period after `remote_closed` during which `read` keeps returning
+/// `WouldBlock` instead of EOF, so a data tail that arrives after the peer's
+/// FIN (its pipe drained faster than its flush emitted the tail) is not dropped
+/// by a prematurely-completing pipe.
+const EOF_GRACE_MS: u64 = 300;
+const EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(EOF_GRACE_MS);
+
 /// Receive half + state + read waker (single mutex).
 struct RecvInner {
     state: StreamState,
@@ -57,6 +65,11 @@ struct RecvInner {
     recv: VecDeque<Bytes>,
     read_waker: Option<Waker>,
     local_closed_at: Option<Instant>,
+    /// When the remote FIN was processed — used for the EOF grace period
+    /// (the FIN may precede the data tail when the peer's pipe drains faster
+    /// than its flush; without the grace, `read` EOFs and the caller's pipe
+    /// completes, dropping the tail).
+    remote_closed_at: Option<Instant>,
 }
 
 /// Send half + write waker (separate mutex so push/read does not block drain).
@@ -113,6 +126,11 @@ pub struct Stream {
     ch_reader_wakeup: kio::Notify,
     /// Wakes up a writer blocked in `poll_write()` (v2 peer window).
     ch_write_wakeup: kio::Notify,
+    /// Optional flush-loop wake (SmuxConn / kcptun set this so writes flush ASAP).
+    /// Low-level Session users may leave this `None`.
+    flush_notify: Mutex<Option<Arc<kio::Notify>>>,
+    /// Weak self-reference so a grace-expiry wakeup task can re-wake a reader.
+    self_ref: Mutex<Option<std::sync::Weak<Stream>>>,
 }
 
 impl Stream {
@@ -125,6 +143,7 @@ impl Stream {
                 recv: VecDeque::new(),
                 read_waker: None,
                 local_closed_at: None,
+                remote_closed_at: None,
             }),
             send: Mutex::new(SendInner {
                 send: VecDeque::new(),
@@ -145,6 +164,29 @@ impl Stream {
             peer_window: AtomicU32::new(262144), // Go initialPeerWindow
             ch_reader_wakeup: kio::Notify::new(),
             ch_write_wakeup: kio::Notify::new(),
+            flush_notify: Mutex::new(None),
+            self_ref: Mutex::new(None),
+        }
+    }
+
+    /// Attach a weak self-reference (set by the Session after Arc creation) so a
+    /// grace-expiry wakeup task can re-wake a reader blocked after `remote_closed`.
+    #[inline]
+    pub fn set_self_ref(&self, w: std::sync::Weak<Stream>) {
+        *self.self_ref.lock() = Some(w);
+    }
+
+    /// Attach a flush-loop notifier so `poll_write` / shutdown wake the driver.
+    #[inline]
+    pub fn set_flush_notify(&self, n: Arc<kio::Notify>) {
+        *self.flush_notify.lock() = Some(n);
+    }
+
+    /// Wake the flush loop if one was registered via [`set_flush_notify`].
+    #[inline]
+    fn notify_flush(&self) {
+        if let Some(ref n) = *self.flush_notify.lock() {
+            n.notify_one();
         }
     }
 
@@ -307,6 +349,42 @@ impl Stream {
 
         if offset == 0 {
             if self.remote_closed.load(Ordering::Acquire) {
+                // ── EOF grace for the FIN-vs-data-tail race (BUGREPORT fix) ──
+                //
+                // WHY: A sender can emit its FIN frame *before* its data tail is
+                // fully transmitted. This happens when the sender's pipe drains
+                // its stream faster than the sender's own flush can emit the
+                // remaining data (KCP congestion-window slow start means the
+                // tail can land 100–300 ms after the FIN). In the M1-A lib
+                // KcpConn path, the reader adds a `KCP → read_buf → reader →
+                // process_data` hop, which widens this window.
+                //
+                // CONSEQUENCE WITHOUT THE GRACE: the moment this reader sees
+                // `remote_closed && empty` it returned `Err(Closed)`, the
+                // caller's `kio::pipe` completed, and the still-in-transit data
+                // tail was silently dropped (observed ~1/5 runs under
+                // `aes + FEC 10/3` for 200 KB transfers).
+                //
+                // FIX: for a grace period after the FIN (`EOF_GRACE_MS`) this
+                // read returns `WouldBlock` (Pending) instead of EOF, so the
+                // caller keeps polling and late-arriving data is delivered. We
+                // schedule a one-shot wakeup after the grace so a reader that is
+                // blocked (no new data) re-polls exactly once more and then gets
+                // the real EOF — it does not wait forever.
+                let closed_at = self.recv.lock().remote_closed_at;
+                if let Some(t) = closed_at {
+                    if t.elapsed() < EOF_GRACE {
+                        if let Some(w) = self.self_ref.lock().clone() {
+                            kio::spawn_task(async move {
+                                kio::sleep_ms(EOF_GRACE_MS).await;
+                                if let Some(s) = w.upgrade() {
+                                    s.wakeup_reader();
+                                }
+                            });
+                        }
+                        return Err(StreamError::WouldBlock);
+                    }
+                }
                 return Err(StreamError::Closed);
             }
             return Err(StreamError::WouldBlock);
@@ -426,6 +504,7 @@ impl Stream {
 
     /// Mark remote side closed (FIN received).
     pub fn mark_remote_closed(&self) {
+        self.recv.lock().remote_closed_at = Some(Instant::now());
         self.remote_closed.store(true, Ordering::Release);
         self.fin_event();
     }
@@ -586,7 +665,7 @@ impl Stream {
     }
 }
 
-/// Shared read logic for `AsyncRead` impls on `Stream` and `SmuxIo`.
+/// Shared read logic for `AsyncRead` impls on `Stream` (and Arc wrappers).
 ///
 /// Both tokio (via `ReadBuf`) and smol (via `&mut [u8]`) reduce to this
 /// after extracting the raw byte slice. Returns:
@@ -669,7 +748,10 @@ impl kio::AsyncWrite for Stream {
             }
         }
         match self.write(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
+            Ok(n) => {
+                self.notify_flush();
+                Poll::Ready(Ok(n))
+            }
             Err(StreamError::Closed) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "SMUX stream closed",
@@ -694,6 +776,7 @@ impl kio::AsyncWrite for Stream {
             self.id
         );
         self.mark_local_closed();
+        self.notify_flush();
         Poll::Ready(Ok(()))
     }
 }
@@ -731,7 +814,10 @@ impl kio::AsyncWrite for Stream {
             }
         }
         match self.write(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
+            Ok(n) => {
+                self.notify_flush();
+                Poll::Ready(Ok(n))
+            }
             Err(StreamError::Closed) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "SMUX stream closed",
@@ -753,6 +839,7 @@ impl kio::AsyncWrite for Stream {
             self.id
         );
         self.mark_local_closed();
+        self.notify_flush();
         Poll::Ready(Ok(()))
     }
 }
@@ -1013,10 +1100,26 @@ mod tests {
             // tokio's AsyncWriteExt provides shutdown(); futures_lite (smol)
             // uses close() for the same semantic.
             #[cfg(feature = "tokio")]
-            (&mut stream).shutdown().await.unwrap();
+            stream.shutdown().await.unwrap();
             #[cfg(feature = "smol")]
-            (&mut stream).close().await.unwrap();
+            stream.close().await.unwrap();
             assert!(stream.is_local_closed());
+        });
+    }
+    #[test]
+    fn set_flush_notify_wakes_on_async_write() {
+        kio::block_on(async {
+            use kio::AsyncWriteExt;
+            let notify = Arc::new(kio::Notify::new());
+            let mut stream = Stream::new(1);
+            stream.set_flush_notify(notify.clone());
+            let waiter = kio::spawn_task(async move {
+                notify.notified().await;
+            });
+            kio::sleep_ms(1).await;
+            let n = (&mut stream).write(b"ping").await.unwrap();
+            assert_eq!(n, 4);
+            let _ = kio::timeout(std::time::Duration::from_millis(200), waiter).await;
         });
     }
 }

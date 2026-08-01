@@ -15,9 +15,10 @@
 //!
 //! ## Encryption
 //!
-//! The block-cipher and AEAD implementations live in the dedicated
-//! [`kcrypt-rs`](../kcrypt_rs) crate and are re-exported here for backward
-//! compatibility. New code should depend on `kcrypt-rs` directly.
+//! Block-cipher / AEAD engines and **wire packing** (`CryptoBuf`,
+//! `encrypt_batch`, offload heuristics) live in [`kcrypt-rs`](../kcrypt_rs).
+//! This crate does **not** depend on it — depend on `kcrypt-rs` directly for
+//! anything crypto related.
 
 // The KCP state machine is a close port of Go's kcp-go v5 and intentionally
 // mirrors the upstream control flow for easy auditing. Several clippy lints
@@ -44,33 +45,32 @@
     clippy::arc_with_non_send_sync,
     clippy::needless_late_init,
     clippy::manual_hash_one,
-    clippy::collapsible_else_if
+    clippy::collapsible_else_if,
+    // Newer clippy lints on pre-existing KCP/crypto paths (Go-port fidelity).
+    clippy::manual_clamp,
+    clippy::manual_checked_ops,
 )]
 
-pub mod crypto_buf;
+pub mod config;
 pub mod fec;
 pub mod kcp;
 pub mod segment;
-pub mod session;
 pub mod snmp;
 
-// Re-export the crypto modules from the shared `kcrypt-rs` crate.
-pub use kcrypt_rs::cast5;
-pub use kcrypt_rs::crypt;
+#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+pub mod conn;
 
-// Re-export the primary public API.
-pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine};
-pub use crypto_buf::{
-    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null, offload_profile,
-    set_offload_profile, should_cpu_block_compress, should_cpu_block_decrypt,
-    should_cpu_block_encrypt, strip_cfb_header_if_present, CryptoBuf, InboundCryptError,
-    OffloadProfile, CRYPT_HDR, NONCE_SZ,
-};
+pub use config::{KcpConfig, KcpMode, DEFAULT_CONV};
 pub use fec::{
     fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncoder, FEC_HEADER_SIZE,
     FEC_TYPE_DATA, FEC_TYPE_PARITY,
 };
 pub use kcp::KCP;
 pub use segment::SegmentPool;
-pub use session::UDPSession;
 pub use snmp::{add as snmp_add, enable as snmp_enable, store as snmp_store, DEFAULT_SNMP, SNMP};
+
+#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+pub use conn::{
+    KcpConn, KcpConnBuilder, KcpListener, KcpListenerBuilder, KcpTcpListener,
+    KcpTcpListenerBuilder, PacketTransport,
+};

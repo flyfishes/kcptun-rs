@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — DNS hostname dialing + CLI defaults synced with Go kcptun
+
+- **Hostname dial / listen / target** — `parse_multi_port` (client `-r`, server
+  `-l`) now resolves DNS hostnames via `ToSocketAddrs`, not just IP literals,
+  matching Go's `net.ResolveUDPAddr`. `-r vps:29900`, `-l myhost:29900`, and
+  multi-port ranges with a hostname all work.
+- **`kio::TcpStream::connect`** (tokio + smol) now resolves hostnames for the
+  server `-t` target (`-t example.com:8080`), instead of requiring an IP literal.
+- **CLI defaults synced with Go** — client `-r`/`--remoteaddr` now defaults to
+  `vps:29900` (Go default), no longer required. All other client/server defaults
+  were verified against the Go binaries' `--help` and already match
+  (`:12948`/`:29900`, `aes`, `fast`, mtu 1350, sndwnd/rcvwnd 128/512 (client) /
+  1024/1024 (server), datashard/parityshard 10/3, sockbuf 4194304, smuxver 2,
+  smuxbuf 4194304, framesize 8192, streambuf 2097152, keepalive 10,
+  closewait 0/30, snmpperiod 60, …).
+
+**Verified**: full 200 KB round-trip through hostname-addressed client, server,
+and target (`-r localhost:… -l localhost:… -t localhost:…`) on both the
+experimental lib path and the legacy path; `parse_multi_port` hostname unit
+test; `make gate` green.
+
+### Fixed — M1-A lib KcpConn flaky tail-loss on large transfers (SMUX EOF grace)
+
+Production path was unaffected (legacy inlined KCP loops are still the default);
+the fix targets the experimental `--experimental-lib-kcp` path and, transitively,
+any SMUX consumer that reads a `smux_rs::Stream` through `kio::pipe`.
+
+**Bug**: large transfers (≥ ~200 KB, with crypto/FEC) intermittently lost the
+tail (~15–60 KCP segments). Under `aes + FEC 10/3` this hit roughly 1 in 5 runs.
+
+**Root cause** (traced via log instrumentation, not speculation):
+1. The **sender's** SMUX stream became `local_closed` **before** its data tail
+   was drained (observed at 121480/200000 bytes). The `local_closed` flag is set
+   when the pipe's stream-read half hits EOF.
+2. `smux_rs::Stream::read` returned EOF (`Err(Closed)`) the moment
+   `remote_closed && recv-buffer empty` — even when more data (the tail) was
+   still arriving from the peer. With the M1-A path's extra
+   `KCP → read_buf → reader → process_data` hop, the reader can drain slower
+   than the peer's pipe, so the peer's FIN is processed while the tail is still
+   in transit (100–300 ms later, due to KCP congestion-window slow start).
+3. The premature FIN → the receiver's stream was marked `remote_closed` → its
+   pipe completed → the still-in-transit tail was dropped.
+
+**Fix** (`smux-rs/src/stream.rs`): added an **EOF grace period**
+(`EOF_GRACE_MS = 300`). When `remote_closed && recv-buffer empty`, `read` now
+returns `WouldBlock` (Pending) and schedules a wakeup after the grace, giving
+late-arriving data a chance to be delivered; EOF is returned only after the
+grace expires. A weak self-reference (`self_ref`) lets the grace-expiry task
+re-wake a blocked reader.
+
+**Tradeoff**: connection closes now wait up to `EOF_GRACE_MS` (300 ms) after the
+peer's FIN before returning EOF, even for clean closes. Acceptable for the M1-A
+prototype; a later `SmuxConn`-unified driver can shorten or remove it.
+
+**Verified**: full config matrix now passes stable full transfers —
+null/nocomp, aes+FEC 10/3 (±comp), null+comp, and 1 MB. Previously ~1/5 runs
+lost the tail. `cargo test --workspace` + `clippy -D warnings` green.
+
+### Added — M1-A experimental library KCP stack (`--experimental-lib-kcp`, default off)
+
+- Client connections can be routed through the library stack
+  (`kcp_rs::KcpConn` + `CryptoTransport` + FEC) instead of the inlined
+  UDP↔crypto↔FEC↔KCP loops, behind a `SessionHandle` trait so the accept loop /
+  scavenger dispatch to either the legacy `KcpConn` or the new `LibKcpConn`.
+- Two tasks (reader/writer) share the lib `KcpConn` via new `&self` async
+  methods `read_shared` / `write_all_shared` — no shared Mutex, so a writer
+  blocked on send-window backpressure never starves the reader (which keeps
+  ACKing inbound data).
+- `KcpConn` write backpressure hardened (M0.1): `window_bytes = snd_wnd × MSS`
+  cap on `write_buf` + partial writes + `backpressure_relieved()` wake.
+- Flag defaults off; tcpraw / multi-port fall back to the legacy path.
+
+### Added — M0 library prep
+
+- **`SnappyPipe<T>`** (`kcptun-common`) — Go-compatible snappy session codec as
+  `AsyncRead + AsyncWrite` over any transport (compress / passthrough modes),
+  with KcpConn round-trip tests.
+- **`CryptoTransport` CPU-offload** — heavy-cipher encrypt batches now offload
+  to `kio::cpu_block` (M0.2); the ACK/urgent path is forced inline so
+  FEC-expanded ACK batches never take a blocking-pool hop.
+- **Config gold tests** (M0.3) — CLI mode matrix
+  (`normal`/`fast`/`fast2`/`fast3`/manual) verified equivalent between the
+  legacy `apply_mode` and the library `kcp_config_from` / `KcpConfig`.
+
 ### Perf — Eliminate vtable dispatch on hot crypto paths (kcp-rs)
 
 - **`CryptEngine` replaces `dyn BlockCrypt`**: Changed 4 function signatures in

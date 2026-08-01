@@ -228,6 +228,13 @@ impl KCP {
 
     // ── Configuration ─────────────────────────────────────────────────────
 
+    /// Set the conversation ID. Used by a server session to adopt a client's
+    /// (random) conv from the first inbound packet — matching Go kcp-go's
+    /// server, which keys each accepted session by the first packet's conv.
+    pub fn set_conv(&mut self, conv: u32) {
+        self.conv = conv;
+    }
+
     /// Set the MTU (Maximum Transmission Unit).
     /// Returns true if successful.
     pub fn set_mtu(&mut self, mtu: u32) -> bool {
@@ -1466,16 +1473,23 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         crate::snmp::enable();
-        let before_s = crate::snmp::DEFAULT_SNMP.bytes_sent.load(Ordering::SeqCst);
-        let before_r = crate::snmp::DEFAULT_SNMP
+        // Reset counters so we measure the absolute effect of our operations
+        // rather than computing a delta (which races with other tests sharing
+        // the process-global DEFAULT_SNMP).
+        crate::snmp::DEFAULT_SNMP
+            .bytes_sent
+            .store(0, Ordering::SeqCst);
+        crate::snmp::DEFAULT_SNMP
             .bytes_received
-            .load(Ordering::SeqCst);
+            .store(0, Ordering::SeqCst);
 
         let mut kcp = create_kcp(7);
         kcp.set_stream_mode(true);
         kcp.send(b"hello-snmp").unwrap();
-        let after_s = crate::snmp::DEFAULT_SNMP.bytes_sent.load(Ordering::SeqCst);
-        assert_eq!(after_s - before_s, 10);
+        assert_eq!(
+            crate::snmp::DEFAULT_SNMP.bytes_sent.load(Ordering::SeqCst),
+            10,
+        );
 
         let store: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let store2 = store.clone();
@@ -1500,10 +1514,12 @@ mod tests {
         b.update(20);
         let got = b.recv().unwrap();
         assert_eq!(&got[..], b"abcdef");
-        let after_r = crate::snmp::DEFAULT_SNMP
-            .bytes_received
-            .load(Ordering::SeqCst);
-        assert!(after_r - before_r >= 6);
+        assert!(
+            crate::snmp::DEFAULT_SNMP
+                .bytes_received
+                .load(Ordering::SeqCst)
+                >= 6,
+        );
     }
 
     /// Regression test: stream-mode append must not panic when the second

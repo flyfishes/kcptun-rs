@@ -1,17 +1,17 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-08-01 (vendoring removed) -->
 
 # .cargo
 
 ## Purpose
 
-Cargo configuration for vendored dependencies and target-specific rustflags. Regenerated/rewritten in part by `make vendor`.
+Cargo build configuration: target-specific rustflags. Dependencies are fetched from crates.io per build platform (not vendored).
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `config.toml` | `crates-io` → `vendor/`; aarch64 `rustflags = ["--cfg", "aes_armv8"]` for Apple Darwin + Linux GNU |
+| `config.toml` | aarch64 `rustflags = ["--cfg", "aes_armv8"]` for Apple Darwin + Linux GNU |
 
 ## Subdirectories
 
@@ -21,23 +21,22 @@ None.
 
 ### Working In This Directory
 
-- Do not hand-edit the source replacement block without also running/understanding `make vendor`.
 - **Keep** aarch64 `aes_armv8` cfg — without it AES falls back to soft fixslice (major perf cliff).
-- Vendor dir is repo-root `vendor/` (not under `.cargo/`).
+- Dependencies are pulled from crates.io at build time; each platform resolves its own appropriate libs. Users need network (or a crates.io mirror) for a fresh build.
 
 ### Testing Requirements
 
-- After vendor refresh: `cargo build --workspace` / `make build`
+- `cargo build --workspace` / `make build`
 
 ### Common Patterns
 
-- Offline builds rely on `vendor/` + this config
+- (none — vendoring removed)
 
 ## Dependencies
 
 ### Internal
 
-- `Makefile` `vendor` / `vendor-force` targets
+- None
 
 ### External
 

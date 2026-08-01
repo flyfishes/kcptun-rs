@@ -25,14 +25,15 @@ impl SimpleXORCrypt {
     #[inline]
     fn xor_inplace(d: &mut [u8], key: &[u8]) {
         let n = d.len().min(key.len());
-        // Fast path: 8-byte u64 XOR via chunks_exact — bounds are proven by
-        // the chunk splitter so LLVM can elide panic paths (unlike try_into).
+        // Fast path: 8-byte u64 XOR via as_chunks — bounds are proven by the
+        // chunk splitter so LLVM can elide panic paths (unlike try_into).
         let (d_body, d_tail) = d[..n].split_at_mut(n & !7);
         let (k_body, k_tail) = key[..n].split_at(n & !7);
-        for (dc, kc) in d_body.chunks_exact_mut(8).zip(k_body.chunks_exact(8)) {
-            // SAFETY: chunks_exact(8) yields exactly 8-byte slices.
-            let k = u64::from_le_bytes(kc.try_into().unwrap());
-            let v = u64::from_le_bytes(dc.try_into().unwrap());
+        let (d_chunks, _) = d_body.as_chunks_mut::<8>();
+        let (k_chunks, _) = k_body.as_chunks::<8>();
+        for (dc, kc) in d_chunks.iter_mut().zip(k_chunks.iter()) {
+            let k = u64::from_le_bytes(*kc);
+            let v = u64::from_le_bytes(*dc);
             dc.copy_from_slice(&(v ^ k).to_le_bytes());
         }
         for (db, kb) in d_tail.iter_mut().zip(k_tail.iter()) {

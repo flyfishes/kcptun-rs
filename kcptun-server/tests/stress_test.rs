@@ -510,6 +510,7 @@ fn test_multithread_100_connections() {
 ///   - Retransmission flood (all segments retransmitted every flush cycle)
 ///   - KCP_MAX_FRAG overflow (concatenated SMUX frames exceeded 128 * MSS)
 #[test]
+#[ignore = "heavy stress test (100 SMUX streams / 1 KCP conn); run via make test"]
 fn test_multithread_large_data() {
     // Single KCP channel (--conn 1): all 100 SMUX streams multiplex over
     // one KCP connection. This tests window contention and backpressure.
@@ -577,6 +578,7 @@ fn test_multithread_large_data() {
 ///   - Wave 2: 20 connections, 32KB each (JS bundles)
 ///   - Wave 3: 50 connections, 4KB-128KB mixed (images, API calls)
 #[test]
+#[ignore = "heavy stress test (80 SMUX streams in 3 waves / 1 KCP conn); run via make test"]
 fn test_page_refresh_simulation() {
     // Single KCP channel: 80 SMUX streams over 1 KCP connection.
     let e = TestEnv::start_with_config(19047, 29947, 12997, "null", true, 1);

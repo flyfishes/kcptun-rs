@@ -33,6 +33,22 @@ const RAW_RECV_BUF: usize = 2 * 1024 * 1024;
 const CHANNEL_CAP: usize = 256;
 const TCP_HDR_LEN: usize = 32; // 20 base + 12 timestamp options
 
+/// How the kernel TCP stack is silenced after the 3-way handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Takeover {
+    Repair,
+    Iptables,
+}
+
+/// Env override for tests / triage: `KCPTCP_TAKEOVER=repair|iptables`.
+fn takeover_from_env() -> Option<Takeover> {
+    match std::env::var("KCPTCP_TAKEOVER").ok().as_deref() {
+        Some("repair") => Some(Takeover::Repair),
+        Some("iptables") => Some(Takeover::Iptables),
+        _ => None,
+    }
+}
+
 /// Initial TCP flow state captured after the three-way handshake.
 ///
 /// Uses `TCP_REPAIR` + `TCP_QUEUE_SEQ` rather than extended `tcp_info` fields
@@ -87,6 +103,156 @@ fn set_repair_queue(stream: &std::net::TcpStream, queue: i32) -> io::Result<()> 
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Non-blocking read-to-empty of an fd (drains the kernel recv queue).
+fn drain_fd(fd: libc::c_int) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
+fn set_ttl(stream: &std::net::TcpStream, ttl: u8) -> io::Result<()> {
+    let val: libc::c_int = ttl as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_TTL,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Set DSCP on a raw socket fd (IPv4 `IP_TOS`, shifted into the 6-bit DSCP
+/// field). Matches Go tcpraw's `setDSCP` (`dscp << 2`). Applies to all
+/// segments sent on that raw socket.
+fn set_raw_dscp(fd: libc::c_int, dscp: u32) -> io::Result<()> {
+    let val: libc::c_int = ((dscp & 0x3F) << 2) as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn ttl_drop_rule_client(
+    local_ip: &str,
+    local_port: u16,
+    peer_ip: &str,
+    peer_port: u16,
+) -> Vec<String> {
+    vec![
+        "-m".into(),
+        "ttl".into(),
+        "--ttl-eq".into(),
+        "1".into(),
+        "-p".into(),
+        "tcp".into(),
+        "-s".into(),
+        local_ip.into(),
+        "--sport".into(),
+        local_port.to_string(),
+        "-d".into(),
+        peer_ip.into(),
+        "--dport".into(),
+        peer_port.to_string(),
+        "-j".into(),
+        "DROP".into(),
+    ]
+}
+
+fn ttl_drop_rule_server(port: u16) -> Vec<String> {
+    vec![
+        "-m".into(),
+        "ttl".into(),
+        "--ttl-eq".into(),
+        "1".into(),
+        "-p".into(),
+        "tcp".into(),
+        "--sport".into(),
+        port.to_string(),
+        "-j".into(),
+        "DROP".into(),
+    ]
+}
+
+fn iptables_status(verb: &str, rule: &[String]) -> io::Result<std::process::ExitStatus> {
+    std::process::Command::new("iptables")
+        .arg("-t")
+        .arg("filter")
+        .arg(verb)
+        .arg("OUTPUT")
+        .args(rule)
+        .status()
+}
+
+/// Test-only: `-C` rule lookup is used solely by the `iptables_rule_cleaned_on_close`
+/// integration test. Gated so the Linux lib build has no dead code.
+#[cfg(test)]
+fn rule_exists(rule: &[String]) -> bool {
+    matches!(iptables_status("-C", rule), Ok(s) if s.success())
+}
+
+fn rule_add(rule: &[String]) -> io::Result<()> {
+    let st = iptables_status("-A", rule)?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "iptables -A failed (needs root / CAP_NET_ADMIN + ttl match module)",
+        ))
+    }
+}
+
+fn rule_delete(rule: &[String]) {
+    let _ = iptables_status("-D", rule);
+}
+
+/// Drains the real socket continuously (iptables path: the kernel is NOT in
+/// repair mode, so it queues inbound into the recv buffer). Keeps the buffer
+/// empty so close-with-unread-data never triggers RST.
+fn spawn_drain_thread(mut stream: std::net::TcpStream) -> Option<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("tcpraw-drain".into())
+        .spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => continue, // discard
+                    _ => break,                 // EOF (shutdown RD) or error
+                }
+            }
+        })
+        .ok()
 }
 
 fn get_queue_seq(stream: &std::net::TcpStream) -> io::Result<u32> {
@@ -239,6 +405,21 @@ pub struct TcpRawConn {
     close_tx: async_channel::Sender<()>,
     /// Capture thread handle.
     _cap_thread: Option<thread::JoinHandle<()>>,
+    /// Which takeover method this connection uses (drives close behavior).
+    takeover: Takeover,
+    /// Per-connection iptables OUTPUT rule (client only; empty for server conns).
+    iptables_rule: Vec<String>,
+    /// Drain thread handle (iptables path only).
+    _drain: Option<thread::JoinHandle<()>>,
+    /// Listener map refs + our peer key (server conns only) so Drop can
+    /// deregister the stale flow/channel entries.
+    listener_reg: Option<(
+        Arc<
+            std::sync::Mutex<std::collections::HashMap<SocketAddr, async_channel::Sender<Vec<u8>>>>,
+        >,
+        Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<TcpFlowState>>>>,
+        SocketAddr,
+    )>,
 }
 
 unsafe impl Send for TcpRawConn {}
@@ -404,11 +585,72 @@ impl TcpRawConn {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(SocketAddr::from((self.src_ip, self.src_port)))
     }
+
+    /// Set DSCP on the raw socket (IPv4 TOS). Matches Go `TCPConn.SetDSCP`.
+    pub fn set_dscp(&self, dscp: u32) -> io::Result<()> {
+        set_raw_dscp(self.raw_fd.as_raw_fd(), dscp)
+    }
+
+    /// Graceful close so the kernel never emits RST (repair path):
+    /// 1. drain the recv queue while still in repair mode (a close with
+    ///    unread data makes the kernel send RST);
+    /// 2. exit TCP_REPAIR (kernel's seq view was frozen at capture time and
+    ///    we only ever sent via the raw socket, so it is consistent);
+    /// 3. graceful FIN via shutdown(SHUT_WR);
+    /// 4. drain stragglers that raced in after step 1.
+    fn close_repair(&self) {
+        let stream = &self._real;
+        let fd = stream.as_raw_fd();
+        let _ = set_repair_queue(stream, TCP_RECV_QUEUE);
+        drain_fd(fd);
+        let _ = set_tcp_repair(stream, false);
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_WR);
+        }
+        drain_fd(fd);
+    }
+
+    /// Graceful close for the iptables-TTL-DROP path: restore TTL so the FIN
+    /// passes the OUTPUT rule, delete the per-conn rule, FIN, then unblock the
+    /// drain thread (which finishes draining before the socket fully closes).
+    fn close_iptables(&self) {
+        let _ = set_ttl(&self._real, 64);
+        if !self.iptables_rule.is_empty() {
+            rule_delete(&self.iptables_rule);
+        }
+        let fd = self._real.as_raw_fd();
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_WR);
+            libc::shutdown(fd, libc::SHUT_RD);
+        }
+    }
+
+    /// Idempotent close: graceful FIN per takeover method, then stop the
+    /// capture thread.
+    pub fn close(&self) {
+        match self.takeover {
+            Takeover::Repair => self.close_repair(),
+            Takeover::Iptables => self.close_iptables(),
+        }
+        let _ = self.close_tx.try_send(());
+    }
 }
 
 impl Drop for TcpRawConn {
     fn drop(&mut self) {
-        let _ = self.close_tx.try_send(());
+        self.close();
+        if let Some(h) = self._drain.take() {
+            let _ = h.join(); // drain exits on shutdown(SHUT_RD) → EOF
+        }
+        if let Some((channels, flows, peer)) = &self.listener_reg {
+            let mut fl = flows.lock().unwrap();
+            let is_mine = matches!(fl.get(peer), Some(f) if Arc::ptr_eq(f, &self.flow));
+            if is_mine {
+                fl.remove(peer);
+                drop(fl);
+                channels.lock().unwrap().remove(peer);
+            }
+        }
     }
 }
 
@@ -424,6 +666,9 @@ pub struct TcpRawListener {
     /// Per-peer flow state so the capture thread can update ack/seq/ts_ecr.
     flows: Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<TcpFlowState>>>>,
     _close_tx: async_channel::Sender<()>,
+    /// Lazily installed OUTPUT TTL-DROP rule for the listen port (first
+    /// accepted connection that takes the iptables path). Deleted on drop.
+    iptables_rule: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 impl TcpRawListener {
@@ -457,7 +702,18 @@ impl TcpRawListener {
             channels,
             flows,
             _close_tx: close_tx,
+            iptables_rule: std::sync::Mutex::new(None),
         })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.real.local_addr()
+    }
+
+    /// Set DSCP on the shared raw socket (all accepted connections). Matches
+    /// Go `TCPConn.SetDSCP` applied to the server listener's handles.
+    pub fn set_dscp(&self, dscp: u32) -> io::Result<()> {
+        set_raw_dscp(self.raw_fd.as_raw_fd(), dscp)
     }
 
     pub async fn accept(&self) -> io::Result<(TcpRawConn, SocketAddr)> {
@@ -484,9 +740,29 @@ impl TcpRawListener {
             flows.insert(peer_addr, flow.clone());
         }
 
-        let state = capture_repair_state(&stream)?;
-        flow.seq.store(state.seq, Ordering::Relaxed);
-        flow.ack.store(state.ack, Ordering::Relaxed);
+        let (takeover, seq, ack, drain) = match takeover_from_env() {
+            Some(Takeover::Repair) => {
+                let st = capture_repair_state(&stream)?;
+                (Takeover::Repair, st.seq, st.ack, None)
+            }
+            Some(Takeover::Iptables) => {
+                let _ = set_ttl(&stream, 1);
+                install_server_rule(self, src_port)?;
+                let drain = spawn_drain_thread(stream.try_clone()?);
+                (Takeover::Iptables, 0, 0, drain)
+            }
+            None => match capture_repair_state(&stream) {
+                Ok(st) => (Takeover::Repair, st.seq, st.ack, None),
+                Err(_) => {
+                    let _ = set_ttl(&stream, 1);
+                    install_server_rule(self, src_port)?;
+                    let drain = spawn_drain_thread(stream.try_clone()?);
+                    (Takeover::Iptables, 0, 0, drain)
+                }
+            },
+        };
+        flow.seq.store(seq, Ordering::Relaxed);
+        flow.ack.store(ack, Ordering::Relaxed);
 
         let (close_tx, _close_rx) = async_channel::bounded::<()>(1);
 
@@ -502,6 +778,10 @@ impl TcpRawListener {
                 rx,
                 close_tx,
                 _cap_thread: None,
+                takeover,
+                iptables_rule: vec![], // server rule is owned by the listener
+                _drain: drain,
+                listener_reg: Some((self.channels.clone(), self.flows.clone(), peer_addr)),
             },
             peer_addr,
         ))
@@ -510,6 +790,9 @@ impl TcpRawListener {
 
 impl Drop for TcpRawListener {
     fn drop(&mut self) {
+        if let Some(rule) = self.iptables_rule.lock().unwrap().take() {
+            rule_delete(&rule);
+        }
         let _ = self._close_tx.try_send(());
     }
 }
@@ -543,6 +826,15 @@ fn update_flow_from_segment(flow: &TcpFlowState, seg: &TcpSegmentView<'_>) {
             flow.ack.store(next, Ordering::Relaxed);
         }
     }
+}
+
+/// Returns true when an inbound segment must be ignored entirely (no flow
+/// update, no payload delivery). A TCP RST means "this TCP flow is broken" —
+/// but KCP is the reliability layer, so RST is treated as noise, never as a
+/// connection-death signal. The flow only dies via KCP's own timeout.
+#[inline]
+fn seg_ignored(seg: &TcpSegmentView<'_>) -> bool {
+    seg.rst
 }
 
 fn server_capture_thread(
@@ -599,6 +891,9 @@ fn server_capture_thread(
         // Port filter (Go captureFlow).
         if seg.dst_port != local_port {
             continue;
+        }
+        if seg_ignored(&seg) {
+            continue; // RST = noise; never touch flow state or KCP
         }
 
         let peer_ip = match sockaddr_to_ipv4(&storage) {
@@ -679,7 +974,9 @@ fn client_capture_thread(
         if seg.dst_port != local_port || seg.src_port != peer_port {
             continue;
         }
-
+        if seg_ignored(&seg) {
+            continue; // RST = noise; never touch flow state or KCP
+        }
         update_flow_from_segment(&flow, &seg);
 
         if !seg.psh || seg.payload.is_empty() {
@@ -700,6 +997,7 @@ struct TcpSegmentView<'a> {
     psh: bool,
     syn: bool,
     fin: bool,
+    rst: bool,
     ts_val: Option<u32>,
     payload: &'a [u8],
 }
@@ -749,6 +1047,7 @@ fn parse_tcp_segment(buf: &[u8]) -> Option<TcpSegmentView<'_>> {
         psh: flags & 0x08 != 0,
         syn: flags & 0x02 != 0,
         fin: flags & 0x01 != 0,
+        rst: flags & 0x04 != 0,
         ts_val,
         payload: &tcp[data_off..],
     })
@@ -791,22 +1090,94 @@ fn extract_ts_val(options: &[u8]) -> Option<u32> {
     None
 }
 
+/// Establish takeover of `stream` after its 3-way handshake.
+///
+/// Returns (method, installed iptables rule — client only, empty otherwise,
+/// drain thread handle, initial (seq, ack)). Repair is preferred; on probe
+/// failure we fall back to the iptables TTL-DROP method. If both fail the
+/// error propagates (no silent UDP fallback).
+fn takeover_stream(
+    stream: &std::net::TcpStream,
+    local: &SocketAddr,
+    remote: &SocketAddr,
+) -> io::Result<(
+    Takeover,
+    Vec<String>,
+    Option<thread::JoinHandle<()>>,
+    (u32, u32),
+)> {
+    let (l_ip, l_port) = socket_addr_to_ipv4(local)?;
+    let (r_ip, r_port) = socket_addr_to_ipv4(remote)?;
+
+    let try_repair = || -> io::Result<(u32, u32)> {
+        match capture_repair_state(stream) {
+            Ok(st) => Ok((st.seq, st.ack)),
+            Err(e) => {
+                let _ = set_tcp_repair(stream, false);
+                Err(e)
+            }
+        }
+    };
+
+    let try_iptables = || -> io::Result<(
+        Takeover,
+        Vec<String>,
+        Option<thread::JoinHandle<()>>,
+        (u32, u32),
+    )> {
+        let rule = ttl_drop_rule_client(
+            &std::net::Ipv4Addr::from(l_ip).to_string(),
+            l_port,
+            &std::net::Ipv4Addr::from(r_ip).to_string(),
+            r_port,
+        );
+        set_ttl(stream, 1)?;
+        rule_delete(&rule);
+        rule_add(&rule)?;
+        let drain = spawn_drain_thread(stream.try_clone()?);
+        Ok((Takeover::Iptables, rule, drain, (0, 0)))
+    };
+
+    match takeover_from_env() {
+        Some(Takeover::Repair) => {
+            let (seq, ack) = try_repair()?;
+            Ok((Takeover::Repair, vec![], None, (seq, ack)))
+        }
+        Some(Takeover::Iptables) => try_iptables(),
+        None => match try_repair() {
+            Ok((seq, ack)) => Ok((Takeover::Repair, vec![], None, (seq, ack))),
+            Err(_) => try_iptables(),
+        },
+    }
+}
+
+fn install_server_rule(listener: &TcpRawListener, port: u16) -> io::Result<()> {
+    let mut guard = listener.iptables_rule.lock().unwrap();
+    if guard.is_none() {
+        let rule = ttl_drop_rule_server(port);
+        rule_delete(&rule);
+        rule_add(&rule)?;
+        *guard = Some(rule);
+    }
+    Ok(())
+}
+
 // ─── Entry Points ────────────────────────────────────────────────────────────
 
 /// Dial a TCP raw connection to `remote_addr` (client side).
 pub fn dial(remote_addr: &SocketAddr) -> io::Result<TcpRawConn> {
-    let (dst_ip, dst_port) = socket_addr_to_ipv4(remote_addr)?;
-
     let stream = std::net::TcpStream::connect(*remote_addr)?;
     let local = stream.local_addr()?;
     let (src_ip, src_port) = socket_addr_to_ipv4(&local)?;
+    let (dst_ip, dst_port) = socket_addr_to_ipv4(remote_addr)?;
 
-    let state = capture_repair_state(&stream)?;
+    let (takeover, iptables_rule, drain, (seq, ack)) =
+        takeover_stream(&stream, &local, remote_addr)?;
+
     let raw_fd = Arc::new(open_raw_tcp_socket()?);
-
     let flow = Arc::new(TcpFlowState {
-        seq: AtomicU32::new(state.seq),
-        ack: AtomicU32::new(state.ack),
+        seq: AtomicU32::new(seq),
+        ack: AtomicU32::new(ack),
         ts_ecr: AtomicU32::new(0),
     });
 
@@ -834,10 +1205,318 @@ pub fn dial(remote_addr: &SocketAddr) -> io::Result<TcpRawConn> {
         rx,
         close_tx,
         _cap_thread: Some(cap_handle),
+        takeover,
+        iptables_rule,
+        _drain: drain,
+        listener_reg: None,
     })
 }
 
 /// Create a TCP raw listener bound to `addr` (server side).
 pub fn listen(addr: &SocketAddr) -> io::Result<TcpRawListener> {
     TcpRawListener::bind(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TCP flag bits (RFC 793).
+    const F_RST: u8 = 0x04;
+    const F_PSH: u8 = 0x08;
+    const F_ACK: u8 = 0x10;
+
+    /// Build a bare IP+TCP packet for the parser (no options, 20B each).
+    fn ip_tcp_packet(flags: u8, seq: u32, ack_num: u32, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + payload.len()];
+        pkt[0] = 0x45; // IPv4, IHL 5
+        pkt[9] = 6; // protocol = TCP
+        let pkt_len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&pkt_len.to_be_bytes());
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes()); // src
+        pkt[20 + 2..20 + 4].copy_from_slice(&29900u16.to_be_bytes()); // dst
+        pkt[20 + 4..20 + 8].copy_from_slice(&seq.to_be_bytes());
+        pkt[20 + 8..20 + 12].copy_from_slice(&ack_num.to_be_bytes());
+        pkt[20 + 12] = 0x50; // data offset 5
+        pkt[20 + 13] = flags;
+        if !payload.is_empty() {
+            pkt[40..].copy_from_slice(payload);
+        }
+        pkt
+    }
+
+    #[test]
+    fn parse_detects_rst_flag() {
+        let pkt = ip_tcp_packet(F_RST | F_ACK, 100, 200, b"");
+        let seg = parse_tcp_segment(&pkt).expect("parse");
+        assert!(seg.rst);
+        assert!(seg.ack_flag);
+        assert_eq!(seg.seq, 100);
+        assert_eq!(seg.ack, 200);
+    }
+
+    #[test]
+    fn seg_ignored_true_only_for_rst() {
+        let pkt_rst = ip_tcp_packet(F_RST | F_ACK, 0, 0, b"");
+        let pkt_data = ip_tcp_packet(F_PSH | F_ACK, 0, 0, b"x");
+        let pkt_ack = ip_tcp_packet(F_ACK, 0, 0, b"");
+        let rst = parse_tcp_segment(&pkt_rst).unwrap();
+        let data = parse_tcp_segment(&pkt_data).unwrap();
+        let ack = parse_tcp_segment(&pkt_ack).unwrap();
+        assert!(seg_ignored(&rst));
+        assert!(!seg_ignored(&data));
+        assert!(!seg_ignored(&ack));
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod integration_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn root_test() -> bool {
+        std::env::var("KCPTCP_ROOT_TEST").is_ok() && unsafe { libc::geteuid() } == 0
+    }
+
+    fn skip() {
+        eprintln!("skipped (needs Linux root + KCPTCP_ROOT_TEST=1)");
+    }
+
+    async fn poll_accept(listener: &TcpRawListener) -> io::Result<(TcpRawConn, SocketAddr)> {
+        crate::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+    }
+
+    /// Returns (client conn, accepted server conn, server listener). The
+    /// listener MUST stay alive for the duration of the test: dropping it
+    /// signals the shared capture thread to exit, silently breaking delivery
+    /// of packets that arrive afterward.
+    async fn pair_conns() -> io::Result<(TcpRawConn, TcpRawConn, TcpRawListener)> {
+        let server = TcpRawListener::bind(&SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let addr = server.local_addr()?;
+        let client = dial(&addr)?;
+        let (accepted, _) = poll_accept(&server).await?;
+        Ok((client, accepted, server))
+    }
+
+    /// Sends a forged RST+ACK segment for the given flow.
+    ///
+    /// Loopback-only: `sendto` targets the remote's IP, but the kernel assigns
+    /// the *local* IP as the packet's source. On 127.0.0.1 the two IPs coincide,
+    /// so the forged RST's source IP matches the real flow entry and the
+    /// RST-suppression path is exercised. On any non-loopback address the source
+    /// IP would be the local external IP rather than the peer's, the flow lookup
+    /// would fail, and the forged RST would be silently ignored — testing nothing.
+    fn send_forged_rst(local: SocketAddr, remote: SocketAddr) -> io::Result<()> {
+        let fd = open_raw_tcp_socket()?;
+        let (l_ip, l_port) = socket_addr_to_ipv4(&local)?;
+        let (r_ip, r_port) = socket_addr_to_ipv4(&remote)?;
+        let pkt = build_tcp_segment(&l_ip, &r_ip, l_port, r_port, 0, 0, 0, 0, &[]);
+        let mut pkt = pkt;
+        // build_tcp_segment returns a bare TCP segment (no IP prefix); the
+        // flags byte is at offset 13. Default is PSH|ACK (0x18) — forge RST|ACK.
+        pkt[13] = 0x14; // RST | ACK
+        let dst = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(r_ip),
+            },
+            sin_zero: [0; 8],
+        };
+        unsafe {
+            libc::sendto(
+                fd.as_raw_fd(),
+                pkt.as_ptr() as *const libc::c_void,
+                pkt.len(),
+                0,
+                &dst as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+        }
+        Ok(())
+    }
+
+    /// Restores `KCPTCP_TAKEOVER` on drop (even on test failure/panic).
+    struct TakeoverEnv;
+    impl TakeoverEnv {
+        fn set(v: &str) -> Self {
+            std::env::set_var("KCPTCP_TAKEOVER", v);
+            TakeoverEnv
+        }
+    }
+    impl Drop for TakeoverEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("KCPTCP_TAKEOVER");
+        }
+    }
+
+    /// Spawns a thread that sniffs the loopback interface for TCP RST segments
+    /// belonging to the flow of `flow_addr` (its port is one endpoint of the
+    /// 4-tuple). Runs for a bounded ~2s window, then returns every matching RST
+    /// as a `Vec` (empty = the kernel/peer never emitted RST for the flow).
+    fn spawn_rst_sniffer(flow_addr: SocketAddr) -> thread::JoinHandle<Vec<String>> {
+        thread::Builder::new()
+            .name("tcpraw-rst-sniffer".into())
+            .spawn(move || {
+                let fd = match open_raw_tcp_socket() {
+                    Ok(fd) => fd,
+                    Err(_) => return Vec::new(), // can't sniff; treat as "no RST"
+                };
+                let tv = libc::timeval {
+                    tv_sec: 1,
+                    tv_usec: 0,
+                };
+                unsafe {
+                    libc::setsockopt(
+                        fd.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
+                        &tv as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                    );
+                }
+                let port = flow_addr.port();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let mut buf = vec![0u8; 65536];
+                let mut rsts = Vec::new();
+                while std::time::Instant::now() < deadline {
+                    let n = unsafe {
+                        libc::recvfrom(
+                            fd.as_raw_fd(),
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                            0,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if n < 0 {
+                        thread::sleep(Duration::from_millis(10)); // EAGAIN (SO_RCVTIMEO) etc.
+                        continue;
+                    }
+                    if n == 0 {
+                        continue;
+                    }
+                    if let Some(seg) = parse_tcp_segment(&buf[..n as usize]) {
+                        if seg.rst && (seg.src_port == port || seg.dst_port == port) {
+                            rsts.push(format!(
+                                "RST src={} dst={} seq={} ack={}",
+                                seg.src_port, seg.dst_port, seg.seq, seg.ack
+                            ));
+                        }
+                    }
+                }
+                rsts
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn loopback_roundtrip_repair() {
+        if !root_test() {
+            skip();
+            return;
+        }
+        // Force the repair takeover explicitly: these tests read a process-global
+        // env var, so they must run serially (--test-threads=1) and each pin its
+        // own mode to avoid a parallel env race.
+        let _env = TakeoverEnv::set("repair");
+        crate::block_on(async {
+            let (c, s, _server) = pair_conns().await.unwrap();
+            assert!(matches!(c.takeover, Takeover::Repair));
+            c.send(b"ping-repair").unwrap();
+            let mut buf = [0u8; 64];
+            let n = crate::timeout(Duration::from_secs(2), s.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..n], b"ping-repair");
+        });
+    }
+
+    #[test]
+    fn loopback_roundtrip_iptables() {
+        if !root_test() {
+            skip();
+            return;
+        }
+        let _env = TakeoverEnv::set("iptables");
+        crate::block_on(async {
+            let (c, s, _server) = pair_conns().await.unwrap();
+            assert!(matches!(c.takeover, Takeover::Iptables));
+            c.send(b"ping-iptables").unwrap();
+            let mut buf = [0u8; 64];
+            let n = crate::timeout(Duration::from_secs(2), s.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..n], b"ping-iptables");
+        });
+    }
+
+    #[test]
+    fn forged_rst_does_not_kill_flow() {
+        if !root_test() {
+            skip();
+            return;
+        }
+        crate::block_on(async {
+            let (c, s, _server) = pair_conns().await.unwrap();
+            send_forged_rst(c.local_addr().unwrap(), s.local_addr().unwrap()).unwrap();
+            c.send(b"after-rst").unwrap();
+            let mut buf = [0u8; 64];
+            let n = crate::timeout(Duration::from_secs(2), s.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..n], b"after-rst");
+        });
+    }
+
+    #[test]
+    fn no_rst_on_wire_during_transfer_and_close() {
+        if !root_test() {
+            skip();
+            return;
+        }
+        crate::block_on(async {
+            let (c, s, _server) = pair_conns().await.unwrap();
+            let flow_addr = s.local_addr().unwrap(); // server conn: its port is one 4-tuple end
+            let sniffer = spawn_rst_sniffer(flow_addr);
+            for i in 0..50 {
+                c.send(&[i as u8; 16]).unwrap();
+            }
+            c.close();
+            s.close();
+            drop(c);
+            drop(s);
+            let rsts = sniffer.join().unwrap();
+            assert!(rsts.is_empty(), "kernel/peer emitted RST: {rsts:?}");
+        });
+    }
+
+    #[test]
+    fn iptables_rule_cleaned_on_close() {
+        if !root_test() {
+            skip();
+            return;
+        }
+        let _guard = TakeoverEnv::set("iptables");
+        crate::block_on(async {
+            let (c, s, _server) = pair_conns().await.unwrap();
+            let client = c.local_addr().unwrap();
+            let server = s.local_addr().unwrap();
+            let rule = ttl_drop_rule_client(
+                &client.ip().to_string(),
+                client.port(),
+                &server.ip().to_string(),
+                server.port(),
+            );
+            assert!(rule_exists(&rule));
+            c.close();
+            assert!(!rule_exists(&rule));
+        });
+    }
 }

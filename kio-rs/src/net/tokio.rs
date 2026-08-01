@@ -2,7 +2,7 @@
 
 use super::{raw_tcp_listener, raw_tcp_stream, raw_udp};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
@@ -67,8 +67,7 @@ impl UdpSocket {
         {
             let mut offset = 0;
             while offset < bufs.len() {
-                let refs: Vec<&[u8]> = bufs[offset..].iter().map(|b| b.as_ref()).collect();
-                match super::mmsg::sendmmsg_connected(self.inner.as_raw_fd(), &refs) {
+                match super::mmsg::sendmmsg_connected(self.inner.as_raw_fd(), &bufs[offset..]) {
                     Ok(n) if n > 0 => offset += n,
                     Ok(_) => self.inner.writable().await?,
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -77,7 +76,7 @@ impl UdpSocket {
                     Err(e) => return Err(e),
                 }
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -110,8 +109,7 @@ impl UdpSocket {
         {
             let mut offset = 0;
             while offset < bufs.len() {
-                let refs: Vec<&[u8]> = bufs[offset..].iter().map(|b| b.as_ref()).collect();
-                match super::mmsg::sendmmsg_to(self.inner.as_raw_fd(), &refs, &target) {
+                match super::mmsg::sendmmsg_to(self.inner.as_raw_fd(), &bufs[offset..], &target) {
                     Ok(n) if n > 0 => offset += n,
                     Ok(_) => self.inner.writable().await?,
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -120,7 +118,7 @@ impl UdpSocket {
                     Err(e) => return Err(e),
                 }
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -173,10 +171,10 @@ impl UdpSocket {
                             out.push((v, peer));
                         }
                     }
-                    return Ok(out.len());
+                    Ok(out.len())
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(0),
-                Err(e) => return Err(e),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -243,10 +241,18 @@ pub struct TcpStream {
 impl TcpStream {
     #[inline(always)]
     pub async fn connect(addr: impl AsRef<str>) -> io::Result<Self> {
+        let addr = addr.as_ref();
+        // Resolve DNS hostnames (server `-t` target), not just IP literals.
         let remote: SocketAddr = addr
-            .as_ref()
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            .to_socket_addrs()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("no address for {addr}"),
+                )
+            })?;
         let std_stream = raw_tcp_stream(remote)?;
         let s = tokio::net::TcpStream::from_std(std_stream)?;
         Ok(Self { inner: s })

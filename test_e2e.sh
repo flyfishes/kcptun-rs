@@ -263,6 +263,21 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
+# tcpraw --tcp transport (Linux+root only)
+# ═══════════════════════════════════════════════════════════════════════
+if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" = "0" ]; then
+    echo ""
+    echo "═══════ tcpraw --tcp transport ═══════"
+    # Use KCPTCP_TAKEOVER=repair to skip iptables requirement for e2e
+    export KCPTCP_TAKEOVER=repair
+    try_test "Rust→Go --tcp" "$RUST_SERVER" "--tcp --crypt none --nocomp" "$GO_CLIENT" "--crypt none --nocomp --tcp"
+    try_test "Go→Rust --tcp" "$GO_SERVER" "--crypt none --nocomp --tcp" "$RUST_CLIENT" "--tcp --crypt none --nocomp"
+    unset KCPTCP_TAKEOVER
+else
+    echo "  ⏭️  tcpraw --tcp tests skipped (needs Linux + root)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
 # Results
 # ═══════════════════════════════════════════════════════════════════════
 echo ""

@@ -14,3 +14,10 @@ twofish = "0.7"
 blowfish = "0.9"
 des = "0.8"
 aes-gcm = "0.10"
+crc32fast = "1"
+parking_lot = "0.12"
+
+[features]
+default = ["wire"]
+# Marker feature: wire framing (CryptoBuf / encrypt_batch / offload) is always compiled.
+wire = []

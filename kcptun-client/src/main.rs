@@ -51,6 +51,11 @@ const KCP_UPDATE_INTERVAL_MS: u64 = 2;
 // ─── Config (JSON config file support) ─────────────────────────────────────────-
 
 /// Configuration struct matching the kcptun JSON config format.
+///
+/// Numeric fields match Go kcptun: time/duration fields that may be negative
+/// (`autoexpire`, `scavengettl`, `keepalive`, `closewait`, `snmpperiod`) are
+/// signed `i64`; count/window/size fields are unsigned (u32/u64) and can't be
+/// negative. Negatives are clamped to 0 when applied to the KCP/SMUX config.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -60,8 +65,8 @@ pub struct Config {
     pub crypt: Option<String>,
     pub mode: Option<String>,
     pub conn: Option<u32>,
-    pub autoexpire: Option<u64>,
-    pub scavengettl: Option<u64>,
+    pub autoexpire: Option<i64>,
+    pub scavengettl: Option<i64>,
     pub mtu: Option<u32>,
     pub ratelimit: Option<u32>,
     pub sndwnd: Option<u32>,
@@ -80,10 +85,10 @@ pub struct Config {
     pub smuxbuf: Option<usize>,
     pub streambuf: Option<usize>,
     pub framesize: Option<usize>,
-    pub keepalive: Option<u64>,
-    pub closewait: Option<u64>,
+    pub keepalive: Option<i64>,
+    pub closewait: Option<i64>,
     pub snmplog: Option<String>,
-    pub snmpperiod: Option<u64>,
+    pub snmpperiod: Option<i64>,
     pub log: Option<String>,
     pub quiet: Option<bool>,
     pub tcp: Option<bool>,
@@ -98,14 +103,22 @@ pub struct Config {
 
 /// kcptun client -- accelerate TCP over KCP.
 #[derive(Debug, Parser)]
-#[command(name = "kcptun-client", about, version, disable_version_flag = true)]
+#[command(
+    name = "kcptun-client",
+    about,
+    version,
+    disable_version_flag = true,
+    allow_negative_numbers = true
+)]
 pub struct Cli {
     /// Local listening address.
     #[arg(short = 'l', long)]
     pub localaddr: Option<String>,
 
     /// Remote server address.
-    #[arg(short = 'r', long)]
+    /// May be an IP (`1.2.3.4:29900`), a DNS hostname (`vps:29900`), or a
+    /// multi-port range (`1.2.3.4:29900-29910`). Default matches Go kcptun.
+    #[arg(short = 'r', long, default_value = "vps:29900")]
     pub remoteaddr: Option<String>,
 
     /// Pre-shared secret between client and server.
@@ -127,11 +140,11 @@ pub struct Cli {
 
     /// Auto-expire connections after N seconds of inactivity.
     #[arg(long)]
-    pub autoexpire: Option<u64>,
+    pub autoexpire: Option<i64>,
 
     /// Scavenge TTL in seconds for expired connections.
     #[arg(long)]
-    pub scavengettl: Option<u64>,
+    pub scavengettl: Option<i64>,
 
     /// MTU value.
     #[arg(long)]
@@ -207,11 +220,11 @@ pub struct Cli {
 
     /// SMUX keepalive interval in seconds.
     #[arg(long)]
-    pub keepalive: Option<u64>,
+    pub keepalive: Option<i64>,
 
     /// Close wait timeout in seconds.
     #[arg(long)]
-    pub closewait: Option<u64>,
+    pub closewait: Option<i64>,
 
     /// SNMP log file path.
     #[arg(long)]
@@ -219,7 +232,7 @@ pub struct Cli {
 
     /// SNMP logging period in seconds.
     #[arg(long)]
-    pub snmpperiod: Option<u64>,
+    pub snmpperiod: Option<i64>,
 
     /// Log file path.
     #[arg(long)]
@@ -254,31 +267,33 @@ pub struct Cli {
     /// Print version and exit (Go-compatible: `-v` / `--version`).
     #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, default_value_t = false)]
     pub version_flag: bool,
+
+    /// Experimental: drive the KCP+FEC+crypto transport through the library
+    /// `kcp_rs::KcpConn` instead of the inlined UDP↔crypto↔FEC↔KCP loops
+    /// (M1-A prototype; default off). Also honors `KCPTUN_USE_LIB_KCP=1`.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub experimental_lib_kcp: bool,
 }
 
 impl Cli {
     /// Merge CLI args with config file, CLI taking precedence.
     fn merge(cli: Self, cfg: Config) -> Self {
         Cli {
-            localaddr: cli.localaddr.or(cfg.localaddr),
-            remoteaddr: cli.remoteaddr.or(cfg.remoteaddr),
-            key: cli.key.or(cfg.key),
-            crypt: cli.crypt.or(cfg.crypt),
-            mode: cli.mode.or(cfg.mode),
-            conn: cli.conn.or(cfg.conn),
-            autoexpire: cli.autoexpire.or(cfg.autoexpire),
-            scavengettl: cli.scavengettl.or(cfg.scavengettl),
-            mtu: cli.mtu.or(cfg.mtu),
-            ratelimit: if cli.ratelimit != 0 {
-                cli.ratelimit
-            } else {
-                cfg.ratelimit.unwrap_or(0)
-            },
-            sndwnd: cli.sndwnd.or(cfg.sndwnd),
-            rcvwnd: cli.rcvwnd.or(cfg.rcvwnd),
-            datashard: cli.datashard.or(cfg.datashard),
-            parityshard: cli.parityshard.or(cfg.parityshard),
-            dscp: cli.dscp.or(cfg.dscp),
+            localaddr: cfg.localaddr.or(cli.localaddr),
+            remoteaddr: cfg.remoteaddr.or(cli.remoteaddr),
+            key: cfg.key.or(cli.key),
+            crypt: cfg.crypt.or(cli.crypt),
+            mode: cfg.mode.or(cli.mode),
+            conn: cfg.conn.or(cli.conn),
+            autoexpire: cfg.autoexpire.or(cli.autoexpire),
+            scavengettl: cfg.scavengettl.or(cli.scavengettl),
+            mtu: cfg.mtu.or(cli.mtu),
+            ratelimit: cfg.ratelimit.unwrap_or(cli.ratelimit),
+            sndwnd: cfg.sndwnd.or(cli.sndwnd),
+            rcvwnd: cfg.rcvwnd.or(cli.rcvwnd),
+            datashard: cfg.datashard.or(cli.datashard),
+            parityshard: cfg.parityshard.or(cli.parityshard),
+            dscp: cfg.dscp.or(cli.dscp),
             nocomp: if cli.nocomp {
                 true
             } else {
@@ -289,20 +304,20 @@ impl Cli {
             } else {
                 cfg.acknodelay.unwrap_or(false)
             },
-            nodelay: cli.nodelay.or(cfg.nodelay),
-            interval: cli.interval.or(cfg.interval),
-            resend: cli.resend.or(cfg.resend),
-            nc: cli.nc.or(cfg.nc),
-            sockbuf: cli.sockbuf.or(cfg.sockbuf),
-            smuxver: cli.smuxver.or(cfg.smuxver),
-            smuxbuf: cli.smuxbuf.or(cfg.smuxbuf),
-            streambuf: cli.streambuf.or(cfg.streambuf),
-            framesize: cli.framesize.or(cfg.framesize),
-            keepalive: cli.keepalive.or(cfg.keepalive),
-            closewait: cli.closewait.or(cfg.closewait),
-            snmplog: cli.snmplog.or(cfg.snmplog),
-            snmpperiod: cli.snmpperiod.or(cfg.snmpperiod),
-            log: cli.log.or(cfg.log),
+            nodelay: cfg.nodelay.or(cli.nodelay),
+            interval: cfg.interval.or(cli.interval),
+            resend: cfg.resend.or(cli.resend),
+            nc: cfg.nc.or(cli.nc),
+            sockbuf: cfg.sockbuf.or(cli.sockbuf),
+            smuxver: cfg.smuxver.or(cli.smuxver),
+            smuxbuf: cfg.smuxbuf.or(cli.smuxbuf),
+            streambuf: cfg.streambuf.or(cli.streambuf),
+            framesize: cfg.framesize.or(cli.framesize),
+            keepalive: cfg.keepalive.or(cli.keepalive),
+            closewait: cfg.closewait.or(cli.closewait),
+            snmplog: cfg.snmplog.or(cli.snmplog),
+            snmpperiod: cfg.snmpperiod.or(cli.snmpperiod),
+            log: cfg.log.or(cli.log),
             quiet: if cli.quiet {
                 true
             } else {
@@ -313,7 +328,7 @@ impl Cli {
             } else {
                 cfg.tcp.unwrap_or(false)
             },
-            pprof: cli.pprof.or(cfg.pprof),
+            pprof: cfg.pprof.or(cli.pprof),
             #[cfg(feature = "qpp")]
             qpp: if cli.qpp {
                 true
@@ -321,9 +336,10 @@ impl Cli {
                 cfg.qpp.unwrap_or(false)
             },
             #[cfg(feature = "qpp")]
-            qppcount: cli.qppcount.or(cfg.qppcount),
+            qppcount: cfg.qppcount.or(cli.qppcount),
             c: cli.c,            // CLI --c/-c flag only, not in Config struct
             version_flag: false, // never from config file
+            experimental_lib_kcp: cli.experimental_lib_kcp,
         }
     }
 }
@@ -403,16 +419,6 @@ struct KcpConn {
     /// buffer) handed directly by the output callback — no per-packet
     /// `Vec` alloc + `extend_from_slice` copy (R2: output Bytes pipeline).
     raw_packets: Arc<parking_lot::Mutex<Vec<bytes::Bytes>>>,
-    /// Shared atomic counter of KCP wait_send, updated by the flush loop.
-    /// Read by SmuxIo::poll_write for backpressure.
-    wait_send: Arc<AtomicUsize>,
-    /// KCP send window size, used for backpressure threshold.
-    snd_wnd: usize,
-    /// Notify for waking up writers blocked by backpressure.
-    /// The flush loop calls notify_waiters() after each flush cycle,
-    /// so blocked writers resume immediately when the window drains,
-    /// instead of waiting for a 10ms sleep timeout.
-    write_notify: Arc<kio::Notify>,
     /// Disable snappy compression at the SMUX session level.
     /// Must match Go kcptun's --nocomp flag for interop.
     nocomp: bool,
@@ -428,7 +434,7 @@ struct KcpConn {
     /// Reusable encryption buffer with counter-based nonce (flush / data path).
     /// Eliminates per-packet vec![] allocation and rand::thread_rng() calls.
     /// All KCP segments produced by `KCP::flush()` are encrypted through this buffer.
-    crypto_buf: Arc<parking_lot::Mutex<kcp_rs::CryptoBuf>>,
+    crypto_buf: Arc<parking_lot::Mutex<kcrypt_rs::CryptoBuf>>,
     /// Separate CryptoBuf for UDP-reader ACK encrypt — avoids lock contention
     /// with the flush-loop batch encrypt on the shared crypto_buf.
     ///
@@ -438,7 +444,7 @@ struct KcpConn {
     ///   would serialize behind that work and delay ACKs, causing retransmits.
     /// - Using a distinct buffer also gives ACKs their own nonce counter range,
     ///   so even if both paths interleave, nonces never collide.
-    ack_crypto_buf: Arc<parking_lot::Mutex<kcp_rs::CryptoBuf>>,
+    ack_crypto_buf: Arc<parking_lot::Mutex<kcrypt_rs::CryptoBuf>>,
     /// Notify for waking up the flush loop immediately when SMUX streams
     /// have new data to send. Eliminates the 0~10ms wait of the fixed
     /// sleep interval.
@@ -572,19 +578,16 @@ impl KcpConn {
             nocomp,
             acknodelay,
             raw_packets,
-            wait_send: Arc::new(AtomicUsize::new(0)),
-            snd_wnd: sndwnd as usize,
-            write_notify: Arc::new(kio::Notify::new()),
             last_activity: Arc::new(AtomicU64::new(kio::mono_ms())),
             compressor: Arc::new(parking_lot::Mutex::new(snap::write::FrameEncoder::new(
                 Vec::new(),
             ))),
-            crypto_buf: Arc::new(parking_lot::Mutex::new(kcp_rs::CryptoBuf::new(
+            crypto_buf: Arc::new(parking_lot::Mutex::new(kcrypt_rs::CryptoBuf::new(
                 DEFAULT_CONV as u64,
             ))),
             // Distinct session_id so ACK nonces never collide with data-path nonces.
             // XOR with a recognizable constant makes it easy to spot in traces.
-            ack_crypto_buf: Arc::new(parking_lot::Mutex::new(kcp_rs::CryptoBuf::new(
+            ack_crypto_buf: Arc::new(parking_lot::Mutex::new(kcrypt_rs::CryptoBuf::new(
                 (DEFAULT_CONV as u64) ^ 0xA11C_B0FF_u64,
             ))),
             flush_notify: Arc::new(kio::Notify::new()),
@@ -628,8 +631,6 @@ impl KcpConn {
         let has_encryption1 = has_encryption;
         let has_aead1 = crypt1.is_aead();
         let crypto_buf1 = self.ack_crypto_buf.clone();
-        let write_notify1 = self.write_notify.clone();
-        let wait_send1 = self.wait_send.clone();
         let flush_notify1 = self.flush_notify.clone();
         let fec_decoder1 = self.fec_decoder.clone();
         let fec_encoder1 = self.fec_encoder.clone();
@@ -694,28 +695,25 @@ impl KcpConn {
                     // Body offset into buf after successful in-place decrypt.
                     let mut cfb_body_off: Option<usize> = None;
                     if has_encryption1 && !has_aead1 {
-                    // All BlockCrypt ciphers (including xor/salsa20) use the standard
-                    // 20-byte CFB header: [nonce 16B][CRC32 4B][KCP segment]
-                    match kcp_rs::decrypt_cfb_in_place(
-                    &mut buf[..n],
-                    crypt1.as_ref(),
-                    false,
-                ) {
-                    Ok(body) => {
-                        cfb_body_off = Some(n - body.len());
-                    }
-                    Err(_) => {
-                        kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
-                        match socket1.try_recv(&mut buf) {
-                            Ok(m) if m > 0 => {
-                                n = m;
-                                continue;
+                        // All BlockCrypt ciphers (including xor/salsa20) use the standard
+                        // 20-byte CFB header: [nonce 16B][CRC32 4B][KCP segment]
+                        match kcrypt_rs::decrypt_cfb_in_place(&mut buf[..n], crypt1.as_ref(), false)
+                        {
+                            Ok(body) => {
+                                cfb_body_off = Some(n - body.len());
                             }
-                            _ => break,
+                            Err(_) => {
+                                kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
+                                match socket1.try_recv(&mut buf) {
+                                    Ok(m) if m > 0 => {
+                                        n = m;
+                                        continue;
+                                    }
+                                    _ => break,
+                                }
+                            }
                         }
                     }
-                }
-            }
 
                     // Body view: AEAD owned, CFB payload slice, or null full buf.
                     let input: &[u8] = if let Some(ref plain) = aead_plain {
@@ -723,7 +721,7 @@ impl KcpConn {
                     } else if let Some(off) = cfb_body_off {
                         &buf[off..n]
                     } else {
-                        kcp_rs::inbound_null(&buf[..n])
+                        kcrypt_rs::inbound_null(&buf[..n])
                     };
 
                     // Inbound CPU offload is permanently disabled: the decrypt + KCP input + SMUX
@@ -842,24 +840,6 @@ impl KcpConn {
                         }
                     }
 
-                    // ── Notify writers after ACK processing ──
-                    // Go's kcpInput() calls notifyWriteEvent() when waitsnd < snd_wnd
-                    // after processing incoming ACKs. This wakes up blocked writers
-                    // immediately, rather than waiting for the next flush cycle.
-                    {
-                        let kcp_guard = kcp1.lock();
-                        let ws = kcp_guard.wait_send() as usize;
-                        let snd_wnd = kcp_guard.snd_wnd() as usize;
-                        // Update the shared wait_send counter immediately so
-                        // poll_write sees the current (post-ACK) value instead
-                        // of the stale value from the last flush cycle. This
-                        // prevents false backpressure from blocking writers.
-                        wait_send1.store(ws, Ordering::Relaxed);
-                        if ws < snd_wnd {
-                            write_notify1.notify_waiters();
-                        }
-                    }
-
                     // ── Drain and send ACKs collected during input() ──
                     // FEC-encode then encrypt inline, then batch-send to reduce
                     // per-packet syscall overhead (sendmmsg on Linux).
@@ -935,8 +915,6 @@ impl KcpConn {
         let crypt2 = crypt.clone();
         let has_encryption2 = has_encryption;
         let has_aead2 = crypt2.is_aead();
-        let wait_send2 = self.wait_send.clone();
-        let write_notify2 = self.write_notify.clone();
         let compressor2 = self.compressor.clone();
         let crypto_buf2 = self.crypto_buf.clone();
         let smuxver = self.smux.version();
@@ -1067,7 +1045,7 @@ impl KcpConn {
                     // tokio worker thread, preventing it from processing UDP recv /
                     // ACKs. The throughput cost of blocking the worker far exceeds
                     // the latency cost of a second pool hop.
-                    let compressed = if kcp_rs::should_cpu_block_compress(plain_len) {
+                    let compressed = if kcrypt_rs::should_cpu_block_compress(plain_len) {
                         kio::cpu_block(compress_fn).await
                     } else {
                         compress_fn()
@@ -1142,11 +1120,6 @@ impl KcpConn {
                     } else {
                         next_update = next_update.clamp(1, KCP_UPDATE_INTERVAL_MS);
                     }
-                    // Update shared wait_send counter for poll_write backpressure
-                    wait_send2.store(ws, Ordering::Relaxed);
-                    // Wake up any writers blocked by backpressure — they'll
-                    // re-check wait_send() and resume if the window drained.
-                    write_notify2.notify_waiters();
                 }
 
                 // ── Encrypt + send raw KCP packets OUTSIDE the KCP lock ──
@@ -1181,7 +1154,7 @@ impl KcpConn {
                     };
 
                     let total_bytes: usize = packets.iter().map(|p| p.len()).sum();
-                    let use_cpu_block = kcp_rs::should_cpu_block_encrypt(
+                    let use_cpu_block = kcrypt_rs::should_cpu_block_encrypt(
                         has_encryption2,
                         has_aead2,
                         packets.len(),
@@ -1202,7 +1175,7 @@ impl KcpConn {
                         let crypt_c = crypt_sb.clone();
                         let cb_c = crypto_buf_sb.clone();
                         enc_out = kio::cpu_block(move || {
-                            kcp_rs::encrypt_batch(
+                            kcrypt_rs::encrypt_batch(
                                 packets,
                                 crypt_c.as_ref(),
                                 &cb_c,
@@ -1213,7 +1186,7 @@ impl KcpConn {
                         .await;
                     } else {
                         kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.encrypt_inline, 1);
-                        kcp_rs::encrypt_batch_into(
+                        kcrypt_rs::encrypt_batch_into(
                             packets,
                             crypt_sb.as_ref(),
                             &crypto_buf_sb,
@@ -1226,7 +1199,13 @@ impl KcpConn {
                     // Rate limit the send (token bucket, 0 = unlimited).
                     {
                         let total_bytes: usize = encrypted.iter().map(|b| b.len()).sum();
-                        rate_limiter2.acquire(total_bytes);
+                        loop {
+                            let wait = rate_limiter2.acquire(total_bytes);
+                            if wait.is_zero() {
+                                break;
+                            }
+                            kio::sleep(wait).await;
+                        }
                     }
 
                     match socket2.send_batch(&encrypted).await {
@@ -1326,6 +1305,404 @@ impl KcpConn {
         now > deadline
     }
 }
+
+// ─── Session handle abstraction (legacy vs library KcpConn) ────────────────────
+
+/// Common surface used by the accept loop / scavenger so the M1-A library path
+/// (`LibKcpConn`) can coexist with the legacy `KcpConn` behind
+/// `--experimental-lib-kcp` (default off).
+trait SessionHandle: Send + Sync {
+    fn is_dead(&self) -> bool;
+    fn is_expired(&self, autoexpire_secs: u64, scavengettl_secs: u64) -> bool;
+    fn open_stream(&self) -> Result<Arc<smux_rs::stream::Stream>, smux_rs::SessionError>;
+    fn send_syn(&self, stream_id: u32) -> Result<()>;
+    fn remove_stream(&self, id: u32);
+    fn mark_dead(&self);
+    fn close_session(&self);
+    fn flush_notify(&self) -> Arc<kio::Notify>;
+}
+
+impl SessionHandle for KcpConn {
+    fn is_dead(&self) -> bool {
+        KcpConn::is_dead(self)
+    }
+    fn is_expired(&self, autoexpire_secs: u64, scavengettl_secs: u64) -> bool {
+        KcpConn::is_expired(self, autoexpire_secs, scavengettl_secs)
+    }
+    fn open_stream(&self) -> Result<Arc<smux_rs::stream::Stream>, smux_rs::SessionError> {
+        self.session().open_stream()
+    }
+    fn send_syn(&self, stream_id: u32) -> Result<()> {
+        let syn = smux_rs::Frame::new(smux_rs::Cmd::Syn, stream_id, Bytes::new())
+            .with_ver(self.smux.version());
+        self.send_frame(&syn)?;
+        self.kcp.lock().flush();
+        self.flush_notify.notify_one();
+        Ok(())
+    }
+    fn remove_stream(&self, id: u32) {
+        self.session().remove_stream(id);
+    }
+    fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+    }
+    fn close_session(&self) {
+        self.smux.close();
+    }
+    fn flush_notify(&self) -> Arc<kio::Notify> {
+        self.flush_notify.clone()
+    }
+}
+
+/// M1-A library-stack session: `kcp_rs::KcpConn` (+ crypto/FEC via
+/// `CryptoTransport`) with SMUX + Snappy scheduling still owned here, in the
+/// binary — reading/writing the library `KcpConn` instead of raw KCP.
+///
+/// Two tasks (reader / flush) share the lib `KcpConn` through an async mutex;
+/// the reader keeps draining inbound data even while the flush task blocks on
+/// send-window backpressure (the library `KcpConn` internal loops buffer it).
+struct LibKcpConn {
+    smux: Arc<smux_rs::Session>,
+    _handles: Vec<kio::JoinHandle<()>>,
+    flush_notify: Arc<kio::Notify>,
+    dead: Arc<AtomicBool>,
+    last_activity: Arc<AtomicU64>,
+}
+
+impl LibKcpConn {
+    async fn new(
+        remote_addr: SocketAddr,
+        key: &[u8; 32],
+        cfg: &SessionConfig,
+        socket: Arc<kio::DatagramSocket>,
+    ) -> Result<Self> {
+        // Mirror the legacy client's config (mode / windows / FEC / knobs) into
+        // the library CLI params; `dial_kcp_session` applies them via KcpConfig.
+        let params = kcptun_common::KcpCliParams {
+            mode: cfg.mode.clone(),
+            mtu: cfg.mtu,
+            sndwnd: cfg.sndwnd,
+            rcvwnd: cfg.rcvwnd,
+            datashard: cfg.datashard,
+            parityshard: cfg.parityshard,
+            acknodelay: cfg.acknodelay,
+            nodelay: cfg.nodelay,
+            interval: cfg.interval,
+            resend: cfg.resend,
+            nc: cfg.nc,
+            conv: DEFAULT_CONV,
+            token: 0,
+        };
+        let lib_kcp =
+            kcptun_common::dial_kcp_session(socket, remote_addr, key, &cfg.crypt, &params).await?;
+        let smux_cfg = smux_rs::Config {
+            version: cfg.smuxver,
+            max_receive_buffer: cfg.smuxbuf,
+            max_stream_buffer: cfg.streambuf,
+            max_frame_size: cfg.framesize,
+            keepalive_interval: cfg.keepalive,
+            keepalive_timeout: if cfg.keepalive == 0 {
+                0
+            } else {
+                cfg.keepalive.saturating_mul(3).max(1)
+            },
+        };
+        let smux = Arc::new(smux_rs::Session::new_client(&smux_cfg)?);
+
+        // lib_kcp is owned directly by the single session loop (no Mutex): a
+        // two-task reader/writer split starves the reader when a write blocks
+        // on backpressure (observed 0-byte inbound under aes+FEC+comp).
+        let compressor = Arc::new(parking_lot::Mutex::new(snap::write::FrameEncoder::new(
+            Vec::new(),
+        )));
+        let flush_notify = Arc::new(kio::Notify::new());
+        let dead = Arc::new(AtomicBool::new(false));
+        let last_activity = Arc::new(AtomicU64::new(kio::mono_ms()));
+        let rate_limiter = Arc::new(kcptun_common::RateLimiter::new(cfg.ratelimit));
+        let nocomp = cfg.nocomp;
+
+        // Shared via `&self` read/write methods (`read_shared` /
+        // `write_all_shared`): the reader ACKs inbound while the writer blocks
+        // on outbound backpressure — true concurrency, no shared mutex (a
+        // single-task loop that blocks in `write_all` stops reading and the
+        // peer's send window stalls).
+        let lib_kcp = Arc::new(lib_kcp);
+        let handles = vec![
+            kio::spawn_task(lib_read_loop(
+                lib_kcp.clone(),
+                smux.clone(),
+                flush_notify.clone(),
+                dead.clone(),
+                last_activity.clone(),
+                nocomp,
+            )),
+            kio::spawn_task(lib_flush_loop(
+                lib_kcp,
+                smux.clone(),
+                compressor.clone(),
+                flush_notify.clone(),
+                dead.clone(),
+                rate_limiter.clone(),
+                nocomp,
+            )),
+        ];
+
+        Ok(LibKcpConn {
+            smux,
+            _handles: handles,
+            flush_notify,
+            dead,
+            last_activity,
+        })
+    }
+}
+
+impl SessionHandle for LibKcpConn {
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+            || self.smux.is_closed()
+            || self.smux.is_keepalive_timeout()
+    }
+    fn is_expired(&self, autoexpire_secs: u64, scavengettl_secs: u64) -> bool {
+        let now = kio::mono_ms();
+        let deadline = self.last_activity.load(Ordering::Relaxed)
+            + (autoexpire_secs + scavengettl_secs) * 1000;
+        now > deadline
+    }
+    fn open_stream(&self) -> Result<Arc<smux_rs::stream::Stream>, smux_rs::SessionError> {
+        self.smux.open_stream()
+    }
+    fn send_syn(&self, stream_id: u32) -> Result<()> {
+        // Queue the SYN into the SMUX outbound stream; the flush task emits it
+        // (prepare_outbound_into drains pending_syns) within the next cycle.
+        self.smux.queue_syn(stream_id);
+        self.flush_notify.notify_one();
+        Ok(())
+    }
+    fn remove_stream(&self, id: u32) {
+        self.smux.remove_stream(id);
+    }
+    fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+    }
+    fn close_session(&self) {
+        self.smux.close();
+    }
+    fn flush_notify(&self) -> Arc<kio::Notify> {
+        self.flush_notify.clone()
+    }
+}
+
+/// Library-stack **reader** task. Drains the lib `KcpConn` (via `&self`
+/// `read_shared`, so it runs concurrently with the writer), decompresses, and
+/// feeds SMUX. Runs until the connection dies / closes.
+async fn lib_read_loop(
+    lib_kcp: Arc<kcp_rs::KcpConn>,
+    smux: Arc<smux_rs::Session>,
+    flush_notify: Arc<kio::Notify>,
+    dead: Arc<AtomicBool>,
+    last_activity: Arc<AtomicU64>,
+    nocomp: bool,
+) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut snappy_dec = if nocomp {
+        None
+    } else {
+        Some(SnappyStreamDecoder::new())
+    };
+    loop {
+        if dead.load(Ordering::Acquire) || smux.is_closed() || lib_kcp.is_closed() {
+            break;
+        }
+        let n = match lib_kcp.read_shared(&mut buf).await {
+            Ok(0) => {
+                error!("lib KCP EOF — remote closed");
+                break;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                error!("lib KCP read error: {}", e);
+                kio::sleep_ms(100).await;
+                continue;
+            }
+        };
+        last_activity.store(kio::mono_ms(), Ordering::Relaxed);
+        if !nocomp {
+            if let Some(ref mut sd) = snappy_dec {
+                if let Ok(dec) = sd.feed(&buf[..n]) {
+                    if !dec.is_empty() {
+                        if let Err(e) = smux.process_data(&dec) {
+                            warn!("SMUX process_data error: {:?}", e);
+                        }
+                        flush_notify.notify_one();
+                    }
+                }
+            }
+        } else if let Err(e) = smux.process_data(&buf[..n]) {
+            warn!("SMUX process_data error: {:?}", e);
+            flush_notify.notify_one();
+        } else {
+            flush_notify.notify_one();
+        }
+    }
+    dead.store(true, Ordering::Release);
+    smux.close();
+}
+
+/// Library-stack **writer** task. Drains SMUX streams, compresses, and writes
+/// to the lib `KcpConn` (via `&self` `write_all_shared`, so it can block on
+/// backpressure without stalling the reader). Also drives keepalive / dead-link
+/// checks.
+async fn lib_flush_loop(
+    lib_kcp: Arc<kcp_rs::KcpConn>,
+    smux: Arc<smux_rs::Session>,
+    compressor: Arc<parking_lot::Mutex<snap::write::FrameEncoder<Vec<u8>>>>,
+    flush_notify: Arc<kio::Notify>,
+    dead: Arc<AtomicBool>,
+    rate_limiter: Arc<kcptun_common::RateLimiter>,
+    nocomp: bool,
+) {
+    let smuxver = smux.version();
+    let mut out_buf = bytes::BytesMut::with_capacity(64 * 1024);
+    const MAX_DRAIN_BYTES: usize = 64 * 1024;
+    let mut health_left: u32 = 0;
+    loop {
+        if dead.load(Ordering::Acquire) || smux.is_closed() || lib_kcp.is_closed() {
+            break;
+        }
+        let _ = kio::timeout(Duration::from_millis(2), flush_notify.notified()).await;
+        if dead.load(Ordering::Acquire) || smux.is_closed() || lib_kcp.is_closed() {
+            break;
+        }
+
+        // ── health checks every ~100ms (dead_link / keepalive) ──
+        if health_left == 0 {
+            health_left = 50;
+            if lib_kcp.is_dead() || lib_kcp.is_closed() {
+                error!("lib KCP dead_link — closing SMUX session");
+                break;
+            }
+            if smux.is_keepalive_timeout() {
+                error!("SMUX keepalive timeout — closing session");
+                break;
+            }
+            if smux.check_keepalive() {
+                let nop = smux.keepalive_frame();
+                nop.encode(&mut out_buf);
+                smux.mark_keepalive_sent();
+            }
+        } else {
+            health_left -= 1;
+        }
+
+        // ── drain SMUX streams (PSH / SYN / FIN / UPD) ──
+        let fin_ids = smux.prepare_outbound_into(&mut out_buf, MAX_DRAIN_BYTES, smuxver);
+
+        // Reap fully closed / local-closed-past-linger streams (legacy 30s).
+        const STREAM_LINGER_SECS: u64 = 30;
+        {
+            let streams = smux.streams();
+            let mut stream_map = streams.lock();
+            let linger = Duration::from_secs(STREAM_LINGER_SECS);
+            let to_remove: Vec<u32> = stream_map
+                .iter()
+                .filter(|(_, s)| {
+                    if s.is_local_closed() && s.is_remote_closed() && s.is_fin_sent() {
+                        return true;
+                    }
+                    if s.is_local_closed() && s.pending_send() == 0 {
+                        if let Some(e) = s.local_closed_elapsed() {
+                            return e >= linger;
+                        }
+                    }
+                    false
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &to_remove {
+                if let Some(s) = stream_map.remove(id) {
+                    s.close();
+                }
+            }
+        }
+
+        // Compress (session level); large batches offload to cpu_block.
+        let send_data: Option<bytes::Bytes> = if out_buf.is_empty() {
+            None
+        } else if !nocomp {
+            use std::io::Write;
+            let plain = out_buf.split().freeze();
+            let plain_len = plain.len();
+            let compress_fn = {
+                let compressor = compressor.clone();
+                move || -> bytes::Bytes {
+                    let mut enc = compressor.lock();
+                    enc.write_all(&plain).ok();
+                    enc.flush().ok();
+                    std::mem::take::<Vec<u8>>(enc.get_mut()).into()
+                }
+            };
+            let compressed = if kcrypt_rs::should_cpu_block_compress(plain_len) {
+                kio::cpu_block(compress_fn).await
+            } else {
+                compress_fn()
+            };
+            if compressed.is_empty() {
+                None
+            } else {
+                Some(compressed)
+            }
+        } else {
+            Some(out_buf.split().freeze())
+        };
+
+        if let Some(to_send) = send_data {
+            if !to_send.is_empty() {
+                loop {
+                    let wait = rate_limiter.acquire(to_send.len());
+                    if wait.is_zero() {
+                        break;
+                    }
+                    kio::sleep(wait).await;
+                }
+                // Block on backpressure; the reader runs concurrently, so it
+                // keeps ACKing the peer's inbound while we wait. The lib KcpConn
+                // auto-close wakes us with an error on a dead peer.
+                match lib_kcp.write_all_shared(&to_send).await {
+                    Ok(()) => {
+                        if !fin_ids.is_empty() {
+                            smux.mark_fins_sent(&fin_ids);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("lib KCP write error: {}", e);
+                        if lib_kcp.is_closed() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    dead.store(true, Ordering::Release);
+    smux.close();
+}
+
+/// Build a session handle for the given remote (legacy or library stack).
+async fn build_session(
+    use_lib_kcp: bool,
+    remote: SocketAddr,
+    key: &[u8; 32],
+    cfg: &SessionConfig,
+    socket: Arc<kio::DatagramSocket>,
+) -> Result<Box<dyn SessionHandle>> {
+    if use_lib_kcp {
+        Ok(Box::new(LibKcpConn::new(remote, key, cfg, socket).await?))
+    } else {
+        Ok(Box::new(KcpConn::new(remote, key, cfg, socket).await?))
+    }
+}
+
 /// Handle a single client connection: pipe between local TCP and SMUX stream
 /// with optional QPP. Compression is handled at the KCP/SMUX session level
 /// (matching Go kcptun architecture).
@@ -1334,22 +1711,15 @@ impl KcpConn {
 async fn handle_client(
     local: kio::TcpStream,
     smux_stream: Arc<smux_rs::stream::Stream>,
-    wait_send: Arc<AtomicUsize>,
-    snd_wnd: usize,
     qpp_enabled: bool,
     qpp_key: Vec<u8>,
     qpp_count: u16,
+    quiet: bool,
     flush_notify: Arc<kio::Notify>,
-    write_notify: Arc<kio::Notify>,
     closewait: u64,
 ) -> Result<()> {
-    let smux_async = smux_rs::SmuxIo::with_backpressure(
-        smux_stream.clone(),
-        flush_notify,
-        wait_send,
-        snd_wnd,
-        write_notify,
-    );
+    smux_stream.set_flush_notify(flush_notify.clone());
+    let smux_async = smux_rs::SmuxIo::new(smux_stream.clone(), flush_notify);
 
     // Use closewait (from --closewait) as the post-copy grace period.
     // Matches Go kcptun semantics: after both sides reach EOF, wait closewait
@@ -1391,7 +1761,9 @@ async fn handle_client(
             let qpp_suffix = if qpp_enabled { " (QPP)" } else { "" };
             #[cfg(not(feature = "qpp"))]
             let qpp_suffix = "";
-            info!("pipe completed: {} sent, {} recv{}", a, b, qpp_suffix);
+            if !quiet {
+                info!("pipe completed: {} sent, {} recv{}", a, b, qpp_suffix);
+            }
         }
         Err(e) => {
             warn!("pipe error: {}", e);
@@ -1404,11 +1776,48 @@ async fn handle_client(
 
 fn main() -> Result<()> {
     // Runtime-shaped cpu_block thresholds only (no wire change).
-    kcp_rs::set_offload_profile(match kio::runtime_kind() {
-        kio::RuntimeKind::Tokio => kcp_rs::OffloadProfile::Tokio,
-        kio::RuntimeKind::Smol => kcp_rs::OffloadProfile::Smol,
+    kcrypt_rs::set_offload_profile(match kio::runtime_kind() {
+        kio::RuntimeKind::Tokio => kcrypt_rs::OffloadProfile::Tokio,
+        kio::RuntimeKind::Smol => kcrypt_rs::OffloadProfile::Smol,
     });
     kio::block_on(async_main())
+}
+
+/// Create the datagram transport for a client connection, honoring `--tcp`.
+///
+/// TCP mode dials a Linux raw-TCP socket (tcpraw); UDP mode uses a plain UDP
+/// socket. Mirrors Go kcptun's `dial()` which routes to `tcpraw.Dial` when
+/// `config.TCP`. Both the initial dial and the reconnect path use this so a
+/// `--tcp` session always re-dials TCP (never silently falling back to UDP).
+fn create_client_socket(
+    remote: SocketAddr,
+    tcp: bool,
+    sockbuf: u32,
+    dscp: u32,
+) -> anyhow::Result<Arc<kio::DatagramSocket>> {
+    if tcp {
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("--tcp requires Linux (raw sockets + TCP_REPAIR)");
+        #[cfg(target_os = "linux")]
+        {
+            let conn = kio::tcpraw_dial(&remote).map_err(|e| {
+                anyhow::anyhow!(
+                    "tcpraw dial to {}: {} (needs Linux + CAP_NET_RAW/ADMIN, server --tcp up)",
+                    remote,
+                    e
+                )
+            })?;
+            if dscp > 0 {
+                if let Err(e) = conn.set_dscp(dscp) {
+                    log::warn!("SetDSCP({}) failed on tcpraw conn: {}", dscp, e);
+                }
+            }
+            Ok(Arc::new(kio::DatagramSocket::TcpRaw(conn)))
+        }
+    } else {
+        let socket = create_client_udp_socket(remote, sockbuf, dscp)?;
+        Ok(Arc::new(kio::DatagramSocket::Udp(socket)))
+    }
 }
 
 /// Create a connected UDP socket for a KCP client connection.
@@ -1468,7 +1877,8 @@ async fn async_main() -> Result<()> {
     // Example: RUST_LOG=kcptun_client=debug,kcp_rs=info cargo run --release
     //
     // Redirect to file when --log is specified (matching Go kcptun).
-    if let Some(ref log_path) = cli.log {
+    // Empty string (Go's default) means stderr.
+    if let Some(ref log_path) = cli.log.as_ref().filter(|s| !s.is_empty()) {
         rotate_log(log_path, 10 * 1024 * 1024);
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -1489,14 +1899,11 @@ async fn async_main() -> Result<()> {
     }
 
     let local_addr = cli.localaddr.as_deref().unwrap_or(":12948");
-    let remote_addr_str = cli
-        .remoteaddr
-        .as_deref()
-        .context("remote address (-r) is required")?;
+    let remote_addr_str = cli.remoteaddr.as_deref().unwrap_or("vps:29900");
 
-    let key_str = cli.key.as_deref().unwrap();
-    let crypt = cli.crypt.as_deref().unwrap();
-    let mode = cli.mode.as_deref().unwrap();
+    let key_str = cli.key.as_deref().unwrap_or("it's a secrect");
+    let crypt = cli.crypt.as_deref().unwrap_or("aes");
+    let mode = cli.mode.as_deref().unwrap_or("fast");
     let conn_count = cli.conn.unwrap_or(1).max(1);
     let mtu = cli.mtu.unwrap_or(1350);
     let sndwnd = cli.sndwnd.unwrap_or(128);
@@ -1504,6 +1911,7 @@ async fn async_main() -> Result<()> {
     let datashard = cli.datashard.unwrap_or(10);
     let parityshard = cli.parityshard.unwrap_or(3);
     let nocomp = cli.nocomp;
+    let quiet = cli.quiet;
     let acknodelay = cli.acknodelay;
     let nodelay = cli.nodelay.unwrap_or(0);
     let interval = cli.interval.unwrap_or(50);
@@ -1517,7 +1925,7 @@ async fn async_main() -> Result<()> {
     let keepalive = cli.keepalive.unwrap_or(10);
     let autoexpire = cli.autoexpire.unwrap_or(0);
     let scavengettl = cli.scavengettl.unwrap_or(600);
-    let closewait = cli.closewait.unwrap_or(0);
+    let closewait = cli.closewait.unwrap_or(0).max(0) as u64;
     let ratelimit = cli.ratelimit;
     let dscp = cli.dscp.unwrap_or(0);
     #[cfg(feature = "qpp")]
@@ -1564,7 +1972,7 @@ async fn async_main() -> Result<()> {
         smuxbuf,
         streambuf,
         framesize,
-        keepalive,
+        keepalive: keepalive.max(0) as u64,
         nocomp,
         ratelimit,
     };
@@ -1577,33 +1985,29 @@ async fn async_main() -> Result<()> {
     // Parse remote addresses (supports multi-port format)
     let remote_addrs = kcptun_common::parse_multi_port(remote_addr_str)?;
 
-    // Create KCP connection pool (shared with scavenger for auto-expire)
-    let conns = Arc::new(parking_lot::Mutex::new(Vec::with_capacity(
-        conn_count as usize,
-    )));
-    if cli.tcp {
-        #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("--tcp requires Linux (raw sockets + TCP_REPAIR)");
+    // Experimental library-stack path (M1-A prototype, default off). tcpraw is
+    // legacy-only for M1-A (plan §5.8); falls back silently when --tcp.
+    let use_lib_kcp = (cli.experimental_lib_kcp
+        || std::env::var("KCPTUN_USE_LIB_KCP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false))
+        && !cli.tcp;
+    if use_lib_kcp {
+        info!("experimental: using library KCP stack (kcp_rs::KcpConn)");
+    }
 
+    // Create KCP connection pool (shared with scavenger for auto-expire)
+    let conns: Arc<parking_lot::Mutex<Vec<Box<dyn SessionHandle>>>> = Arc::new(
+        parking_lot::Mutex::new(Vec::with_capacity(conn_count as usize)),
+    );
+    if cli.tcp {
         // TCP mode: single connection (TCP is point-to-point).
-        // Server must already be listening with --tcp; dial does a real TCP
-        // handshake then switches the socket into TCP_REPAIR + raw IP I/O.
-        #[cfg(target_os = "linux")]
-        {
-            let remote = remote_addrs[0];
-            info!("creating TCP raw KCP connection -> {}", remote);
-            let conn = kio::tcpraw_dial(&remote).map_err(|e| {
-                anyhow::anyhow!(
-                    "tcpraw dial to {}: {} (needs Linux + CAP_NET_RAW/ADMIN, server --tcp up)",
-                    remote,
-                    e
-                )
-            })?;
-            let socket = Arc::new(kio::DatagramSocket::TcpRaw(conn));
-            let conn = KcpConn::new(remote, &key, &session_cfg, socket).await?;
-            kcp_rs::DEFAULT_SNMP.session_opened(true);
-            conns.lock().push(conn);
-        }
+        let remote = remote_addrs[0];
+        info!("creating TCP raw KCP connection -> {}", remote);
+        let socket = create_client_socket(remote, true, sockbuf, dscp)?;
+        let conn = build_session(use_lib_kcp, remote, &key, &session_cfg, socket).await?;
+        kcp_rs::DEFAULT_SNMP.session_opened(true);
+        conns.lock().push(conn);
     } else {
         // UDP mode: create conn_count connections
         for i in 0..conn_count as usize {
@@ -1616,7 +2020,7 @@ async fn async_main() -> Result<()> {
             );
             let socket = create_client_udp_socket(remote, sockbuf, dscp)?;
             let socket = Arc::new(kio::DatagramSocket::Udp(socket));
-            let conn = KcpConn::new(remote, &key, &session_cfg, socket).await?;
+            let conn = build_session(use_lib_kcp, remote, &key, &session_cfg, socket).await?;
             kcp_rs::DEFAULT_SNMP.session_opened(true);
             conns.lock().push(conn);
         }
@@ -1642,7 +2046,7 @@ async fn async_main() -> Result<()> {
     // SNMP collection is off by default (zero hot-path cost). Enable only when
     // a log path is set and period > 0.
     if let Some(ref snmplog_path) = cli.snmplog {
-        let secs = cli.snmpperiod.unwrap_or(60);
+        let secs = cli.snmpperiod.unwrap_or(60).max(0) as u64;
         if secs > 0 && !snmplog_path.is_empty() {
             kcp_rs::snmp_enable();
             let period = Duration::from_secs(secs);
@@ -1679,8 +2083,8 @@ async fn async_main() -> Result<()> {
     if autoexpire > 0 {
         let s = stop_flag.clone();
         let scavenge_conns = conns.clone();
-        let scavenge_autoexpire = autoexpire;
-        let scavenge_ttl = scavengettl;
+        let scavenge_autoexpire = autoexpire.max(0) as u64;
+        let scavenge_ttl = scavengettl.max(0) as u64;
         kio::spawn_task(async move {
             // Matches Go kcptun: scavenger polls every 5 seconds and closes
             // sessions whose expiryDate (autoexpire + scavengettl) has passed.
@@ -1696,13 +2100,9 @@ async fn async_main() -> Result<()> {
                 let guard = scavenge_conns.lock();
                 for conn in guard.iter() {
                     if !conn.is_dead() && conn.is_expired(scavenge_autoexpire, scavenge_ttl) {
-                        info!(
-                            "scavenger: closing expired connection (last activity {}ms ago)",
-                            kio::mono_ms()
-                                .saturating_sub(conn.last_activity.load(Ordering::Relaxed))
-                        );
-                        conn.dead.store(true, Ordering::Release);
-                        conn.smux.close();
+                        info!("scavenger: closing expired connection");
+                        conn.mark_dead();
+                        conn.close_session();
                     }
                 }
             }
@@ -1757,9 +2157,8 @@ async fn async_main() -> Result<()> {
                             attempt + 1
                         );
                         let reconnect_res = {
-                            let socket = create_client_udp_socket(remote, sockbuf, dscp)?;
-                            let socket = Arc::new(kio::DatagramSocket::Udp(socket));
-                            KcpConn::new(remote, &key, &session_cfg, socket).await
+                            let socket = create_client_socket(remote, cli.tcp, sockbuf, dscp)?;
+                            build_session(use_lib_kcp, remote, &key, &session_cfg, socket).await
                         };
                         match reconnect_res {
                             Ok(new_conn) => {
@@ -1777,29 +2176,24 @@ async fn async_main() -> Result<()> {
                     let stream_result = {
                         let guard = conns.lock();
                         let c = &guard[idx];
-                        match c.session().open_stream() {
+                        match c.open_stream() {
                             Ok(s) => {
                                 let stream_id = s.id();
                                 debug!("sending SYN for stream {}", stream_id);
-                                let syn_frame =
-                                    smux_rs::Frame::new(smux_rs::Cmd::Syn, stream_id, Bytes::new())
-                                        .with_ver(c.session().version());
-                                if let Err(e) = c.send_frame(&syn_frame) {
+                                if let Err(e) = c.send_syn(stream_id) {
                                     error!("failed to send Syn frame: {}", e);
-                                    c.session().remove_stream(stream_id);
-                                    c.dead.store(true, Ordering::Release);
-                                    c.session().close();
+                                    c.remove_stream(stream_id);
+                                    c.mark_dead();
+                                    c.close_session();
                                     None
                                 } else {
-                                    c.kcp.lock().flush();
-                                    c.flush_notify.notify_one();
                                     Some(s)
                                 }
                             }
                             Err(e) => {
                                 error!("failed to open SMUX stream: {:?}", e);
-                                c.dead.store(true, Ordering::Release);
-                                c.session().close();
+                                c.mark_dead();
+                                c.close_session();
                                 None
                             }
                         }
@@ -1820,17 +2214,13 @@ async fn async_main() -> Result<()> {
                 };
 
                 let stream_id = smux_stream.id();
-                info!("accepted connection from {} (stream {})", peer, stream_id);
+                if !quiet {
+                    info!("accepted connection from {} (stream {})", peer, stream_id);
+                }
 
-                let (ws, sw, flush_notify_ref, write_notify_ref) = {
+                let flush_notify_ref = {
                     let guard = conns.lock();
-                    let c = &guard[idx];
-                    (
-                        c.wait_send.clone(),
-                        c.snd_wnd,
-                        c.flush_notify.clone(),
-                        c.write_notify.clone(),
-                    )
+                    guard[idx].flush_notify()
                 };
 
                 let qpp_key = key.to_vec();
@@ -1838,20 +2228,20 @@ async fn async_main() -> Result<()> {
                     if let Err(e) = handle_client(
                         local,
                         smux_stream,
-                        ws,
-                        sw,
                         qpp_enabled,
                         qpp_key,
                         qpp_count,
+                        quiet,
                         flush_notify_ref,
-                        write_notify_ref,
                         closewait,
                     )
                     .await
                     {
                         error!("client handler error (stream {}): {:?}", stream_id, e);
                     }
-                    info!("stream {} closed", stream_id);
+                    if !quiet {
+                        info!("stream {} closed", stream_id);
+                    }
                 });
             }
             Ok(Err(e)) => {
@@ -1975,6 +2365,7 @@ mod tests {
             qppcount: None,
             c: None,
             version_flag: false,
+            experimental_lib_kcp: false,
         };
         let cfg = Config {
             remoteaddr: Some("server:1234".into()),

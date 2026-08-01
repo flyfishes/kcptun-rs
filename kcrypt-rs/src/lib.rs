@@ -24,6 +24,12 @@
 //! | `3des`       | `BlockCrypt`| 8 B        | Triple-DES-CFB                 |
 //! | `aes-128-gcm`| `AeadCrypt` | 16 B       | AES-128-GCM (nonce + tag)      |
 //!
+//! ## Wire packing
+//!
+//! CFB/AEAD packet framing (`CryptoBuf`, `encrypt_batch`, offload heuristics)
+//! lives in [`wire`]. Prefer `kcrypt_rs::wire` (or the crate-root re-exports)
+//! over the old `kcp_rs::crypto_buf` path, which has been removed.
+//!
 //! ## Usage
 //!
 //! ```no_run
@@ -38,6 +44,13 @@
 pub mod cast5;
 pub mod crypt;
 pub mod des;
+pub mod wire;
 
 // Re-export the primary public API at the crate root for convenience.
 pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine};
+pub use wire::{
+    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null, offload_profile,
+    set_offload_profile, should_cpu_block_compress, should_cpu_block_decrypt,
+    should_cpu_block_encrypt, strip_cfb_header_if_present, CryptoBuf, InboundCryptError,
+    OffloadProfile, CRYPT_HDR, NONCE_SZ,
+};

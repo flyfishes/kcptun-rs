@@ -1,40 +1,49 @@
 //! High-level SMUX connection wrapper for standalone usage.
 //!
 //! `SmuxConn` wraps a [`Session`] with background read/write/keepalive tasks,
-//! so users can just `open_stream()` and use the returned [`SmuxIo`] with
-//! standard async I/O — no manual flush loop needed.
+//! so users can just `open_stream()` / `accept()` and use the returned
+//! [`Stream`] with standard async I/O — no manual flush loop needed.
 //!
-//! ## Quick start (simplest)
+//! ## Quick start (Builder, aligned with KcpConn)
 //!
-//! Pass your transport directly — `SmuxConn` takes ownership and drives it
-//! in a background task. You don't need to spawn anything.
+//! Pass your transport — `SmuxConn` takes ownership and drives it in a
+//! background task. Chain config, then `.build().await`.
 //!
 //! ```ignore
 //! use smux_rs::{SmuxConn, Config};
 //! use kio::{AsyncReadExt, AsyncWriteExt};
 //!
-//! // Client: connect and get a ready-to-use multiplexed connection
+//! // Client
 //! let tcp = kio::TcpStream::connect("127.0.0.1:8080").await?;
-//! let conn = SmuxConn::client(Config::default(), tcp)?;
+//! let conn = SmuxConn::connect(tcp)
+//!     .version(2)
+//!     .keepalive(10)
+//!     .build()
+//!     .await?;
 //!
-//! let mut stream = conn.open_stream()?;
-//! stream.write_all(b"hello").await?;
-//! let mut buf = [0u8; 1024];
-//! let n = stream.read(&mut buf).await?;
-//! ```
+//! let stream = conn.open_stream()?; // Arc<Stream>, flush notify set
+//! // Stream implements AsyncRead + AsyncWrite when you own &mut Stream;
+//! // wrap Arc with SmuxIo if needed.
 //!
-//! ```ignore
-//! // Server: accept a transport and serve streams
+//! // Server
 //! let (tcp, _) = listener.accept().await?;
-//! let conn = SmuxConn::server(Config::default(), tcp)?;
-//!
+//! let conn = SmuxConn::serve(tcp).version(2).build().await?;
 //! loop {
-//!     let mut stream = conn.accept().await?;
-//!     kio::spawn_task(async move {
-//!         // echo or handle the stream
-//!     });
+//!     let stream = conn.accept().await?;
+//!     kio::spawn_task(async move { /* handle */ });
 //! }
+//!
+//! // Full Config at once
+//! let conn = SmuxConn::connect(tcp)
+//!     .config(Config { version: 2, ..DEFAULT_CONFIG.clone() })
+//!     .build()
+//!     .await?;
 //! ```
+//!
+//! ## Compatibility: `client` / `server`
+//!
+//! [`client`](SmuxConn::client) / [`server`](SmuxConn::server) remain as thin
+//! sync wrappers around the same builder path (`connect`/`serve` + config).
 //!
 //! ## Advanced: manual driver control
 //!
@@ -42,7 +51,7 @@
 //! or a transport that is not `Send`), use the lower-level constructors:
 //!
 //! ```ignore
-//! let conn = SmuxConn::new(Config::default(), true)?; // no transport yet
+//! let conn = SmuxConn::new(DEFAULT_CONFIG.clone(), true)?; // no transport yet
 //! let driver = conn.clone();
 //! kio::spawn_task(async move { let _ = driver.run(&mut tcp).await; });
 //! ```
@@ -56,8 +65,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 
 use crate::frame::Frame;
-use crate::io::SmuxIo;
-use crate::session::{Config, Session, SessionError};
+use crate::session::{Config, Session, SessionError, DEFAULT_CONFIG};
+use crate::stream::Stream;
 
 /// How often the `run()` loop polls for keepalive / reap when idle (ms).
 const RUN_POLL_MS: u64 = 10;
@@ -70,32 +79,72 @@ const REAP_LINGER: Duration = Duration::from_secs(30);
 ///
 /// Wraps a [`Session`] with background read/write/keepalive tasks. Users call
 /// [`open_stream`](Self::open_stream) (client) or
-/// [`accept`](Self::accept) (server) to get a [`SmuxIo`] that implements
-/// `kio::AsyncRead + AsyncWrite` directly — no manual `process_data` /
-/// `prepare_outbound_into` loop required.
+/// [`accept`](Self::accept) (server) to get an [`Arc`]`<`[`Stream`]`>` with
+/// flush notify set. Stream implements `AsyncRead`/`AsyncWrite` on `&mut Stream`;
+/// wrap with [`crate::SmuxIo`] for the shared `Arc` handle — no manual
+/// `process_data` / `prepare_outbound_into` loop required.
 ///
-/// ## Two driver modes
+/// Prefer [`connect`](Self::connect) / [`serve`](Self::serve) builders (aligned
+/// with `KcpConn`). Low-level drivers remain available:
 ///
 /// - **[`run`](Self::run)**: single-task, takes `&mut T: AsyncRead + AsyncWrite`.
-///   Uses a 10 ms read timeout so flush/keepalive can run between reads.
-///   Simplest — just `spawn_task` it and use streams.
+/// - **[`spawn`](Self::spawn)**: two-task, separate read + write halves.
 ///
-/// - **[`spawn`](Self::spawn)**: two-task, takes separate read + write halves.
-///   Read and write run concurrently for lower latency. Requires splitting
-///   the transport (e.g. `tokio::io::split`).
-///
-/// Both modes handle keepalive, timeout, and zombie stream reaping automatically.
+/// Both handle keepalive, timeout, and zombie stream reaping automatically.
 #[derive(Clone)]
 pub struct SmuxConn {
     session: Arc<Session>,
     flush_notify: Arc<kio::Notify>,
     /// Set to true once a driver task has been started (via run/spawn or
-    /// the convenience client/server constructors). Prevents accidentally
-    /// starting a second driver on the same connection.
+    /// the connect/serve builders / client/server wrappers). Prevents
+    /// accidentally starting a second driver on the same connection.
     driven: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Builder for [`SmuxConn`]. Chain config, then [`.build().await`](Self::build).
+///
+/// Created via [`SmuxConn::connect`] (client) or [`SmuxConn::serve`] (server).
+pub struct SmuxConnBuilder<T> {
+    transport: T,
+    is_client: bool,
+    config: Config,
+}
+
 impl SmuxConn {
+    /// Client-mode builder over an owned transport (`AsyncRead + AsyncWrite`).
+    ///
+    /// ```ignore
+    /// let conn = SmuxConn::connect(tcp).version(2).keepalive(10).build().await?;
+    /// ```
+    pub fn connect<T>(transport: T) -> SmuxConnBuilder<T>
+    where
+        T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+    {
+        SmuxConnBuilder {
+            transport,
+            is_client: true,
+            config: DEFAULT_CONFIG.clone(),
+        }
+    }
+
+    /// Server-mode builder over an owned (accepted) transport.
+    ///
+    /// Enables the accept queue so [`accept`](Self::accept) works after build.
+    ///
+    /// ```ignore
+    /// let conn = SmuxConn::serve(tcp).version(2).build().await?;
+    /// ```
+    pub fn serve<T>(transport: T) -> SmuxConnBuilder<T>
+    where
+        T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+    {
+        SmuxConnBuilder {
+            transport,
+            is_client: false,
+            config: DEFAULT_CONFIG.clone(),
+        }
+    }
+
     /// Create a new SMUX connection (no transport yet).
     ///
     /// `is_client = true` → client session (odd stream IDs, can open streams).
@@ -104,9 +153,7 @@ impl SmuxConn {
     /// After creating, call [`run`](Self::run) or
     /// [`spawn`](Self::spawn) to drive the connection.
     ///
-    /// This is the low-level constructor for advanced use cases where you
-    /// need to manage the driver task yourself. Most users should prefer
-    /// [`client`](Self::client) or [`server`](Self::server).
+    /// Prefer [`connect`](Self::connect) / [`serve`](Self::serve) for standalone use.
     pub fn new(config: Config, is_client: bool) -> Result<Self, SessionError> {
         let session = Arc::new(if is_client {
             Session::new_client(&config)?
@@ -125,109 +172,60 @@ impl SmuxConn {
         })
     }
 
-    /// Create a client-mode SMUX connection that owns and drives the transport.
+    /// Compatibility wrapper: client-mode SMUX that owns and drives the transport.
     ///
-    /// This is the simplest way to get a multiplexed client connection:
-    ///
-    /// ```ignore
-    /// let tcp = kio::TcpStream::connect("127.0.0.1:8080").await?;
-    /// let conn = SmuxConn::client(Config::default(), tcp)?;
-    ///
-    /// let mut stream = conn.open_stream()?;
-    /// stream.write_all(b"hello").await?;
-    /// ```
-    ///
-    /// The connection spawns a background driver task internally. You do not
-    /// need to call [`run`](Self::run) or [`spawn`](Self::spawn).
-    ///
-    /// The transport must be `Send + 'static` because it is moved into the
-    /// spawned driver task.
-    pub fn client<T>(config: Config, mut transport: T) -> Result<Self, SessionError>
+    /// Equivalent to `SmuxConn::connect(transport).config(config)` + start driver
+    /// (sync). Prefer [`connect`](Self::connect)`.build().await` for new code.
+    pub fn client<T>(config: Config, transport: T) -> Result<Self, SessionError>
     where
         T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
     {
-        let conn = Self::new(config, true)?;
-        // Mark as driven before spawning to prevent accidental double-drive.
-        if conn
-            .driven
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err()
-        {
-            // This should be unreachable for a freshly created conn.
-            return Err(SessionError::SessionClosed);
+        SmuxConnBuilder {
+            transport,
+            is_client: true,
+            config,
         }
-        let driver = conn.clone();
-        kio::spawn_task(async move {
-            let _ = driver.run(&mut transport).await;
-        });
-        Ok(conn)
+        .build_sync()
     }
 
-    /// Create a server-mode SMUX connection that owns and drives the transport.
+    /// Compatibility wrapper: server-mode SMUX that owns and drives the transport.
     ///
-    /// This is the simplest way to serve multiplexed streams over an accepted
-    /// connection:
-    ///
-    /// ```ignore
-    /// let (tcp, _) = listener.accept().await?;
-    /// let conn = SmuxConn::server(Config::default(), tcp)?;
-    ///
-    /// loop {
-    ///     let mut stream = conn.accept().await?;
-    ///     // handle stream...
-    /// }
-    /// ```
-    ///
-    /// The connection spawns a background driver task internally. You do not
-    /// need to call [`run`](Self::run) or [`spawn`](Self::spawn).
-    ///
-    /// The transport must be `Send + 'static` because it is moved into the
-    /// spawned driver task.
-    pub fn server<T>(config: Config, mut transport: T) -> Result<Self, SessionError>
+    /// Equivalent to `SmuxConn::serve(transport).config(config)` + start driver
+    /// (sync). Prefer [`serve`](Self::serve)`.build().await` for new code.
+    pub fn server<T>(config: Config, transport: T) -> Result<Self, SessionError>
     where
         T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
     {
-        let conn = Self::new(config, false)?;
-        if conn
-            .driven
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return Err(SessionError::SessionClosed);
+        SmuxConnBuilder {
+            transport,
+            is_client: false,
+            config,
         }
-        let driver = conn.clone();
-        kio::spawn_task(async move {
-            let _ = driver.run(&mut transport).await;
-        });
-        Ok(conn)
+        .build_sync()
     }
 
     /// Open a new stream (client side).
     ///
-    /// Returns a [`SmuxIo`] implementing `kio::AsyncRead + AsyncWrite`.
-    /// A SYN frame is automatically queued and sent by the flush loop —
-    /// no manual frame encoding needed.
-    pub fn open_stream(&self) -> Result<SmuxIo, SessionError> {
+    /// Returns an [`Arc`]`<`[`Stream`]`>` with flush notify attached so async
+    /// writes wake the driver. A SYN frame is automatically queued and sent
+    /// by the flush loop — no manual frame encoding needed.
+    ///
+    /// For `AsyncRead`/`AsyncWrite` over the shared handle, wrap with
+    /// [`crate::SmuxIo::new`]`(stream, flush)` or use the stream's own
+    /// `&mut Stream` impl when you own the value.
+    pub fn open_stream(&self) -> Result<Arc<Stream>, SessionError> {
         let stream = self.session.open_stream()?;
         self.session.queue_syn(stream.id());
-        Ok(SmuxIo::new(stream, self.flush_notify.clone()))
+        stream.set_flush_notify(self.flush_notify.clone());
+        Ok(stream)
     }
 
     /// Accept the next incoming stream (server side).
     ///
     /// Waits until a SYN frame arrives (via `process_data` in the driver
-    /// loop) and a new stream is created. Returns a [`SmuxIo`].
-    pub async fn accept(&self) -> Result<SmuxIo, SessionError> {
+    /// loop) and a new stream is created. Returns an [`Arc`]`<`[`Stream`]`>`
+    /// with flush notify attached.
+    pub async fn accept(&self) -> Result<Arc<Stream>, SessionError> {
         loop {
             if self.session.is_closed() {
                 return Err(SessionError::SessionClosed);
@@ -235,7 +233,8 @@ impl SmuxConn {
             if let Some(id) = self.session.pop_accepted_stream() {
                 let streams = self.session.streams();
                 if let Some(stream) = streams.lock().get(&id).cloned() {
-                    return Ok(SmuxIo::new(stream, self.flush_notify.clone()));
+                    stream.set_flush_notify(self.flush_notify.clone());
+                    return Ok(stream);
                 }
                 // Stream was already reaped — try again.
                 continue;
@@ -352,7 +351,7 @@ impl SmuxConn {
     ///
     /// More efficient than [`run`](Self::run) because read and write
     /// happen concurrently. The flush task also wakes on
-    /// `flush_notify` (set by `SmuxIo::poll_write`) for near-instant flush.
+    /// `flush_notify` (set by stream write / `SmuxIo::poll_write`) for near-instant flush.
     ///
     /// Split a `kio::TcpStream` using your runtime's split function:
     ///
@@ -460,6 +459,91 @@ impl SmuxConn {
     }
 }
 
+// ─── Builder ──────────────────────────────────────────────────────────────────
+
+impl<T> SmuxConnBuilder<T>
+where
+    T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
+{
+    /// Replace the full SMUX [`Config`].
+    pub fn config(mut self, cfg: Config) -> Self {
+        self.config = cfg;
+        self
+    }
+
+    /// SMUX protocol version (`1` or `2`).
+    pub fn version(mut self, v: u8) -> Self {
+        self.config.version = v;
+        self
+    }
+
+    /// Keepalive interval in seconds (`Config::keepalive_interval`).
+    pub fn keepalive(mut self, secs: u64) -> Self {
+        self.config.keepalive_interval = secs;
+        self
+    }
+
+    /// Keepalive timeout in seconds (`0` = disabled).
+    pub fn keepalive_timeout(mut self, secs: u64) -> Self {
+        self.config.keepalive_timeout = secs;
+        self
+    }
+
+    /// Maximum frame payload size (bytes).
+    pub fn max_frame_size(mut self, n: usize) -> Self {
+        self.config.max_frame_size = n;
+        self
+    }
+
+    /// Maximum overall receive buffer for the session (bytes).
+    pub fn max_receive_buffer(mut self, n: usize) -> Self {
+        self.config.max_receive_buffer = n;
+        self
+    }
+
+    /// Maximum per-stream receive buffer (bytes).
+    pub fn max_stream_buffer(mut self, n: usize) -> Self {
+        self.config.max_stream_buffer = n;
+        self
+    }
+
+    /// Construct the connection and start the background driver.
+    ///
+    /// Uses the single-task [`SmuxConn::run`] driver (no forced split) so any
+    /// `AsyncRead + AsyncWrite` transport works. Callers that can split may
+    /// still use [`SmuxConn::new`] + [`SmuxConn::spawn`] for concurrent I/O.
+    pub async fn build(self) -> Result<SmuxConn, SessionError> {
+        self.build_sync()
+    }
+
+    /// Sync path used by `build` and the legacy `client`/`server` wrappers.
+    fn build_sync(self) -> Result<SmuxConn, SessionError> {
+        let SmuxConnBuilder {
+            mut transport,
+            is_client,
+            config,
+        } = self;
+        let conn = SmuxConn::new(config, is_client)?;
+        if conn
+            .driven
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(SessionError::SessionClosed);
+        }
+        let driver = conn.clone();
+        kio::spawn_task(async move {
+            let _ = driver.run(&mut transport).await;
+        });
+        Ok(conn)
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -482,6 +566,81 @@ mod tests {
             conn.session() as *const Session,
             conn2.session() as *const Session,
         ));
+    }
+
+    /// Builder chain sets Config fields without needing a real network.
+    #[test]
+    fn connect_builder_sets_config_fields() {
+        // Dummy transport never used — we only inspect builder.config before build.
+        struct Dummy;
+        impl kio::AsyncRead for Dummy {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut kio::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl kio::AsyncWrite for Dummy {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(0))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let b = SmuxConn::connect(Dummy)
+            .version(2)
+            .keepalive(15)
+            .keepalive_timeout(45)
+            .max_frame_size(8 * 1024)
+            .max_receive_buffer(2 * 1024 * 1024)
+            .max_stream_buffer(128 * 1024);
+        assert_eq!(b.config.version, 2);
+        assert_eq!(b.config.keepalive_interval, 15);
+        assert_eq!(b.config.keepalive_timeout, 45);
+        assert_eq!(b.config.max_frame_size, 8 * 1024);
+        assert_eq!(b.config.max_receive_buffer, 2 * 1024 * 1024);
+        assert_eq!(b.config.max_stream_buffer, 128 * 1024);
+        assert!(b.is_client);
+
+        let b2 = SmuxConn::serve(Dummy).config(Config {
+            version: 2,
+            max_receive_buffer: 1024 * 1024,
+            max_stream_buffer: 64 * 1024,
+            max_frame_size: 4096,
+            keepalive_interval: 5,
+            keepalive_timeout: 20,
+        });
+        assert!(!b2.is_client);
+        assert_eq!(b2.config.version, 2);
+        assert_eq!(b2.config.keepalive_interval, 5);
+        assert_eq!(b2.config.max_frame_size, 4096);
+    }
+
+    /// open_stream after builder-style new applies session version from config.
+    #[test]
+    fn new_with_version2_config() {
+        let mut cfg = DEFAULT_CONFIG.clone();
+        cfg.version = 2;
+        let conn = SmuxConn::new(cfg, true).unwrap();
+        assert_eq!(conn.session().version(), 2);
+        assert_eq!(conn.session().config().version, 2);
     }
 
     /// Verify that open_stream queues a SYN that prepare_outbound drains.
@@ -550,10 +709,7 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             if this.fail_next_write.swap(false, Ordering::SeqCst) {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "mock write failure",
-                )));
+                return Poll::Ready(Err(std::io::Error::other("mock write failure")));
             }
             let mut w = this.written.lock().unwrap();
             w.extend_from_slice(buf);
@@ -585,10 +741,7 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             if this.fail_next_write.swap(false, Ordering::SeqCst) {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "mock write failure",
-                )));
+                return Poll::Ready(Err(std::io::Error::other("mock write failure")));
             }
             let mut w = this.written.lock().unwrap();
             w.extend_from_slice(buf);

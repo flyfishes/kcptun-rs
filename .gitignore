@@ -2,7 +2,10 @@
 /target/
 **/target/
 **/*.rs.bk
+PAGE.md
+fix_e2e.sh
 
+.claude
 # IDE / editor settings
 .vscode/
 .idea/
@@ -21,6 +24,9 @@ __pycache__/
 
 # Cargo lock is committed for binary crates; keep it.
 .omc/
+
+# Superpowers working data (session/task artifacts; not committed)
+.superpowers/
 
 # Flamegraph / sampling artifacts (regenerate via bench/profile_flamegraph.sh)
 /bench/profiles/**

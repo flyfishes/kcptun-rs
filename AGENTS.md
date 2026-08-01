@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-22 | Updated: 2026-07-22 -->
+<!-- Generated: 2026-07-22 | Updated: 2026-07-31 (Task 7: KcpConn/SmuxConn library surface) -->
 
 # kcptun-rs
 
@@ -17,7 +17,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | File | Description |
 |------|-------------|
 | `Cargo.toml` | Workspace of 9 crates; release: `opt-level=3`, LTO, `panic=abort`, strip; `profiling` profile for pprof |
-| `Makefile` | Build/test/clippy/bench/e2e/profile for tokio & smol; ARMv7/ARM64 cross; vendor |
+| `Makefile` | Build/test/clippy/bench/e2e/profile for tokio & smol; ARMv7/ARM64 cross |
 | `CLAUDE.md` | AI behavioral rules + project gotchas (authoritative for *how to work*) |
 | `README.md` / `README.zh.md` | User-facing docs (EN/ZH) |
 | `CHANGELOG.md` | Keep-a-Changelog history of perf/interop work |
@@ -32,25 +32,24 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `bugs/BUGREPORT.md` | Known issues (single-KCP deadlock / FIN history) |
 | `bugs/BUGREPORT_PROXY_MEMORY_GROWTH.md` | **Open**: proxy SMUX stream leak → RSS growth |
 | `DISCLAIMER.md` / `DISCLAIMER.zh.md` | Legal / non-production disclaimer |
-| `.cargo/config.toml` | Vendored crates-io (`vendor/`) + aarch64 `aes_armv8` rustflags |
+| `.cargo/config.toml` | aarch64 `aes_armv8` rustflags (deps fetched from crates.io per platform) |
 
 ## Subdirectories
 
 | Directory | Purpose |
 |-----------|---------|
-| `kcp-rs/` | KCP ARQ, FEC, CryptoBuf, SNMP (see `kcp-rs/AGENTS.md`) |
-| `kcrypt-rs/` | 13 BlockCrypt + AES-128-GCM (see `kcrypt-rs/AGENTS.md`) |
-| `smux-rs/` | SMUX v1/v2 multiplexer (see `smux-rs/AGENTS.md`) |
+| `kcp-rs/` | KCP ARQ, FEC, SNMP; optional async `KcpConn`/`PacketTransport` (see `kcp-rs/AGENTS.md`) |
+| `kcrypt-rs/` | 13 BlockCrypt + AES-128-GCM + **wire packing** (`CryptoBuf`/`encrypt_batch`) (see `kcrypt-rs/AGENTS.md`) |
+| `smux-rs/` | SMUX v1/v2 multiplexer; `SmuxConn` Builder (see `smux-rs/AGENTS.md`) |
 | `qpp-rs/` | Quantum Permutation Pad stream obfuscation (see `qpp-rs/AGENTS.md`) |
 | `kio-rs/` | Runtime-agnostic async I/O tokio\|smol (see `kio-rs/AGENTS.md`) |
 | `kpprof-rs/` | Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock) (see `kpprof-rs/AGENTS.md`) |
-| `kcptun-common/` | Shared client/server helpers: key derive, KCP modes, Snappy framing (see `kcptun-common/AGENTS.md`) |
+| `kcptun-common/` | Shared helpers + library-ready `CryptoTransport`/`kcp_session` (see `kcptun-common/AGENTS.md`) |
 | `kcptun-client/` | Client binary (see `kcptun-client/AGENTS.md`) |
 | `kcptun-server/` | Server binary + stress tests (see `kcptun-server/AGENTS.md`) |
 | `bench/` | Bench/profile runners (see `bench/AGENTS.md`) |
 | `bugs/` | Bug reports & postmortems (not under repo root) |
 | `tests/` | Go kcptun reference binaries for e2e (`tests/kcptun-go/`) — **no AGENTS.md** |
-| `vendor/` | Vendored third-party crates (`make vendor`; do not edit by hand) |
 | `.cargo/` | Cargo config (see `.cargo/AGENTS.md`) |
 | `.claude/skills/` | Project agent skills |
 
@@ -80,9 +79,6 @@ make profile / profile-rust-go / profiling-bins
 # Cross (ARM defaults to smol)
 make release-armv7 / release-arm64
 make install-cross
-
-# Vendor refresh
-make vendor
 ```
 
 Runtime-feature packages (`RT_PKGS`): `kcptun-client`, `kcptun-server`, `kio-rs`, `smux-rs`, `kpprof-rs`.  
@@ -94,9 +90,10 @@ Runtime-agnostic: `kcp-rs`, `kcrypt-rs`, `qpp-rs`.
 
 ```
 kcptun-client ──┐
-                ├──► kcptun-common ──► kcp-rs ──► kcrypt-rs
+                ├──► kcptun-common ──► kcp-rs      (crypto → kcrypt-rs)
 kcptun-server ──┤
-                ├──► kcp-rs ──► kcrypt-rs
+                ├──► kcp-rs      (no crypto dep)
+                ├──► kcrypt-rs
                 ├──► smux-rs ──► kio-rs  (feature: tokio | smol)
                 ├──► qpp-rs
                 ├──► kio-rs
@@ -124,12 +121,23 @@ kcptun-server ──┤
 
 ### Binary hot path (flush loop)
 
-Both client (`KcpConn`) and server (`KcpServerSession`) split flush into **4 phases** to minimize KCP mutex hold time:
+Production client/server still use **legacy** per-session KCP+SMUX+Snappy loops (not yet cut over to library `kcp_rs::KcpConn` / `SmuxConn`). Both client and server split flush into **4 phases** to minimize KCP mutex hold time:
 
 1–3. Outside lock: snappy (via `kio::cpu_block` when appropriate), crypto prepare, optional parallel encrypt  
 4. Inside lock: `kcp.send()` / `update()` / `flush()` briefly
 
 Snappy is **session-level** (not per-stream), matching Go. Compression **on by default** (`--nocomp` disables).
+
+### Library-ready stack (Tasks 1–7; production cut-over deferred)
+
+```
+UDP → CryptoTransport (kcptun-common) → KcpConn (+FEC) → [Snappy] → SmuxConn → Stream
+```
+
+- `kcp-rs`: feature `async-tokio` / `async-smol` → `KcpConn`, `PacketTransport`, FEC on builder; **no crypto inside KcpConn**
+- `kcptun-common`: `CryptoTransport`, `kcp_session*`, `kcp_config_from`, `dial_kcp_session` / `accept_kcp_peer`
+- `smux-rs`: `SmuxConn::connect`/`serve` Builder; `Arc<Stream>` is AsyncRead/Write; **no** `with_backpressure`
+- Specs: `docs/superpowers/specs/2026-07-30-kcp-netconn-abstraction-analysis.md`, `docs/superpowers/specs/2026-07-31-smux-rs-simplification.md`
 
 ## For AI Agents
 
@@ -154,7 +162,7 @@ Snappy is **session-level** (not per-stream), matching Go. Compression **on by d
 
 - Global allocator: `mimalloc` in both binaries
 - Crypto selection: `kcrypt_rs::select_block_crypt` / `select_aead_crypt`
-- Packet packing: `kcp_rs::CryptoBuf` + `encrypt_batch`
+- Packet packing: `kcrypt_rs::wire::CryptoBuf` + `encrypt_batch` (B2: moved from kcp-rs)
 - Async I/O: `kio::{TcpStream, UdpSocket, spawn_task, cpu_block, sleep_ms}`
 
 ## Dependencies
@@ -165,6 +173,6 @@ Workspace members only (see graph above).
 
 ### External
 
-Vendored under `vendor/` via `.cargo/config.toml`. Notable: `bytes`, `parking_lot`, `crossbeam`, `reed-solomon-erasure`, `aes`/`aes-gcm`, `snap`, `clap`, `mimalloc`, optional `pprof`.
+Fetched from crates.io per build platform (not vendored). Notable: `bytes`, `parking_lot`, `crossbeam`, `reed-solomon-erasure`, `aes`/`aes-gcm`, `snap`, `clap`, `mimalloc`, optional `pprof`.
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->

@@ -303,6 +303,7 @@ impl Session {
         }
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
+        stream.set_self_ref(Arc::downgrade(&stream));
         stream.set_state(StreamState::Ready);
         stream.mark_opened();
         // SMUX v1 has no UPD / per-stream send window.
@@ -323,6 +324,7 @@ impl Session {
         }
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
+        stream.set_self_ref(Arc::downgrade(&stream));
         stream.set_state(StreamState::Ready);
         stream.mark_opened();
         // SMUX v1 has no UPD / per-stream send window.
@@ -900,7 +902,7 @@ mod tests {
 
         // We should have produced some bytes, but not the entire payload.
         // The peer window starts at 256KiB (initialPeerWindow), so max_bytes is the limiter.
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
         assert!(buf.len() < big.len(), "should be capped by max_bytes");
         // Stream should still have pending data.
         assert!(s.pending_send() > 0);

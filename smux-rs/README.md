@@ -29,11 +29,11 @@ SMUX (Stream Multiplexer) allows many independent logical streams to share a sin
 
 Key features:
 
-- **`SmuxConn`** — high-level wrapper that manages read/write/keepalive automatically. Just `open_stream()` and use the returned `SmuxIo` with standard async I/O.
+- **`SmuxConn`** — high-level wrapper that manages read/write/keepalive automatically. Prefer `connect`/`serve` Builder; `open_stream()` / `accept()` return `Arc<Stream>` implementing standard async I/O.
 - **v1 / v2 protocol** — wire-compatible with Go smux
 - **Flow control** — v2 uses per-stream window updates (UPD frames)
 - **Half-close** — streams support independent local/remote close (like TCP)
-- **Async I/O** — `Stream` and `SmuxIo` implement `kio::AsyncRead + AsyncWrite` (tokio or smol)
+- **Async I/O** — `Stream` (and thin `SmuxIo`) implement `kio::AsyncRead + AsyncWrite` (tokio or smol)
 - **Zero-copy** — receive path uses `Bytes` reference-counted slices
 
 ---
@@ -60,10 +60,13 @@ use kio::{AsyncReadExt, AsyncWriteExt};
 // 1. Connect to server (transport is owned by SmuxConn)
 let tcp = kio::TcpStream::connect("127.0.0.1:8080").await?;
 
-// 2. Create SMUX client connection — driver runs automatically
-let conn = SmuxConn::client(Config::default(), tcp)?;
+// 2. Create SMUX client — Builder starts the driver on build().await
+let conn = SmuxConn::connect(tcp)
+    .config(Config::default())
+    .build()
+    .await?;
 
-// 3. Open a stream — use it like a normal TCP connection
+// 3. Open a stream — Arc<Stream> is AsyncRead + AsyncWrite
 let mut stream = conn.open_stream()?;
 stream.write_all(b"hello").await?;
 
@@ -81,8 +84,11 @@ use kio::{AsyncReadExt, AsyncWriteExt};
 let listener = kio::TcpListener::bind("0.0.0.0:8080".parse().unwrap()).await?;
 let (tcp, _) = listener.accept().await?;
 
-// 2. Create SMUX server connection — driver runs automatically
-let conn = SmuxConn::server(Config::default(), tcp)?;
+// 2. Create SMUX server — Builder starts the driver on build().await
+let conn = SmuxConn::serve(tcp)
+    .config(Config::default())
+    .build()
+    .await?;
 
 // 3. Accept streams
 loop {
@@ -98,6 +104,8 @@ loop {
     });
 }
 ```
+
+> Compatibility: `SmuxConn::client(config, transport)?` / `SmuxConn::server(config, transport)?` remain as thin wrappers over `connect`/`serve`.
 
 ### High-performance mode (split read/write)
 
@@ -134,10 +142,12 @@ High-level connection wrapper. Manages read/flush/keepalive/reap automatically.
 
 | Method | Description |
 |--------|-------------|
-| `client(config, transport)` | **Recommended for clients.** Takes ownership of transport and starts the driver automatically. |
-| `server(config, transport)` | **Recommended for servers.** Takes ownership of transport and starts the driver automatically. |
+| `connect(transport)` | **Recommended for clients.** Returns `SmuxConnBuilder`; chain options then `.build().await`. |
+| `serve(transport)` | **Recommended for servers.** Same builder path, `is_client=false`. |
+| `client(config, transport)` | Thin wrapper: `connect(transport).config(config).build()` (sync spawn path). |
+| `server(config, transport)` | Thin wrapper over `serve`. |
 | `new(config, is_client)` | Low-level: create connection (no transport yet). Call `run`/`spawn` yourself. |
-| `open_stream()` | Open a new stream (client). Returns `SmuxIo`. SYN is auto-queued. |
+| `open_stream()` | Open a new stream (client). Returns `Arc<Stream>`. SYN is auto-queued. |
 | `accept()` | Accept next incoming stream (server). Async — waits for SYN. |
 | `run(&mut transport)` | Low-level: drive with a single transport (10ms poll). |
 | `spawn(read, write)` | Low-level: drive with split halves (concurrent, lower latency). |
@@ -160,7 +170,7 @@ High-level connection wrapper. Manages read/flush/keepalive/reap automatically.
 Logical stream within a session. Implements `kio::AsyncRead + AsyncWrite`.
 
 ```rust
-// Async read/write (via SmuxIo wrapper)
+// Async read/write on Arc<Stream> (preferred)
 let mut stream = conn.open_stream()?;
 stream.write_all(b"data").await?;
 let mut buf = [0u8; 4096];
@@ -169,7 +179,7 @@ stream.shutdown().await?; // half-close local side (tokio)
 // stream.close().await?;  // half-close local side (smol)
 ```
 
-Key `Stream` methods (accessed via `SmuxIo` or `Arc<Stream>`):
+Key `Stream` methods (on `Arc<Stream>` or via thin `SmuxIo`):
 
 | Method | Description |
 |--------|-------------|
@@ -321,11 +331,11 @@ smux-rs/
 ├── build.rs           — enforces tokio/smol mutual exclusion
 └── src/
     ├── lib.rs          — public re-exports
-    ├── conn.rs         — SmuxConn: high-level wrapper (auto read/flush/keepalive)
+    ├── conn.rs         — SmuxConn + SmuxConnBuilder (connect/serve/build)
     ├── frame.rs        — 8B header codec; Cmd, Frame, FrameCodec
     ├── session.rs      — Session multiplexer, Config, flow control
-    ├── stream.rs        — logical Stream (AsyncRead/AsyncWrite, window, state)
-    └── io.rs            — SmuxIo wrapper with optional backpressure
+    ├── stream.rs       — logical Stream (AsyncRead/AsyncWrite, flush_notify)
+    └── io.rs           — thin SmuxIo (flush notify only; no KCP backpressure)
 ```
 
 ### Data flow (SmuxConn)
@@ -378,7 +388,7 @@ The peer hasn't sent a UPD frame yet, or the peer's receive buffer is full. Ensu
 
 ### FIN frames not being sent
 
-`SmuxConn` handles FIN encoding automatically. The stream must be marked `local_closed` (via `shutdown()` / `close()` on `SmuxIo`). The flush loop encodes FIN and marks it sent after transport accepts.
+`SmuxConn` handles FIN encoding automatically. The stream must be marked `local_closed` (via `shutdown()` / `close()` on `Stream` / `SmuxIo`). The flush loop encodes FIN and marks it sent after transport accepts.
 
 ### `build.rs` panic: feature conflict
 

@@ -15,6 +15,7 @@ kcptun server binary: UDP/KCP accept → SMUX → target TCP. `KcpServerSession`
 | `build.rs` | Build-time glue |
 | `src/main.rs` | Entire binary: `Cli`, `KcpServerSession`, `handle_stream`, `pipe` idle timeout, pprof |
 | `tests/stress_test.rs` | Multi-connection stress / data integrity (run via `make stress`) |
+| `tests/autoexpire_multi_port_test.rs` | Functional: combined multi-port (`-l`/`-r` range) + client `--autoexpire` scavenger |
 
 ## Subdirectories
 

@@ -2,7 +2,7 @@
 
 use super::{raw_tcp_listener, raw_tcp_stream, raw_udp};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 // ─── UdpSocket ────────────────────────────────────────────────────────────────
 
@@ -69,8 +69,7 @@ impl UdpSocket {
             use std::os::fd::AsRawFd;
             let mut offset = 0;
             while offset < bufs.len() {
-                let refs: Vec<&[u8]> = bufs[offset..].iter().map(|b| b.as_ref()).collect();
-                match super::mmsg::sendmmsg_connected(self.inner.as_raw_fd(), &refs) {
+                match super::mmsg::sendmmsg_connected(self.inner.as_raw_fd(), &bufs[offset..]) {
                     Ok(n) if n > 0 => offset += n,
                     Ok(_) => {
                         // Wait until writable via a no-op send readiness: poll send of empty fails,
@@ -114,8 +113,7 @@ impl UdpSocket {
             use std::os::fd::AsRawFd;
             let mut offset = 0;
             while offset < bufs.len() {
-                let refs: Vec<&[u8]> = bufs[offset..].iter().map(|b| b.as_ref()).collect();
-                match super::mmsg::sendmmsg_to(self.inner.as_raw_fd(), &refs, &target) {
+                match super::mmsg::sendmmsg_to(self.inner.as_raw_fd(), &bufs[offset..], &target) {
                     Ok(n) if n > 0 => offset += n,
                     Ok(_) => {
                         let _ = self.inner.send_to(bufs[offset].as_ref(), target).await?;
@@ -317,10 +315,18 @@ pub struct TcpStream {
 impl TcpStream {
     #[inline(always)]
     pub async fn connect(addr: impl AsRef<str>) -> io::Result<Self> {
+        let addr = addr.as_ref();
+        // Resolve DNS hostnames (server `-t` target), not just IP literals.
         let remote: SocketAddr = addr
-            .as_ref()
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            .to_socket_addrs()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("no address for {addr}"),
+                )
+            })?;
         let std_stream = raw_tcp_stream(remote)?;
         let async_stream = async_io::Async::new(std_stream)?;
         let s = smol::net::TcpStream::from(async_stream);

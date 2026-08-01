@@ -885,10 +885,12 @@ dependencies = [
  "bytes",
  "crc32fast",
  "crossbeam",
- "kcrypt-rs",
+ "kio-rs",
+ "libc",
  "parking_lot 0.12.5",
  "reed-solomon-erasure",
  "smallvec",
+ "tokio",
 ]
 
 [[package]]
@@ -925,6 +927,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "kcp-rs",
+ "kcrypt-rs",
  "kio-rs",
  "log",
  "parking_lot 0.12.5",
@@ -932,6 +935,7 @@ dependencies = [
  "qpp-rs",
  "sha1",
  "snap",
+ "tokio",
 ]
 
 [[package]]
@@ -970,8 +974,10 @@ dependencies = [
  "aes-gcm",
  "blowfish",
  "bytes",
+ "crc32fast",
  "des",
  "hmac",
+ "parking_lot 0.12.5",
  "pbkdf2",
  "sha1",
  "twofish",

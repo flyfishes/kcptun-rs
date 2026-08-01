@@ -50,6 +50,11 @@ const MAX_DATAGRAM: usize = 2048;
 /// How often the KCP update loop fires (milliseconds).
 const KCP_UPDATE_INTERVAL_MS: u64 = 2;
 
+/// Upper bound on the idle flush-loop sleep. Idle sessions back off to the
+/// KCP interval (mode-dependent, 10-40ms) but are capped so the Phase 1a
+/// stream reaper and keepalive health checks still run on a bounded schedule.
+const MAX_IDLE_UPDATE_MS: u64 = 100;
+
 // ─── KCP-level Snappy compression (matching Go) ────────────────────────────
 
 // Note: Compression is handled by the persistent snap::write::FrameEncoder
@@ -74,6 +79,11 @@ fn rotate_log(log_path: &str, max_size: u64) {
 // ─── Config (JSON config file support) ──────────────────────────────────────────
 
 /// Configuration struct matching the kcptun JSON config format.
+///
+/// Numeric fields match Go kcptun: time/duration fields that may be negative
+/// (`keepalive`, `closewait`, `snmpperiod`) are signed `i64`; count/window/size
+/// fields are unsigned (u32/u64) and can't be negative. Negatives are clamped
+/// to 0 when applied to the KCP/SMUX config.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -100,10 +110,10 @@ pub struct Config {
     pub smuxbuf: Option<usize>,
     pub streambuf: Option<usize>,
     pub framesize: Option<usize>,
-    pub keepalive: Option<u64>,
-    pub closewait: Option<u64>,
+    pub keepalive: Option<i64>,
+    pub closewait: Option<i64>,
     pub snmplog: Option<String>,
-    pub snmpperiod: Option<u64>,
+    pub snmpperiod: Option<i64>,
     pub log: Option<String>,
     pub quiet: Option<bool>,
     pub tcp: Option<bool>,
@@ -118,7 +128,13 @@ pub struct Config {
 
 /// kcptun server -- accept KCP connections and forward to TCP targets.
 #[derive(Debug, Parser)]
-#[command(name = "kcptun-server", about, version, disable_version_flag = true)]
+#[command(
+    name = "kcptun-server",
+    about,
+    version,
+    disable_version_flag = true,
+    allow_negative_numbers = true
+)]
 pub struct Cli {
     /// KCP listen address (UDP).
     #[arg(short = 'l', long, default_value = ":29900")]
@@ -215,11 +231,11 @@ pub struct Cli {
 
     /// SMUX keepalive interval in seconds.
     #[arg(long)]
-    pub keepalive: Option<u64>,
+    pub keepalive: Option<i64>,
 
     /// Close wait timeout in seconds.
     #[arg(long)]
-    pub closewait: Option<u64>,
+    pub closewait: Option<i64>,
 
     /// SNMP log file path.
     #[arg(long)]
@@ -227,7 +243,7 @@ pub struct Cli {
 
     /// SNMP logging period in seconds.
     #[arg(long)]
-    pub snmpperiod: Option<u64>,
+    pub snmpperiod: Option<i64>,
 
     /// Log file path.
     #[arg(long)]
@@ -268,39 +284,18 @@ impl Cli {
     /// Merge CLI args with config file, CLI taking precedence.
     fn merge(cli: Self, cfg: Config) -> Self {
         Cli {
-            listen: cli.listen.or(cfg.listen),
-            target: cli.target.or(cfg.target),
-            key: cli.key.or(cfg.key),
-            crypt: cli.crypt.or(cfg.crypt),
-            mode: cli.mode.or(cfg.mode),
-            ratelimit: {
-                let v = cli.ratelimit;
-                if v != 0 {
-                    v
-                } else {
-                    cfg.ratelimit.unwrap_or(0)
-                }
-            },
-            mtu: cli.mtu.or(cfg.mtu),
-            sndwnd: cli.sndwnd.or(cfg.sndwnd),
-            rcvwnd: cli.rcvwnd.or(cfg.rcvwnd),
-            datashard: {
-                let v = cli.datashard;
-                if v != 10 {
-                    v
-                } else {
-                    cfg.datashard.unwrap_or(10)
-                }
-            },
-            parityshard: {
-                let v = cli.parityshard;
-                if v != 3 {
-                    v
-                } else {
-                    cfg.parityshard.unwrap_or(3)
-                }
-            },
-            dscp: cli.dscp.or(cfg.dscp),
+            listen: cfg.listen.or(cli.listen),
+            target: cfg.target.or(cli.target),
+            key: cfg.key.or(cli.key),
+            crypt: cfg.crypt.or(cli.crypt),
+            mode: cfg.mode.or(cli.mode),
+            ratelimit: cfg.ratelimit.unwrap_or(cli.ratelimit),
+            mtu: cfg.mtu.or(cli.mtu),
+            sndwnd: cfg.sndwnd.or(cli.sndwnd),
+            rcvwnd: cfg.rcvwnd.or(cli.rcvwnd),
+            datashard: cfg.datashard.unwrap_or(cli.datashard),
+            parityshard: cfg.parityshard.unwrap_or(cli.parityshard),
+            dscp: cfg.dscp.or(cli.dscp),
             nocomp: if cli.nocomp {
                 true
             } else {
@@ -311,34 +306,20 @@ impl Cli {
             } else {
                 cfg.acknodelay.unwrap_or(false)
             },
-            nodelay: cli.nodelay.or(cfg.nodelay),
-            interval: cli.interval.or(cfg.interval),
-            resend: cli.resend.or(cfg.resend),
-            nc: cli.nc.or(cfg.nc),
-            sockbuf: cli.sockbuf.or(cfg.sockbuf),
-            smuxver: cli.smuxver.or(cfg.smuxver),
-            smuxbuf: cli.smuxbuf.or(cfg.smuxbuf),
-            streambuf: {
-                let v = cli.streambuf;
-                if v != 2097152 {
-                    v
-                } else {
-                    cfg.streambuf.unwrap_or(2097152)
-                }
-            },
-            framesize: {
-                let v = cli.framesize;
-                if v != 8192 {
-                    v
-                } else {
-                    cfg.framesize.unwrap_or(8192)
-                }
-            },
-            keepalive: cli.keepalive.or(cfg.keepalive),
-            closewait: cli.closewait.or(cfg.closewait),
-            snmplog: cli.snmplog.or(cfg.snmplog),
-            snmpperiod: cli.snmpperiod.or(cfg.snmpperiod),
-            log: cli.log.or(cfg.log),
+            nodelay: cfg.nodelay.or(cli.nodelay),
+            interval: cfg.interval.or(cli.interval),
+            resend: cfg.resend.or(cli.resend),
+            nc: cfg.nc.or(cli.nc),
+            sockbuf: cfg.sockbuf.or(cli.sockbuf),
+            smuxver: cfg.smuxver.or(cli.smuxver),
+            smuxbuf: cfg.smuxbuf.or(cli.smuxbuf),
+            streambuf: cfg.streambuf.unwrap_or(cli.streambuf),
+            framesize: cfg.framesize.unwrap_or(cli.framesize),
+            keepalive: cfg.keepalive.or(cli.keepalive),
+            closewait: cfg.closewait.or(cli.closewait),
+            snmplog: cfg.snmplog.or(cli.snmplog),
+            snmpperiod: cfg.snmpperiod.or(cli.snmpperiod),
+            log: cfg.log.or(cli.log),
             quiet: if cli.quiet {
                 true
             } else {
@@ -349,7 +330,7 @@ impl Cli {
             } else {
                 cfg.tcp.unwrap_or(false)
             },
-            pprof: cli.pprof.or(cfg.pprof),
+            pprof: cfg.pprof.or(cli.pprof),
             #[cfg(feature = "qpp")]
             qpp: if cli.qpp {
                 true
@@ -357,7 +338,7 @@ impl Cli {
                 cfg.qpp.unwrap_or(false)
             },
             #[cfg(feature = "qpp")]
-            qppcount: cli.qppcount.or(cfg.qppcount),
+            qppcount: cfg.qppcount.or(cli.qppcount),
             c: cli.c,
             version_flag: false, // never from config file
         }
@@ -430,6 +411,7 @@ async fn handle_stream(
         info!("stream {} connected to target {}", stream_id, target);
     }
 
+    smux_stream.set_flush_notify(flush_notify.clone());
     let smux_io = smux_rs::SmuxIo::new(smux_stream.clone(), flush_notify);
 
     // Default idle timeout to prevent FD leaks when close_wait is 0.
@@ -560,7 +542,7 @@ struct KcpServerSession {
     compressor: Option<Arc<parking_lot::Mutex<snap::write::FrameEncoder<Vec<u8>>>>>,
     /// Reusable encryption buffer with counter-based nonce.
     /// Eliminates per-packet vec![] allocation and rand::thread_rng() calls.
-    crypto_buf: Arc<parking_lot::Mutex<kcp_rs::CryptoBuf>>,
+    crypto_buf: Arc<parking_lot::Mutex<kcrypt_rs::CryptoBuf>>,
     /// Notify for waking up the flush loop immediately when SMUX streams
     /// have new data to send. Eliminates the 0~10ms wait of the fixed
     /// sleep interval.
@@ -577,6 +559,10 @@ struct KcpServerSession {
     /// KCP dead_link (20 retransmits) or SMUX keepalive timeout (typically
     /// a few seconds). 4-10s end-to-end is acceptable per requirements.
     dead: Arc<AtomicBool>,
+    /// Adopt the client's conv from the first inbound packet. TCP sessions
+    /// don't know the conv at accept time (Go's server keys each session by
+    /// the first packet's conv); UDP sessions already extracted it up front.
+    adopt_conv: AtomicBool,
     /// Per-connection rate limiter (token bucket). 0 = unlimited.
     ratelimiter: Arc<kcptun_common::RateLimiter>,
 }
@@ -589,6 +575,7 @@ impl KcpServerSession {
         socket: &Arc<kio::DatagramSocket>,
         key: &[u8; 32],
         cfg: &SessionConfig,
+        adopt_conv: bool,
     ) -> Self {
         let crypt_method = cfg.crypt.as_str();
         let mode = cfg.mode.as_str();
@@ -715,9 +702,12 @@ impl KcpServerSession {
                     snap::write::FrameEncoder::new(Vec::new()),
                 )))
             },
-            crypto_buf: Arc::new(parking_lot::Mutex::new(kcp_rs::CryptoBuf::new(conv as u64))),
+            crypto_buf: Arc::new(parking_lot::Mutex::new(kcrypt_rs::CryptoBuf::new(
+                conv as u64,
+            ))),
             flush_notify: Arc::new(kio::Notify::new()),
             dead: Arc::new(AtomicBool::new(false)),
+            adopt_conv: AtomicBool::new(adopt_conv),
             ratelimiter: Arc::new(kcptun_common::RateLimiter::new(cfg.ratelimit)),
         };
 
@@ -742,11 +732,12 @@ impl KcpServerSession {
         if self.smux.is_closed() {
             return true;
         }
-        // Check KCP directly for freshness (mirrors client behavior).
-        if self.kcp.lock().is_dead() {
-            self.dead.store(true, Ordering::Release);
-            return true;
-        }
+        // KCP dead_link detection is owned by the flush loop's health check
+        // (it stores `dead` when kcp.is_dead()). Checking KCP here would lock
+        // the KCP mutex on every datagram — the flush loop already marks the
+        // session dead on kcp.is_dead() / SMUX keepalive timeout, which is the
+        // only signal get_or_create_session needs to evict. Detection latency
+        // stays well inside the 4-10s reconnect-acceptance envelope.
         false
     }
 
@@ -779,7 +770,10 @@ impl KcpServerSession {
             let mut next_update: u64 = KCP_UPDATE_INTERVAL_MS;
             // Reused across iterations: single buffer for SMUX frame assembly (P0.3).
             let mut out_buf = BytesMut::with_capacity(64 * 1024);
-            // Throttle Phase 0 health checks (~100ms); flush still runs at full rate.
+            // Throttle Phase 0 health checks; flush still runs at full rate.
+            // Health checks run every 50 flush cycles: at idle cadence that is
+            // ~50×interval (≈1.5s for mode fast), still well inside the SMUX
+            // keepalive (10s / 30s) and KCP dead_link acceptance envelopes.
             let mut health_checks_left: u32 = 0;
 
             loop {
@@ -798,7 +792,7 @@ impl KcpServerSession {
                     break;
                 }
                 if health_checks_left == 0 {
-                    health_checks_left = 50; // ~100ms at 2ms update interval
+                    health_checks_left = 50; // 50 cycles; idle ≈ 50×interval (~1.5s fast)
                     if kcp.lock().is_dead() {
                         error!("KCP dead_link detected for peer {} — closing session", peer);
                         dead.store(true, Ordering::Release);
@@ -897,7 +891,7 @@ impl KcpServerSession {
                     // tokio worker thread, preventing it from processing UDP recv /
                     // ACKs. The throughput cost of blocking the worker far exceeds
                     // the latency cost of a second pool hop.
-                    let to_send = if kcp_rs::should_cpu_block_compress(plain_len) {
+                    let to_send = if kcrypt_rs::should_cpu_block_compress(plain_len) {
                         kio::cpu_block(compress_fn).await
                     } else {
                         compress_fn()
@@ -979,7 +973,11 @@ impl KcpServerSession {
                     if had_outbound || kcp_guard.wait_send() > 0 {
                         next_update = 1;
                     } else {
-                        next_update = next_update.clamp(1, KCP_UPDATE_INTERVAL_MS);
+                        // Idle: flush() already returns the KCP interval (mode-dependent,
+                        // 10-40ms). Back off to it instead of forcing a 2ms wakeup per idle
+                        // session — 500Hz × session count was the dominant idle CPU cost.
+                        // Bounded so Phase 1a reaping and keepalive checks run on time.
+                        next_update = next_update.clamp(1, MAX_IDLE_UPDATE_MS);
                     }
                 }
 
@@ -1009,7 +1007,7 @@ impl KcpServerSession {
                     };
 
                     let total_bytes: usize = packets.iter().map(|p| p.len()).sum();
-                    let use_cpu_block = kcp_rs::should_cpu_block_encrypt(
+                    let use_cpu_block = kcrypt_rs::should_cpu_block_encrypt(
                         has_encryption,
                         has_aead,
                         packets.len(),
@@ -1026,7 +1024,7 @@ impl KcpServerSession {
                         let crypt_c = crypt_sb.clone();
                         let cb_c = crypto_buf_sb.clone();
                         enc_out = kio::cpu_block(move || {
-                            kcp_rs::encrypt_batch(
+                            kcrypt_rs::encrypt_batch(
                                 packets,
                                 crypt_c.as_ref(),
                                 &cb_c,
@@ -1037,7 +1035,7 @@ impl KcpServerSession {
                         .await;
                     } else {
                         kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.encrypt_inline, 1);
-                        kcp_rs::encrypt_batch_into(
+                        kcrypt_rs::encrypt_batch_into(
                             packets,
                             crypt_sb.as_ref(),
                             &crypto_buf_sb,
@@ -1050,7 +1048,13 @@ impl KcpServerSession {
                     // Rate limit the send (token bucket, 0 = unlimited).
                     {
                         let total_bytes: usize = encrypted.iter().map(|b| b.len()).sum();
-                        ratelimiter.acquire(total_bytes);
+                        loop {
+                            let wait = ratelimiter.acquire(total_bytes);
+                            if wait.is_zero() {
+                                break;
+                            }
+                            kio::sleep(wait).await;
+                        }
                     }
 
                     match socket.send_batch_to(&encrypted, peer).await {
@@ -1066,6 +1070,7 @@ impl KcpServerSession {
                             warn!("UDP send_to error ({}): {}", peer, e);
                             if e.kind() == std::io::ErrorKind::ConnectionRefused {
                                 error!("ConnectionRefused for {} — broken socket, closing", peer);
+                                dead.store(true, Ordering::Release);
                                 smux.close();
                                 break;
                             }
@@ -1115,7 +1120,7 @@ impl KcpServerSession {
             // All ciphers with CFB headers (including xor/salsa20) use the
             // standard 20-byte header. probe_header=false because the header
             // is always present for encrypted traffic (unlike legacy "none").
-            match kcp_rs::decrypt_cfb_in_place(data, self.crypt.as_ref(), false) {
+            match kcrypt_rs::decrypt_cfb_in_place(data, self.crypt.as_ref(), false) {
                 Ok(body) => self.feed_body(body),
                 Err(_) => {
                     kcp_rs::snmp_add(&kcp_rs::DEFAULT_SNMP.in_csum_errors, 1);
@@ -1124,11 +1129,27 @@ impl KcpServerSession {
             return;
         }
         // null cipher: no crypto header
-        self.feed_body(kcp_rs::inbound_null(data));
+        self.feed_body(kcrypt_rs::inbound_null(data));
     }
 
     /// FEC + KCP input + SMUX for an already-decrypted body slice.
     fn feed_body(&self, body: &[u8]) {
+        // First inbound packet (TCP sessions): adopt the client's conv so KCP
+        // input() doesn't drop it. Go's server keys each session by the first
+        // packet's conv; UDP sessions already extracted it in get_or_create.
+        if self.adopt_conv.swap(false, Ordering::Relaxed) && body.len() >= 6 {
+            let fec_flag = u16::from_le_bytes([body[4], body[5]]);
+            let off = if (0x00f1..=0x00f3).contains(&fec_flag) {
+                8
+            } else {
+                0
+            };
+            if body.len() >= off + 4 {
+                let conv = u32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+                self.kcp.lock().set_conv(conv);
+                info!("adopted client conv=0x{:08x} (TCP session)", conv);
+            }
+        }
         // FEC decode may allocate recovered shards; data-path KCP input uses
         // slices only (no intermediate to_vec for feed_slice[FEC_HDR..]).
         if let Some(ref fec) = self.fec_decoder {
@@ -1231,32 +1252,27 @@ impl KcpServerSession {
     /// Returns a list of (stream_id, Arc<Stream>) pairs for streams that
     /// were accepted by the SMUX session but have not yet been dispatched.
     fn drain_new_streams(&self) -> Vec<(u32, Arc<smux_rs::stream::Stream>)> {
-        let handled = self.handled_streams.lock().clone();
+        // Single pass, no HashSet clone. Lock order is streams → handled,
+        // identical to the flush loop's Phase 1a reaper, so there is no
+        // lock-order inversion. Accept-and-mark happen atomically under the
+        // handled lock.
         let streams = self.smux.streams();
         let stream_map = streams.lock();
-        let new_streams: Vec<(u32, Arc<smux_rs::stream::Stream>)> = stream_map
-            .iter()
-            .filter(|(&id, s)| {
-                if handled.contains(&id) {
-                    return false;
-                }
-                // Accept streams that are ready (SYN received) OR have data buffered.
-                // A FIN might arrive before the server reads the data, so we must
-                // also accept streams with pending data even if state is FinReceived.
-                s.is_ready() || s.available() > 0
-            })
-            .map(|(&id, s)| (id, s.clone()))
-            .collect();
-        drop(stream_map);
-
-        // Mark as handled
-        {
-            let mut h = self.handled_streams.lock();
-            for (id, _) in &new_streams {
-                h.insert(*id);
+        let mut handled = self.handled_streams.lock();
+        let mut new_streams = Vec::new();
+        for (&id, s) in stream_map.iter() {
+            if handled.contains(&id) {
+                continue;
+            }
+            // Accept streams that are ready (SYN received) OR have data
+            // buffered. A FIN may arrive before the server reads the data, so
+            // also accept streams with pending data even if state is
+            // FinReceived.
+            if s.is_ready() || s.available() > 0 {
+                new_streams.push((id, s.clone()));
+                handled.insert(id);
             }
         }
-
         new_streams
     }
 }
@@ -1288,13 +1304,15 @@ fn get_or_create_session(
     // IMPORTANT: Do not hold the get() guard while calling remove(), as that
     // can deadlock on DashMap shard lock (read guard vs write for remove).
     // Snapshot the liveness first, then remove if needed.
-    let need_evict = sessions.get(peer).is_some_and(|s| s.is_dead());
-    if need_evict {
-        sessions.remove(peer);
-    }
-
     if let Some(s) = sessions.get(peer) {
-        return s.clone();
+        if s.is_dead() {
+            // Drop the DashMap read guard before remove() — holding it while
+            // calling remove() can deadlock on the shard lock (read vs write).
+            drop(s);
+            sessions.remove(peer);
+        } else {
+            return s.clone();
+        }
     }
 
     // Step 2: Extract conv OUTSIDE any lock — this involves decryption
@@ -1388,6 +1406,7 @@ fn get_or_create_session(
         socket,
         key_arr,
         session_cfg,
+        false, // conv already extracted from the first packet above
     ));
     // Insert with entry API — only locks one shard
     // If another thread inserted a session for this peer while we were
@@ -1402,11 +1421,24 @@ fn get_or_create_session(
     }
 }
 
-/// Recv loop for a TCP raw KCP session. Reads datagrams and feeds KCP+SMUX.
+/// Recv loop for a TCP raw KCP session. Reads datagrams, feeds KCP+SMUX, and
+/// relays newly-accepted SMUX streams to the TCP target (mirroring the UDP
+/// path's `drain_new_streams` handling — without it, TCP-mode streams are
+/// created by the SMUX session but never connected to the target).
 #[cfg(target_os = "linux")]
-fn spawn_tcp_recv_loop(session: Arc<KcpServerSession>, socket: Arc<kio::DatagramSocket>) {
+fn spawn_tcp_recv_loop(
+    session: Arc<KcpServerSession>,
+    socket: Arc<kio::DatagramSocket>,
+    target: String,
+    qpp_enabled: bool,
+    qpp_key: Vec<u8>,
+    qpp_count: u16,
+    quiet: bool,
+    close_wait_val: u64,
+) {
     let dead = session.dead.clone();
     let flush = session.flush_notify.clone();
+    let peer = session.peer;
     kio::spawn_task(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
@@ -1417,6 +1449,37 @@ fn spawn_tcp_recv_loop(session: Arc<KcpServerSession>, socket: Arc<kio::Datagram
                 Ok((n, _)) if n > 0 => {
                     session.feed_data_mut(&mut buf[..n]);
                     flush.notify_one();
+                    for (stream_id, smux_stream) in session.drain_new_streams() {
+                        if !quiet {
+                            info!(
+                                "accepting stream {} from {} -> target {}",
+                                stream_id, peer, target
+                            );
+                        }
+                        let target = target.clone();
+                        let qpp_key = qpp_key.clone();
+                        let fn_notify = flush.clone();
+                        kio::spawn_task(async move {
+                            if let Err(e) = handle_stream(
+                                target,
+                                smux_stream,
+                                stream_id,
+                                qpp_enabled,
+                                qpp_key,
+                                qpp_count,
+                                quiet,
+                                close_wait_val,
+                                fn_notify,
+                            )
+                            .await
+                            {
+                                error!("stream {} handler error: {:?}", stream_id, e);
+                            }
+                            if !quiet {
+                                info!("stream {} closed", stream_id);
+                            }
+                        });
+                    }
                 }
                 Err(_) => break,
                 _ => {}
@@ -1426,9 +1489,9 @@ fn spawn_tcp_recv_loop(session: Arc<KcpServerSession>, socket: Arc<kio::Datagram
 }
 
 fn main() -> Result<()> {
-    kcp_rs::set_offload_profile(match kio::runtime_kind() {
-        kio::RuntimeKind::Tokio => kcp_rs::OffloadProfile::Tokio,
-        kio::RuntimeKind::Smol => kcp_rs::OffloadProfile::Smol,
+    kcrypt_rs::set_offload_profile(match kio::runtime_kind() {
+        kio::RuntimeKind::Tokio => kcrypt_rs::OffloadProfile::Tokio,
+        kio::RuntimeKind::Smol => kcrypt_rs::OffloadProfile::Smol,
     });
     kio::block_on(async_main())
 }
@@ -1455,7 +1518,8 @@ async fn async_main() -> Result<()> {
     };
 
     // Set up logging: redirect to file if --log is specified
-    if let Some(ref log_path) = cli.log {
+    // Empty string (Go's default) means stderr.
+    if let Some(ref log_path) = cli.log.as_ref().filter(|s| !s.is_empty()) {
         // Rotate log file if it exceeds 10MB
         rotate_log(log_path, 10 * 1024 * 1024);
         let file = std::fs::OpenOptions::new()
@@ -1483,9 +1547,9 @@ async fn async_main() -> Result<()> {
     let listen = cli.listen.as_deref().unwrap_or(":29900");
     let target = cli.target.as_deref().unwrap_or("127.0.0.1:12948");
 
-    let key_str = cli.key.as_deref().unwrap();
-    let crypt_method = cli.crypt.as_deref().unwrap();
-    let mode = cli.mode.as_deref().unwrap();
+    let key_str = cli.key.as_deref().unwrap_or("it's a secrect");
+    let crypt_method = cli.crypt.as_deref().unwrap_or("aes");
+    let mode = cli.mode.as_deref().unwrap_or("fast");
     let mtu = cli.mtu.unwrap_or(1350);
     let sndwnd = cli.sndwnd.unwrap_or(1024);
     let rcvwnd = cli.rcvwnd.unwrap_or(1024);
@@ -1505,7 +1569,7 @@ async fn async_main() -> Result<()> {
     let framesize = cli.framesize;
     let keepalive = cli.keepalive.unwrap_or(10);
     let ratelimit_val = cli.ratelimit;
-    let close_wait_val = cli.closewait.unwrap_or(30);
+    let close_wait_val = cli.closewait.unwrap_or(30).max(0) as u64;
     let quiet = cli.quiet;
     #[cfg(feature = "qpp")]
     let qpp_enabled = cli.qpp;
@@ -1563,33 +1627,47 @@ async fn async_main() -> Result<()> {
         smuxbuf,
         streambuf,
         framesize,
-        keepalive,
+        keepalive: keepalive.max(0) as u64,
         nocomp,
         ratelimit: ratelimit_val,
     };
 
-    // TCP mode: accept raw TCP connections, each is a dedicated KCP session.
-    // Do NOT also bind UDP on the same ports — that was only for the UDP path
-    // and confused logs / wasted sockets when --tcp is set.
+    // TCP mode: additionally accept raw TCP connections alongside the
+    // always-on UDP listener, each TCP conn a dedicated KCP session
+    // (matches Go: `--tcp` exposes a tcpraw listener alongside UDP).
     if cli.tcp {
         #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("--tcp requires Linux (raw sockets + TCP_REPAIR)");
+        warn!("--tcp requires Linux (raw sockets + TCP_REPAIR) — serving UDP only");
 
         #[cfg(target_os = "linux")]
         {
             let key = key_arr;
             let cfg = session_cfg.clone();
             for &addr in &listen_addrs {
-                let listener = kio::tcpraw_listen(&addr)?;
+                let listener = match kio::tcpraw_listen(&addr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        warn!("tcpraw listen on {} failed: {}", addr, e);
+                        continue;
+                    }
+                };
+                if dscp_val > 0 {
+                    if let Err(e) = listener.set_dscp(dscp_val) {
+                        warn!("SetDSCP({}) failed on tcpraw listener: {}", dscp_val, e);
+                    }
+                }
                 info!("listening on {} for TCP raw KCP connections", addr);
                 let key = key;
                 let cfg = cfg.clone();
+                let target_loop = target.to_string();
+                let qpp_key_loop = key.to_vec();
                 kio::spawn_task(async move {
                     loop {
                         let (conn, peer) = match listener.accept().await {
                             Ok(c) => c,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::Interrupted =>
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::Interrupted =>
                             {
                                 // Should not happen with blocking accept; retry.
                                 kio::sleep_ms(10).await;
@@ -1602,8 +1680,20 @@ async fn async_main() -> Result<()> {
                         };
                         info!("TCP raw session from {}", peer);
                         let socket = Arc::new(kio::DatagramSocket::TcpRaw(conn));
-                        let session = Arc::new(KcpServerSession::new(0, peer, &socket, &key, &cfg));
-                        spawn_tcp_recv_loop(session, socket);
+                        let session = Arc::new(KcpServerSession::new(
+                            0, peer, &socket, &key, &cfg,
+                            true, // TCP: conv unknown at accept; adopt from first packet
+                        ));
+                        spawn_tcp_recv_loop(
+                            session,
+                            socket,
+                            target_loop.clone(),
+                            qpp_enabled,
+                            qpp_key_loop.clone(),
+                            qpp_count,
+                            quiet,
+                            close_wait_val,
+                        );
                     }
                 });
             }
@@ -1612,15 +1702,6 @@ async fn async_main() -> Result<()> {
                 info!("ratelimit: {} bytes/sec", ratelimit_val);
             }
             info!("sockbuf: {}", sockbuf);
-            // Wait for Ctrl-C.
-            loop {
-                kio::sleep_ms(500).await;
-                if stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
-            info!("bye");
-            return Ok(());
         }
     }
 
@@ -1647,7 +1728,7 @@ async fn async_main() -> Result<()> {
     // SNMP collection is off by default (zero hot-path cost). Enable only when
     // a log path is set and period > 0.
     if let Some(ref snmplog_path) = cli.snmplog {
-        let secs = cli.snmpperiod.unwrap_or(60);
+        let secs = cli.snmpperiod.unwrap_or(60).max(0) as u64;
         if secs > 0 && !snmplog_path.is_empty() {
             kcp_rs::snmp_enable();
             let period = Duration::from_secs(secs);
@@ -1717,7 +1798,6 @@ async fn async_main() -> Result<()> {
                     &udp_recv,
                     &session_cfg,
                 );
-                let target_str = target_str.clone();
                 session.feed_data_mut(data);
                 session.flush_notify.notify_one();
                 for (stream_id, smux_stream) in session.drain_new_streams() {
@@ -1963,7 +2043,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_merge_cli_precedence() {
+    fn test_cli_merge_config_precedence() {
+        // Go kcptun: parseJSONConfig decodes OVER flag defaults, so config
+        // values win. CLI values are the fallback when config omits a field.
         let cli = Cli {
             listen: Some("0.0.0.0:29900".into()),
             target: Some("10.0.0.1:8080".into()),
@@ -2007,9 +2089,9 @@ mod tests {
             ..Default::default()
         };
         let merged = Cli::merge(cli, cfg);
-        // CLI values take precedence
-        assert_eq!(merged.target.as_deref(), Some("10.0.0.1:8080"));
-        assert_eq!(merged.key.as_deref(), Some("cli-key"));
+        // Config values take precedence (Go parseJSONConfig decodes over flags)
+        assert_eq!(merged.target.as_deref(), Some("cfg-target:8080"));
+        assert_eq!(merged.key.as_deref(), Some("cfg-key"));
     }
 
     #[test]

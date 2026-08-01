@@ -8,7 +8,22 @@ description = "KCP protocol implementation in Rust - reliable UDP transport"
 bytes = "1"
 parking_lot = "0.12"
 crossbeam = "0.8"
-kcrypt-rs = { path = "../kcrypt-rs" }
 reed-solomon-erasure = "6"
 crc32fast = "1"
 smallvec = "1"
+# Optional async runtime + I/O (KcpConn). Enable via async-tokio or async-smol.
+kio-rs = { path = "../kio-rs", default-features = false, optional = true }
+
+[dev-dependencies]
+# Integration tests for KcpConn need a runtime; async-tokio feature pulls kio/tokio.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+libc = "0.2"
+
+[features]
+default = []
+# Convenience alias → tokio backend (matches smux-rs default).
+async = ["async-tokio"]
+# Async KcpConn over kio (tokio runtime).
+async-tokio = ["dep:kio-rs", "kio-rs/tokio"]
+# Async KcpConn over kio (smol runtime). Mutually exclusive with async-tokio at kio level.
+async-smol = ["dep:kio-rs", "kio-rs/smol"]

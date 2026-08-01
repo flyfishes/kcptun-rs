@@ -1,13 +1,40 @@
-//! Linux `sendmmsg` helpers for batch UDP send (P1.2b).
+//! Linux `sendmmsg` helpers for batch UDP send/recv (P1.2b).
 //!
 //! Compiled only on Linux. Other platforms keep the try_send / sequential path.
+//!
+//! The `iovec`/`mmsghdr`/`sockaddr_storage` arrays are built in a per-thread
+//! reusable scratch buffer (capacity retained across calls) so the hot path
+//! does not allocate per batch.
+//!
+//! TODO(linux-verify): the `#[cfg(test)]` round-trip tests below were only
+//! compile-checked (`cargo check -p kio-rs --target x86_64-unknown-linux-gnu`).
+//! Run them for real once a Linux toolchain/container is available:
+//! `cargo test -p kio-rs` in `rust:nightly-2026-07-18`.
 
 #![cfg(target_os = "linux")]
 
+use std::cell::RefCell;
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
 use std::ptr;
+
+/// Reusable `sendmmsg`/`recvmmsg` scratch arrays (cleared, not deallocated).
+struct MmsgScratch {
+    iov: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    names: Vec<libc::sockaddr_storage>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<MmsgScratch> = const {
+        RefCell::new(MmsgScratch {
+            iov: Vec::new(),
+            msgs: Vec::new(),
+            names: Vec::new(),
+        })
+    };
+}
 
 /// Try to send many datagrams with one `sendmmsg` syscall.
 ///
@@ -16,67 +43,74 @@ use std::ptr;
 ///
 /// Returns number of messages successfully queued (may be partial).
 /// `WouldBlock` is returned only if zero messages were sent.
-pub fn sendmmsg_connected(fd: RawFd, bufs: &[&[u8]]) -> io::Result<usize> {
+pub fn sendmmsg_connected<B: AsRef<[u8]>>(fd: RawFd, bufs: &[B]) -> io::Result<usize> {
     sendmmsg_inner(fd, bufs, None)
 }
 
-pub fn sendmmsg_to(fd: RawFd, bufs: &[&[u8]], addr: &std::net::SocketAddr) -> io::Result<usize> {
+pub fn sendmmsg_to<B: AsRef<[u8]>>(
+    fd: RawFd,
+    bufs: &[B],
+    addr: &std::net::SocketAddr,
+) -> io::Result<usize> {
     let (storage, len) = socket_addr_to_storage(addr);
     sendmmsg_inner(fd, bufs, Some((&storage, len)))
 }
 
-fn sendmmsg_inner(
+fn sendmmsg_inner<B: AsRef<[u8]>>(
     fd: RawFd,
-    bufs: &[&[u8]],
+    bufs: &[B],
     to: Option<(&libc::sockaddr_storage, libc::socklen_t)>,
 ) -> io::Result<usize> {
     if bufs.is_empty() {
         return Ok(0);
     }
-    // Cap batch size to avoid huge stack/heap; callers can loop.
+    // Cap batch size to avoid huge scratch; callers can loop.
     const MAX_BATCH: usize = 64;
     let n = bufs.len().min(MAX_BATCH);
 
-    // Heap-allocate iovec + mmsghdr to avoid large stack frames.
-    let mut iov: Vec<libc::iovec> = Vec::with_capacity(n);
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
+    SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        s.iov.clear();
+        s.msgs.clear();
 
-    for buf in bufs.iter().take(n) {
-        iov.push(libc::iovec {
-            iov_base: buf.as_ptr() as *mut _,
-            iov_len: buf.len(),
-        });
-    }
-
-    for i in 0..n {
-        let mut hdr: libc::mmsghdr = unsafe { mem::zeroed() };
-        hdr.msg_hdr.msg_iov = &mut iov[i] as *mut _;
-        hdr.msg_hdr.msg_iovlen = 1;
-        if let Some((storage, len)) = to {
-            hdr.msg_hdr.msg_name = storage as *const _ as *mut _;
-            hdr.msg_hdr.msg_namelen = len;
+        for buf in bufs.iter().take(n) {
+            let b = buf.as_ref();
+            s.iov.push(libc::iovec {
+                iov_base: b.as_ptr() as *mut _,
+                iov_len: b.len(),
+            });
         }
-        msgs.push(hdr);
-    }
 
-    // MSG_DONTWAIT: match try_send semantics used on non-Linux paths.
-    // flags type differs by libc (musl: c_uint, glibc: c_int); `as _` infers.
-    let ret = unsafe {
-        libc::sendmmsg(
-            fd,
-            msgs.as_mut_ptr(),
-            n as libc::c_uint,
-            libc::MSG_DONTWAIT as _,
-        )
-    };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::WouldBlock {
+        for i in 0..n {
+            let mut hdr: libc::mmsghdr = unsafe { mem::zeroed() };
+            hdr.msg_hdr.msg_iov = &mut s.iov[i] as *mut _;
+            hdr.msg_hdr.msg_iovlen = 1;
+            if let Some((storage, len)) = to {
+                hdr.msg_hdr.msg_name = storage as *const _ as *mut _;
+                hdr.msg_hdr.msg_namelen = len;
+            }
+            s.msgs.push(hdr);
+        }
+
+        // MSG_DONTWAIT: match try_send semantics used on non-Linux paths.
+        // flags type differs by libc (musl: c_uint, glibc: c_int); `as _` infers.
+        let ret = unsafe {
+            libc::sendmmsg(
+                fd,
+                s.msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
             return Err(err);
         }
-        return Err(err);
-    }
-    Ok(ret as usize)
+        Ok(ret as usize)
+    })
 }
 
 fn socket_addr_to_storage(
@@ -145,69 +179,73 @@ pub fn recvmmsg_from(
     const MAX_BATCH: usize = 64;
     let n = bufs.len().min(MAX_BATCH);
 
-    let mut iov: Vec<libc::iovec> = Vec::with_capacity(n);
-    let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { mem::zeroed() }; n];
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
+    SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        s.iov.clear();
+        s.msgs.clear();
+        s.names.clear();
+        s.names.resize(n, unsafe { mem::zeroed() });
 
-    for b in bufs.iter_mut().take(n) {
-        if b.capacity() < 2048 {
-            b.reserve(2048);
-        }
-        let cap = b.capacity();
-        unsafe {
-            b.set_len(cap);
-        }
-        iov.push(libc::iovec {
-            iov_base: b.as_mut_ptr() as *mut _,
-            iov_len: cap,
-        });
-    }
-
-    for i in 0..n {
-        let mut hdr: libc::mmsghdr = unsafe { mem::zeroed() };
-        hdr.msg_hdr.msg_iov = &mut iov[i] as *mut _;
-        hdr.msg_hdr.msg_iovlen = 1;
-        hdr.msg_hdr.msg_name = &mut names[i] as *mut _ as *mut _;
-        hdr.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        msgs.push(hdr);
-    }
-
-    // MSG_DONTWAIT: never block even if the runtime's non-blocking flag is
-    // lost/raced; callers (try_recv_batch_from) expect WouldBlock semantics.
-    // flags type differs by libc (musl: c_uint, glibc: c_int); `as _` infers.
-    let ret = unsafe {
-        libc::recvmmsg(
-            fd,
-            msgs.as_mut_ptr(),
-            n as libc::c_uint,
-            libc::MSG_DONTWAIT as _,
-            ptr::null_mut(),
-        )
-    };
-    if ret < 0 {
         for b in bufs.iter_mut().take(n) {
+            if b.capacity() < 2048 {
+                b.reserve(2048);
+            }
+            let cap = b.capacity();
+            unsafe {
+                b.set_len(cap);
+            }
+            s.iov.push(libc::iovec {
+                iov_base: b.as_mut_ptr() as *mut _,
+                iov_len: cap,
+            });
+        }
+
+        for i in 0..n {
+            let mut hdr: libc::mmsghdr = unsafe { mem::zeroed() };
+            hdr.msg_hdr.msg_iov = &mut s.iov[i] as *mut _;
+            hdr.msg_hdr.msg_iovlen = 1;
+            hdr.msg_hdr.msg_name = &mut s.names[i] as *mut _ as *mut _;
+            hdr.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            s.msgs.push(hdr);
+        }
+
+        // MSG_DONTWAIT: never block even if the runtime's non-blocking flag is
+        // lost/raced; callers (try_recv_batch_from) expect WouldBlock semantics.
+        // flags type differs by libc (musl: c_uint, glibc: c_int); `as _` infers.
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                s.msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            for b in bufs.iter_mut().take(n) {
+                unsafe {
+                    b.set_len(0);
+                }
+            }
+            return Err(io::Error::last_os_error());
+        }
+        let got = ret as usize;
+        let mut out = Vec::with_capacity(got);
+        for (i, b) in bufs.iter_mut().take(got).enumerate() {
+            let len = s.msgs[i].msg_len as usize;
+            unsafe {
+                b.set_len(len);
+            }
+            let addr = sockaddr_storage_to_addr(&s.names[i], s.msgs[i].msg_hdr.msg_namelen);
+            out.push((len, addr));
+        }
+        for b in bufs.iter_mut().skip(got).take(n - got) {
             unsafe {
                 b.set_len(0);
             }
         }
-        return Err(io::Error::last_os_error());
-    }
-    let got = ret as usize;
-    let mut out = Vec::with_capacity(got);
-    for i in 0..got {
-        let len = msgs[i].msg_len as usize;
-        unsafe {
-            bufs[i].set_len(len);
-        }
-        let addr = sockaddr_storage_to_addr(&names[i], msgs[i].msg_hdr.msg_namelen);
-        out.push((len, addr));
-    }
-    for i in got..n {
-        unsafe {
-            bufs[i].set_len(0);
-        }
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 fn sockaddr_storage_to_addr(
@@ -218,7 +256,7 @@ fn sockaddr_storage_to_addr(
         return None;
     }
     match storage.ss_family as i32 {
-        x if x == libc::AF_INET as i32 => {
+        x if x == libc::AF_INET => {
             let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
@@ -226,7 +264,7 @@ fn sockaddr_storage_to_addr(
                 ip, port,
             )))
         }
-        x if x == libc::AF_INET6 as i32 => {
+        x if x == libc::AF_INET6 => {
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
@@ -238,5 +276,60 @@ fn sockaddr_storage_to_addr(
             )))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+
+    /// `sendmmsg_to` must deliver every datagram intact and in order.
+    #[test]
+    fn sendmmsg_to_roundtrip() {
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = recv.local_addr().unwrap();
+
+        let expected: Vec<Vec<u8>> = vec![vec![0xAA; 100], vec![0xBB; 200], vec![0xCC; 300]];
+        let n = sendmmsg_to(send.as_raw_fd(), &expected, &target).unwrap();
+        assert_eq!(n, 3, "all three datagrams should send");
+
+        let mut got_buf = vec![0u8; 512];
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        while received.len() < 3 {
+            let (len, _peer) = recv.recv_from(&mut got_buf).unwrap();
+            received.push(got_buf[..len].to_vec());
+        }
+        assert_eq!(
+            received, expected,
+            "datagrams must arrive intact and in order"
+        );
+    }
+
+    /// `recvmmsg_from` must fill one slot per datagram with correct peers.
+    #[test]
+    fn recvmmsg_from_batch() {
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+
+        for _ in 0..3 {
+            send.send_to(b"x", recv_addr).unwrap();
+        }
+        let mut bufs = vec![vec![0u8; 0]; 3];
+        let out = loop {
+            let o = recvmmsg_from(recv.as_raw_fd(), &mut bufs).unwrap();
+            if !o.is_empty() {
+                break o;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(out.len(), 3, "should batch-receive all three datagrams");
+        for (len, peer) in &out {
+            assert_eq!(*len, 1);
+            assert!(peer.is_some());
+        }
     }
 }

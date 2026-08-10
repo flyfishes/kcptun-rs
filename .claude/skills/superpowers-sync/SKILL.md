@@ -17,9 +17,9 @@ description: When finishing a feature/fix, write (or update) the plan to docs/su
 ```
 docs/superpowers/
 ├── plans/
-│   └── YYYY-MM-DD-<short-kebab>.md
+│   └── YYYY-MM-DD-<SHORT_KEBAB>.md
 └── specs/
-    └── YYYY-MM-DD-<short-kebab>.md
+    └── YYYY-MM-DD-<SHORT_KEBAB>.md
 ```
 
 ### Plan file (`plans/`)

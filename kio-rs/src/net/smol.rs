@@ -141,11 +141,19 @@ impl UdpSocket {
         }
     }
 
-    /// Non-blocking recv for connected sockets (smol: via get_ref + try).
+    /// Non-blocking recv for connected sockets.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // smol/async-net has no try_recv; use libc recv with MSG_DONTWAIT on Linux,
-        // otherwise WouldBlock always to force async path.
-        #[cfg(target_os = "linux")]
+        // async-net has no try_recv API. Use the socket directly on platforms
+        // that provide MSG_DONTWAIT so callers can drain a UDP burst without
+        // waiting for one reactor wake per datagram.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        ))]
         {
             use std::os::fd::AsRawFd;
             let fd = self.inner.as_raw_fd();
@@ -162,18 +170,101 @@ impl UdpSocket {
             }
             Ok(n as usize)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        )))]
         {
             let _ = buf;
             Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
     }
 
-    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    /// Non-blocking send for connected sockets (libc `send` + MSG_DONTWAIT).
+    /// All BSD-derived systems (macOS, FreeBSD, OpenBSD, NetBSD, DragonFly) and
+    /// Linux support MSG_DONTWAIT; other platforms fall back to WouldBlock to
+    /// force the async path.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        ))]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = self.inner.as_raw_fd();
+            let n =
+                unsafe { libc::send(fd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(n as usize)
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        )))]
+        {
+            let _ = buf;
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// Try to send all `bufs` without blocking. Returns the number of packets
+    /// sent (stops on `WouldBlock` / partial).
+    ///
+    /// Linux: `sendmmsg` (one syscall for the batch). Others: per-packet
+    /// [`try_send`](Self::try_send).
+    pub fn try_send_batch<B: AsRef<[u8]>>(&self, bufs: &[B]) -> io::Result<usize> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            // use recvfrom with MSG_DONTWAIT
+            match super::mmsg::sendmmsg_connected(self.inner.as_raw_fd(), bufs) {
+                Ok(n) => Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut sent = 0;
+            for b in bufs {
+                match self.try_send(b.as_ref()) {
+                    Ok(n) if n == b.as_ref().len() => sent += 1,
+                    Ok(_) => return Ok(sent), // partial datagram (shouldn't happen)
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(sent),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(sent)
+        }
+    }
+
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        ))]
+        {
+            use std::os::fd::AsRawFd;
             let fd = self.inner.as_raw_fd();
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -190,33 +281,21 @@ impl UdpSocket {
             if n < 0 {
                 return Err(io::Error::last_os_error());
             }
-            // parse addr via mmsg helper pattern - inline minimal
-            let peer = match storage.ss_family as i32 {
-                x if x == libc::AF_INET as i32 => {
-                    let sin = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in) };
-                    let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                        ip,
-                        u16::from_be(sin.sin_port),
-                    ))
-                }
-                x if x == libc::AF_INET6 as i32 => {
-                    let sin6 = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in6) };
-                    let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                    std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                        ip,
-                        u16::from_be(sin6.sin6_port),
-                        sin6.sin6_flowinfo,
-                        sin6.sin6_scope_id,
-                    ))
-                }
-                _ => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown family"));
-                }
-            };
+            // SAFETY: recvfrom initialized `storage` and wrote its actual byte
+            // length to `len`; SockAddr owns the copied storage value.
+            let peer = unsafe { socket2::SockAddr::new(storage, len) }
+                .as_socket()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown family"))?;
             Ok((n as usize, peer))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+        )))]
         {
             let _ = buf;
             Err(io::Error::from(io::ErrorKind::WouldBlock))
@@ -271,9 +350,87 @@ impl UdpSocket {
         }
     }
 
+    /// Allocation-free batch receive on an unconnected socket.
+    ///
+    /// Fills `packet_bufs[..n]` with payloads **in place** (slots stay owned by
+    /// the caller, no per-slot replacement `Vec`) and writes the source
+    /// addresses into `peers` (cleared first; capacity reused). Returns the
+    /// number of datagrams received; `Ok(0)` on `WouldBlock`.
+    ///
+    /// Linux: one `recvmmsg` syscall. Elsewhere: sequential `try_recv_from`
+    /// filling slots in place (no `to_vec()` copy).
+    pub fn try_recv_batch_from_into(
+        &self,
+        packet_bufs: &mut [Vec<u8>],
+        peers: &mut Vec<SocketAddr>,
+    ) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            return super::mmsg::recvmmsg_from_into(self.inner.as_raw_fd(), packet_bufs, peers);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            peers.clear();
+            let mut n = 0;
+            for slot in packet_bufs.iter_mut() {
+                if slot.capacity() < 2048 {
+                    slot.reserve(2048);
+                }
+                slot.resize(slot.capacity(), 0);
+                match self.try_recv_from(slot) {
+                    Ok((len, peer)) => {
+                        slot.truncate(len);
+                        peers.push(peer);
+                        n += 1;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(n)
+        }
+    }
+
     #[inline(always)]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+
+    /// Non-blocking batch receive on a connected socket (no peer addresses).
+    ///
+    /// Linux/macOS: one `recvmmsg` syscall fills the pool. Others: one
+    /// `try_recv` per call into `pool[0]`. Returns datagrams received.
+    pub fn try_recv_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
+        if pool.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            match super::mmsg::recvmmsg_connected(self.inner.as_raw_fd(), pool) {
+                Ok(n) => Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if pool[0].capacity() < 2048 {
+                pool[0].reserve(2048);
+            }
+            // resize to capacity so try_recv gets a non-zero-length buffer.
+            pool[0].resize(pool[0].capacity(), 0);
+            match self.try_recv(&mut pool[0]) {
+                Ok(n) if n > 0 => {
+                    pool[0].truncate(n);
+                    Ok(1)
+                }
+                Ok(_) => Ok(0),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
     }
 }
 
@@ -304,6 +461,30 @@ impl TcpListener {
         let _ = s.set_nodelay(true);
         Ok((TcpStream { inner: s }, a))
     }
+
+    /// Non-blocking accept of one pending connection; `WouldBlock` when none.
+    ///
+    /// Polls the async `accept` future once with a no-op waker.
+    #[inline(always)]
+    pub fn try_accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = pin!(self.inner.accept());
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok((s, a))) => {
+                let _ = s.set_nodelay(true);
+                Ok((TcpStream { inner: s }, a))
+            }
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no pending connection",
+            )),
+        }
+    }
 }
 
 // ─── TcpStream ────────────────────────────────────────────────────────────────
@@ -315,20 +496,29 @@ pub struct TcpStream {
 impl TcpStream {
     #[inline(always)]
     pub async fn connect(addr: impl AsRef<str>) -> io::Result<Self> {
-        let addr = addr.as_ref();
-        // Resolve DNS hostnames (server `-t` target), not just IP literals.
-        let remote: SocketAddr = addr
-            .to_socket_addrs()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-            .next()
-            .ok_or_else(|| {
+        let addr = addr.as_ref().to_owned();
+        // Offload blocking DNS resolution + TCP connect to the persistent
+        // blocking pool. Try all resolved addresses (IPv6/IPv4 fallback).
+        let std_stream = crate::cpu_block(move || -> io::Result<std::net::TcpStream> {
+            let addrs = addr
+                .to_socket_addrs()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let mut last_err = None;
+            for remote in addrs {
+                match raw_tcp_stream(remote) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("no address for {addr}"),
                 )
-            })?;
-        let std_stream = raw_tcp_stream(remote)?;
-        let async_stream = async_io::Async::new(std_stream)?;
+            }))
+        })
+        .await;
+        let async_stream = async_io::Async::new(std_stream?)?;
         let s = smol::net::TcpStream::from(async_stream);
         Ok(Self { inner: s })
     }

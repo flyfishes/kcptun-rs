@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust release binaries (tokio default), `samply`, `bench/throughput.py`, existing stress tests, bash 3.2-compatible scripts, Speedscope JSON artifacts (gitignored).
 
-**Spec:** `docs/superpowers/specs/2026-07-21-flamegraph-perf-design.md`
+**Spec:** `docs/superpowers/specs/2026-07-21-FLAMEGRAPH_PERF_DESIGN.md`
 
 ---
 
@@ -668,7 +668,7 @@ No TBD steps; Task 5 code is intentionally data-dependent but requires real patc
 
 ## Execution handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-07-21-flamegraph-perf.md`.
+Plan complete and saved to `docs/superpowers/plans/2026-07-21-FLAMEGRAPH_PERF.md`.
 
 **Two execution options:**
 

@@ -341,15 +341,17 @@ def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
     srv_args = build_args(server_bin, is_go, 'server', echo_port, srv_port, cli_port,
                           crypt, nocomp, conn)
     log(f"  [{label}] starting server (udp :{srv_port})...")
-    srv = subprocess.Popen(srv_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Benchmark children log continuously on recent binaries.  This path does
+    # not drain their output, so a PIPE eventually fills and blocks the data
+    # plane.  Discard logs rather than letting logging reduce throughput.
+    srv = subprocess.Popen(srv_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Wait for process to stay up; UDP bind has no TCP connect probe
     for _ in range(20):
         if srv.poll() is not None:
             break
         time.sleep(0.1)
     if srv.poll() is not None:
-        out = srv.stdout.read().decode(errors='replace') if srv.stdout else ""
-        log(f"  [{label}] server died:\n{out[:300]}")
+        log(f"  [{label}] server died")
         echo.close()
         ensure_ports_free(echo_port, srv_port, cli_port, timeout=2.0)
         return None
@@ -357,14 +359,10 @@ def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
     cli_args = build_args(client_bin, is_go, 'client', echo_port, srv_port, cli_port,
                           crypt, nocomp, conn)
     log(f"  [{label}] starting client (tcp :{cli_port})...")
-    cli = subprocess.Popen(cli_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    cli = subprocess.Popen(cli_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Poll TCP listener readiness instead of fixed sleep (cold-start first test)
     if not wait_port_ready(cli_port, timeout=8.0):
-        out = ""
-        if cli.poll() is not None and cli.stdout:
-            out = cli.stdout.read().decode(errors='replace')
-        log(f"  [{label}] client listener not ready on {cli_port}"
-            + (f":\n{out[:300]}" if out else " (process still running)"))
+        log(f"  [{label}] client listener not ready on {cli_port}")
         cli.terminate()
         srv.terminate()
         try: cli.wait(timeout=3)
@@ -375,8 +373,7 @@ def run_bench(server_bin, client_bin, is_go, conn, size, timeout, label,
         ensure_ports_free(echo_port, srv_port, cli_port, timeout=3.0)
         return None
     if cli.poll() is not None:
-        out = cli.stdout.read().decode(errors='replace') if cli.stdout else ""
-        log(f"  [{label}] client died:\n{out[:300]}")
+        log(f"  [{label}] client died")
         srv.terminate()
         echo.close()
         ensure_ports_free(echo_port, srv_port, cli_port, timeout=2.0)

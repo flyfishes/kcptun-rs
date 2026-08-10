@@ -9,6 +9,7 @@ bytes = "1"
 log = "0.4"
 parking_lot = "0.12"
 kio-rs = { path = "../kio-rs", default-features = false }
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

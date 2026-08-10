@@ -338,6 +338,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 |------------------|-------------|
 | `connect(addr)` | Dial `addr`, binding an ephemeral local UDP socket. Returns a builder. |
 | `with_transport(transport, remote)` | Build over an existing [`PacketTransport`](#packettransport) (e.g. `CryptoTransport`). |
+| `.connect_timeout(Duration)` | Require a first peer response (probe `WINS` / ACK) within the timeout; `build` fails with `TimedOut` otherwise. |
 | `.mtu(v)` / `.sndwnd(v)` / `.rcvwnd(v)` | Size knobs. |
 | `.mode(KcpMode)` / `.nodelay(n, i, r, c)` | Latency curve / raw knobs. |
 | `.stream(bool)` / `.acknodelay(bool)` / `.conv(v)` / `.token(v)` | Protocol knobs. |
@@ -346,10 +347,19 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `.config(KcpConfig)` | Apply a full config value. |
 | `.build().await` | Construct and start the background loops. |
 | `read` / `write_all` / `flush` | Standard async I/O (`kio::AsyncReadExt` / `AsyncWriteExt`). |
-| `set_nodelay` / `set_window_size` / `set_mtu` / `set_stream_mode` | Post-construction tuning. |
-| `close()` / `is_closed()` | Close / query state. |
-| `remote_addr()` / `local_addr()` | Addresses. |
-| `snd_wnd()` / `wait_send()` | Backpressure diagnostics. |
+| `set_kcp_nodelay` / `set_kcp_window_size` / `set_kcp_mtu` / `set_kcp_stream_mode` / `set_kcp_acknodelay` | KCP-specific post-construction tuning (`set_kcp_*` prefix avoids collisions). |
+| `set_nodelay(bool)` / `nodelay()` | TCP-style Nagle toggle (`true` → KCP fast path) + getter. |
+| `set_read_timeout(Option<Duration>)` / `read_timeout()` | Read deadline (`TimedOut` after it elapses with no data). |
+| `set_write_timeout(Option<Duration>)` / `write_timeout()` | Write deadline when blocked on a full send window. |
+| `shutdown(std::net::Shutdown)` | Half-close: `Write` stops writes + flushes, `Read` surfaces EOF, `Both` = `close()`. |
+| `remote_addr()` / `local_addr()` | Peer / local addresses. |
+| `peek(&mut [u8])` | Non-blocking peek at buffered inbound (`WouldBlock` when empty). |
+| `take_error()` | Last background-loop I/O error, clearing it. |
+| `split()` / `into_split()` | Borrowing / owned read+write halves (tokio-style); connection closes on last owned-half drop. |
+| `readable()` / `writable()` | Await data-available / window-open readiness. |
+| `read_shared(&mut [u8])` / `write_all_shared(&[u8])` | Concurrent `&self` read/write (used by the session layer). |
+| `close()` / `is_closed()` / `is_dead()` | Close / query state. |
+| `snd_wnd()` / `rcv_wnd()` / `wait_send()` / `last_activity_ms()` | Backpressure & activity diagnostics. |
 
 ### KcpListener (async)
 
@@ -357,7 +367,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 
 | Method / builder | Description |
 |------------------|-------------|
-| `bind(addr)` | Bind a UDP socket to `addr`; returns a `KcpListenerBuilder`. |
+| `bind(addr)` | Bind a UDP socket to `addr`; returns a `KcpListenerBuilder` (awaitable directly via `IntoFuture`, or `.build().await`). |
 | `.mtu(v)` / `.sndwnd(v)` / `.rcvwnd(v)` | Size knobs (propagated to accepted conns). |
 | `.mode(KcpMode)` / `.nodelay(n, i, r, c)` | Latency curve / raw knobs. |
 | `.stream(bool)` / `.acknodelay(bool)` / `.conv(v)` / `.token(v)` | Protocol knobs. |
@@ -365,6 +375,9 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `.config(KcpConfig)` | Apply a full config value. |
 | `.build().await` | Bind the socket, spawn the demux reader, return the listener. |
 | `accept()` | Await the next client — `io::Result<(KcpConn, SocketAddr)>` (per-peer conn + source addr). |
+| `accept_timeout(t)` | Await the next client within `t`, else `io::ErrorKind::TimedOut`. |
+| `try_accept()` | Non-blocking: `Ok(Some(conn))` if pending, `Ok(None)` otherwise. |
+| `take_error()` | Surface + clear the last demux-reader transport error. |
 | `local_addr()` | Local address of the listen socket. |
 | `close()` | Stop accepting new clients (existing accepted conns are unaffected). |
 

@@ -44,10 +44,12 @@ None.
   process-global `KCPTCP_TAKEOVER` env var — they must run **serially**:
   `cargo test -p kio-rs net::tcpraw::integration_tests -- --test-threads=1`
   (with `KCPTCP_ROOT_TEST=1` + root on Linux). Parallel runs race the env var.
-- **PENDING LINUX VERIFY**: `mmsg.rs` `#[cfg(test)]` round-trip tests are compile-checked
-  on `x86_64-unknown-linux-gnu` but **not yet executed**. Once a Linux container is
-  available run `cargo test -p kio-rs` (and `--no-default-features --features smol`) in
-  `rust:nightly-2026-07-18`.
+- **✅ LINUX VERIFIED 2026-08-06**: `mmsg.rs` `#[cfg(test)]` round-trip tests pass in a
+  `rustlang/rust:nightly` container: `cargo test -p kio-rs` → 25 passed, incl.
+  `sendmmsg_to_roundtrip` + `recvmmsg_from_batch`. Container recipe: mount repo,
+  `CARGO_TARGET_DIR=<repo>/target/linux-verify`,
+  `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc` (overrides the macOS cross-linker
+  in `.cargo/config.toml`).
 
 ### Common Patterns
 

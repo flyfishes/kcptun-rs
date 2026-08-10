@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-07-31 (B2: wire packing moved here) -->
+<!-- Generated: 2026-07-22 | Updated: 2026-08-03 (legacy selectors deprecated; thiserror errors) -->
 
 # kcrypt-rs
 
@@ -12,7 +12,7 @@ Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.
 | File | Description |
 |------|-------------|
 | `Cargo.toml` | `aes`, `aes-gcm`, `twofish`, `blowfish`, `des`, `pbkdf2`, `hmac`, `sha1`, `bytes`, `crc32fast`, `parking_lot` |
-| `src/lib.rs` | Public API: `select_block_crypt`, `select_aead_crypt`, traits, `CryptEngine`; re-exports `wire::*` |
+| `src/lib.rs` | Preferred public API: `CryptEngine::select`; deprecated compatibility selectors, traits, and `wire::*` remain exported |
 | `src/crypt.rs` | Traits `BlockCrypt` / `AeadCrypt`; CFB helpers; `GO_CFB_IV`; factory; re-exports ciphers |
 | `src/wire.rs` | **Wire packing** (B2): `CryptoBuf`, `encrypt_batch(_into)`, `decrypt_cfb_in_place`, `strip_cfb_header_if_present`, `inbound_null`, `should_cpu_block_*`, `OffloadProfile`, `CRYPT_HDR`/`NONCE_SZ` |
 | `src/cast5.rs` | Full CAST-128 (RFC 2144) block implementation (Go-compatible) |
@@ -31,7 +31,7 @@ Shared block-cipher and AEAD library for kcptun-rs. Port of Go `kcp-go/v5/crypt.
 - **CFB uses fixed IV** `GO_CFB_IV` (16 bytes hardcoded to match Go). Never randomize per-packet IV.
 - `BlockCrypt::{encrypt,decrypt}` take `&self` — ciphers are **stateless after construction**.
 - **Hot path:** prefer `Arc<CryptEngine>` (enum match) over `Arc<dyn BlockCrypt>`. Helpers: `is_aead()`, `as_aead()`, `uses_cfb_header(method)`.
-- `select_block_crypt` still returns `Box<dyn BlockCrypt>` for tests/legacy; it delegates to `CryptEngine::select`.
+- `select_block_crypt` / `select_aead_crypt` remain for compatibility but are deprecated; new code uses `CryptEngine::select`.
 - CFB helpers are generic `<F: Fn>` for monomorphization/inlining — keep them generic, not `&dyn Fn`.
 - Key selection: `CryptEngine::select` / `select_block_crypt` / `select_aead_crypt` — password typically already PBKDF2-derived 32B key from binaries (`SALT = b"kcp-go"`).
 - TEA: **8 rounds** (Go uses rounds/2). SM4: tjfoc/gmsm S-box + CK fix. Do not "upgrade" defaults that break interop.

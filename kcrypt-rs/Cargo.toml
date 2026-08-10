@@ -16,6 +16,7 @@ des = "0.8"
 aes-gcm = "0.10"
 crc32fast = "1"
 parking_lot = "0.12"
+thiserror.workspace = true
 
 [features]
 default = ["wire"]

@@ -4,6 +4,7 @@
 **/*.rs.bk
 PAGE.md
 fix_e2e.sh
+**/vendor/
 
 .claude
 # IDE / editor settings
@@ -21,6 +22,7 @@ __pycache__/
 # Compiled test binaries (built from source, not committed)
 /tests/kcptun-go/client
 /tests/kcptun-go/server
+/tests/kcp-go-latency/kcp-go-latency
 
 # Cargo lock is committed for binary crates; keep it.
 .omc/

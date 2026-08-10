@@ -13,8 +13,10 @@
 
 #![cfg(any(feature = "async-tokio", feature = "async-smol"))]
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
+use kcp_rs::listener::KcpListenerLimits;
 use kcp_rs::{KcpConn, KcpListener, KcpMode};
 use kio::{AsyncReadExt, AsyncWriteExt};
 
@@ -176,6 +178,49 @@ fn listener_multiple_peers_demux() {
     });
 }
 
+/// The configured drain limit counts the packet that woke the reader. With a
+/// one-packet quantum, two peers still make progress in separate wakeups.
+#[test]
+fn listener_drain_limit_counts_first_packet() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .limits(KcpListenerLimits {
+                max_drain_packets: 1,
+                ..KcpListenerLimits::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut c1 = KcpConn::connect(addr).conv(CONV).build().await.unwrap();
+        let mut c2 = KcpConn::connect(addr).conv(CONV).build().await.unwrap();
+        c1.write_all(b"a").await.unwrap();
+        c2.write_all(b"b").await.unwrap();
+
+        let (mut s1, _) = listener
+            .accept_timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (mut s2, _) = listener
+            .accept_timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut a = [0u8; 1];
+        let mut b = [0u8; 1];
+        read_exact_timeout(&mut s1, &mut a, Duration::from_secs(2)).await;
+        read_exact_timeout(&mut s2, &mut b, Duration::from_secs(2)).await;
+        assert!(matches!(a[0], b'a' | b'b'));
+        assert!(matches!(b[0], b'a' | b'b'));
+        assert_ne!(a, b, "each peer must retain its own routed packet");
+        c1.close();
+        c2.close();
+        s1.close();
+        s2.close();
+        listener.close();
+    });
+}
+
 /// After a connection is fully closed on both sides, the listener keeps
 /// accepting and serving fresh clients.
 ///
@@ -228,6 +273,146 @@ fn listener_serves_new_client_after_previous_closed() {
 
         drop(s2);
         drop(c2);
+        listener.close();
+    });
+}
+
+/// `connect_timeout` succeeds when a live, conv-compatible listener responds to
+/// the forced `WASK` probe with `WINS` (first-packet reachability check).
+#[test]
+fn connect_timeout_live_listener_succeeds() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .build()
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = KcpConn::connect(addr)
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .await
+            .expect("live listener should answer the probe within the timeout");
+
+        // The probe-triggered session should be accepted by the listener.
+        let (_server, _peer) = listener.accept().await.unwrap();
+        client.close();
+        listener.close();
+    });
+}
+
+/// `connect_timeout` fails with `TimedOut` (after roughly the full timeout)
+/// when nothing responds — UDP has no RST-style fast failure.
+#[test]
+fn connect_timeout_dead_port_times_out() {
+    kio::block_on(async {
+        // Grab an ephemeral port then release it: nothing listens there.
+        let probe = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let dead = probe.local_addr().unwrap();
+        drop(probe);
+
+        let start = std::time::Instant::now();
+        let err = match KcpConn::connect(dead)
+            .conv(CONV)
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .await
+        {
+            Ok(_) => panic!("connect to a dead port should time out"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() >= Duration::from_millis(280),
+            "should wait roughly the full timeout before failing"
+        );
+    });
+}
+
+/// `KcpListener::bind(addr).await` works without an explicit `.build()`.
+#[test]
+fn listener_bind_into_future() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .await
+            .expect("bind via IntoFuture");
+        assert!(listener.local_addr().unwrap().port() != 0);
+        listener.close();
+    });
+}
+
+/// `KcpConn::connect(addr).await` works without an explicit `.build()`.
+#[test]
+fn kcpconn_connect_into_future() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = KcpConn::connect(addr).conv(CONV).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+        let (_server, _peer) = listener.accept().await.unwrap();
+        client.close();
+        listener.close();
+    });
+}
+
+/// `accept_timeout` fails with `TimedOut` when no client connects in time.
+#[test]
+fn listener_accept_timeout() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
+        let err = match listener.accept_timeout(Duration::from_millis(100)).await {
+            Ok(_) => panic!("expected accept timeout"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        listener.close();
+    });
+}
+
+/// `try_accept` returns `None` when nothing is pending, then `Some` once a
+/// client's first datagram registers a peer session (non-blocking poll).
+#[test]
+fn listener_try_accept() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Nothing connected yet → None.
+        assert!(listener.try_accept().unwrap().is_none());
+
+        // Dial + write → the demux reader registers a peer session.
+        let mut client = KcpConn::connect(addr).conv(CONV).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+
+        // Poll until the accepted conn is pending (reader is async).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_server, peer)) = listener.try_accept().unwrap() {
+                assert_eq!(peer, client.local_addr().unwrap());
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for try_accept");
+            }
+            kio::sleep_ms(10).await;
+        }
+        client.close();
+        listener.close();
+    });
+}
+
+/// `take_error` starts empty.
+#[test]
+fn listener_take_error_initial_none() {
+    kio::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
+        assert!(listener.take_error().unwrap().is_none());
         listener.close();
     });
 }

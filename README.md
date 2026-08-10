@@ -321,6 +321,31 @@ make linux-aarch64      # ARM64 musl (smol)
 make linux-full         # x86_64 musl + QPP
 ```
 
+### OS-Level UDP Buffer Tuning (macOS)
+
+On macOS, the default UDP socket buffer sizes are small (typically 256 KB for send, 256 KB for receive). Under high-throughput KCP workloads — especially with large windows (`sndwnd`/`rcvwnd` ≥ 512) or high concurrency — the kernel UDP receive buffer can overflow, causing **silent packet drops** that inflate P99/P999 tail latency and trigger KCP retransmit storms.
+
+Increasing the kernel socket buffer limits eliminates this bottleneck. This is the single most effective OS-level tuning for P99/P999 latency on macOS:
+
+```bash
+# Raise max socket buffer to 8 MB (default ~256 KB)
+sudo sysctl -w kern.ipc.maxsockbuf=8388608
+
+# Raise UDP receive buffer to 4 MB (default ~256 KB)
+sudo sysctl -w net.inet.udp.recvspace=4194304
+```
+
+> **Effect on P99/P999 (measured):** With these settings applied, the raw KCP layer's max sustainable throughput on loopback improved from **2975 → 3802 req/s** (tokio, +28%) and **2411 → 2921 req/s** (Go, +21%), with P99 latency dropping from 14.2 ms → 10.5 ms (tokio) and 20.3 ms → 15.9 ms (Go). See [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md) for full numbers.
+
+To make the change persistent across reboots, add to `/etc/sysctl.conf`:
+
+```
+kern.ipc.maxsockbuf=8388608
+net.inet.udp.recvspace=4194304
+```
+
+> **Linux equivalent:** `net.core.rmem_max`, `net.core.rmem_default`, `net.core.wmem_max`, `net.core.wmem_default` — set to `4194304` or higher. Some distributions also require `net.core.netdev_max_backlog`.
+
 ---
 
 ## 🔬 Optimization Journey
@@ -338,6 +363,7 @@ The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driv
 | + Snappy offload & threshold tuning | — | — |
 | + sendmmsg/recvmmsg batch I/O | — | — |
 | + Cipher enum static dispatch | vtable eliminated | — |
+| + macOS UDP buffer tuning (sysctl) | P99 −26%, throughput +28% | — |
 | → **Final (smol bulk)** | **108 MB/s** | **2.11×** 🏆 |
 
 ### Notable Bug Fixes Found Along the Way
@@ -350,6 +376,55 @@ The project evolved from **5.4 MB/s** to over **108 MB/s** through evidence-driv
 | KCP ACK never populated | Infinite retransmission → deadlock | Queue ACKs for every received Push |
 | `snd_buf` never cleaned | Window stuck at 32 packets | Front-of-buffer cleanup in flush() |
 | Twofish 256-bit key S-box | Wrong ciphertext vs Go | Added 5th sbox layer |
+
+### p99 Latency Collapse Investigation (256KB @ High Concurrency)
+
+Symptom: the raw `kcp-rs` KcpConn (no tunnel layers) collapsed on large
+payloads under sustained load — 256KB round-trip at **RPS=300 went from ~4ms
+to p50=3.2s**, while Go with the *identical* 512/512 window + Fast3 config
+stayed at **19ms**. Single-request latency was already fast (4.3ms); the
+pipeline stalled only when requests overlapped.
+
+**Root cause:** every received KCP segment triggered a full
+`flush_with_current()` (kcp.input → `parse_una>0` → iterate the whole
+`snd_buf` ~500 segments for retransmit checks). At 50k+ pkt/s that is ~30M
+`snd_buf` iterations/s, inflating per-segment cost to ~680µs and driving a
+fast/early retransmit storm (~20K/2s).
+
+**Effective fixes (kept):**
+
+| Fix | Where | Result (256KB@RPS=300) |
+|:----|:------|:----------------------|
+| Batch input flush: `input_no_flush()` + `flush_if_pending()` (one deferred flush per recv burst, single lock) | kcp.rs, conn.rs | **3183ms → 2.1ms**, 100% ok (was 87%), retrans storm → 0 |
+| Flush loop trusts `kcp.flush()` return (clamp 1..10ms) instead of forcing 1ms | conn.rs | flush-loop churn ~5-10× lower |
+| P3: nodelay window-probe interval 500→50ms (`IKCP_PROBE_INIT_NODELAY`) | kcp.rs | collapse-edge recovery 947ms → 47ms at RPS=250 |
+| Same batch-flush applied to the **legacy binary sessions** (`input_no_flush` + one `flush_if_pending` per datagram FEC group) | kcptun-client, kcptun-server | 256KB@RPS=300: p50 12.4→10.5ms (legacy tunnel doesn't collapse — 1024-window + FEC + SMUX buffering keep it below the cliff) |
+| Gate fast/early retransmit on `new_segs_count > 0` — only retransmit when the window can carry new data; a fastack on an in-flight segment under a full window is usually a DELAYED ACK, not loss | kcp.rs | RPS=300 p99 69ms→3.9ms; RPS≤450 clean (~2.3ms) |
+| `write_notify` → `notify_one()` (permit-storing) — the old `notify_waiters` lost wakes that landed before the waiter registered, forcing 10ms fallbacks under load | conn.rs | RPS=475 clean 2.3ms (was 539ms collapse); RPS=500 p50 500ms+→~100ms |
+
+**Tunnel comparison (why the raw lib's extreme-load queueing isn't a lib defect):**
+the same `kcp_rs::KcpConn` sustains **256KB@RPS=500 at ~11ms, 100% ok** when used
+the way the product uses it (the default shared-session tunnel, `copy_bidirectional`
+two-task per conn) — vs Go tunnel 30.5ms. The raw benchmark's residual RPS=500
+deep-queue is the single-task serial-echo worst case at 131 MB/s on one
+connection; the tunnel's SMUX/TCP layers decouple read from write. macOS exposes
+no public `sendmmsg`/`recvmmsg` (libSystem has no symbols), so batch I/O there
+would require raw syscalls (not implemented).
+
+Rust now sustains 300 RPS of 256KB at ~2.1ms — **~9× faster than Go's 19ms**.
+Wire format unchanged; verified by Go↔Rust interop (both directions 500/500).
+
+**Ineffective approaches tested and reverted** (recorded so they aren't
+re-attempted):
+
+| Approach | Outcome |
+|:---------|:--------|
+| Asymmetric window (rcv_wnd=2048) | No change — **disproved wnd=0 deadlock as the primary cause** (Go uses 512/512 too) |
+| Suppress retransmit when `rmt_wnd==0` | No change — `rmt_wnd` stays >0 during the collapse |
+| Disable fast/early retransmit entirely | 4× worse — retransmits were recovering real packet loss |
+| ackOnly input flush (skip snd_buf scan) | 5× worse — the data-recovery half of flush is load-bearing |
+| Drain-first recv loops (+ `yield_now`) | deadlock — the reactor wait was the implicit yield |
+| Listener-reader batch drain | 3.7× worse |
 
 ---
 

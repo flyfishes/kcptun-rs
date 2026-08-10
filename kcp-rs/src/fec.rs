@@ -4,11 +4,12 @@
 //! compatibility.
 
 use crate::snmp::{self as snmp, DEFAULT_SNMP};
+use bytes::Bytes;
 use reed_solomon_erasure::galois_8::Field;
 use reed_solomon_erasure::ReedSolomon;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// FEC header size (seqid + type = 6 bytes).
@@ -156,16 +157,25 @@ impl FecEncoder {
         let max_sz = self.max_size;
         let po = self.payload_offset;
 
-        // Pad data shards to max_sz (Go: clear tail)
+        // Pad data shards to max_sz (Go: clear tail) — reuse existing buffers
         for i in 0..self.data_shards {
             let slen = self.shard_cache[i].len();
             if slen < max_sz {
                 self.shard_cache[i].resize(max_sz, 0u8);
             }
         }
-        // Allocate parity shard buffers
+        // Reuse parity shard buffers instead of allocating new ones — avoids
+        // a malloc + memset per FEC group (measured ~99KB cumulative in pprof).
         for i in self.data_shards..self.shard_size {
-            self.shard_cache[i] = vec![0u8; max_sz];
+            if self.shard_cache[i].len() < max_sz {
+                self.shard_cache[i].resize(max_sz, 0u8);
+            } else {
+                self.shard_cache[i].truncate(max_sz);
+            }
+            // Zero-fill the buffer (required for RS encoding)
+            for b in &mut self.shard_cache[i] {
+                *b = 0;
+            }
         }
 
         // RS encode only payload region [payload_offset..max_sz] (matching Go)
@@ -219,7 +229,7 @@ impl FecEncoder {
 /// Min-heap wrapper for FEC packets (matching Go's shardHeap).
 struct ShardEntry {
     seqid: u32,
-    data: Vec<u8>,
+    data: bytes::Bytes,
 }
 
 impl PartialEq for ShardEntry {
@@ -255,7 +265,10 @@ impl ShardHeap {
     fn has(&self, seqid: u32) -> bool {
         self.marks.contains_key(&seqid)
     }
-    fn push(&mut self, pkt: Vec<u8>) {
+    fn has_all_data(&self, base_seqid: u32, data_shards: usize) -> bool {
+        (0..data_shards).all(|idx| self.has(base_seqid + idx as u32))
+    }
+    fn push(&mut self, pkt: Bytes) {
         if pkt.len() < 4 {
             return;
         }
@@ -266,7 +279,7 @@ impl ShardHeap {
     fn len(&self) -> usize {
         self.elements.len()
     }
-    fn pop_all(&mut self) -> Vec<Vec<u8>> {
+    fn pop_all(&mut self) -> Vec<Bytes> {
         let mut result = Vec::new();
         while let Some(Reverse(entry)) = self.elements.pop() {
             self.marks.remove(&entry.seqid);
@@ -278,35 +291,58 @@ impl ShardHeap {
 
 /// Simple FEC auto-tuning (matching Go's autoTune).
 struct AutoTune {
-    pulses: Vec<(u32, bool)>, // (seqid, is_data)
+    pulses: VecDeque<(u32, bool)>, // (seqid, is_data)
     max_samples: usize,
 }
 
 impl AutoTune {
     fn new() -> Self {
         AutoTune {
-            pulses: Vec::new(),
+            pulses: VecDeque::with_capacity(258),
             max_samples: 258,
         }
     }
 
     fn sample(&mut self, is_data: bool, seq: u32) {
-        self.pulses.push((seq, is_data));
+        self.pulses.push_back((seq, is_data));
         if self.pulses.len() > self.max_samples {
-            self.pulses.remove(0);
+            self.pulses.pop_front();
         }
     }
 
-    fn find_period(&self, bit: bool) -> usize {
+    fn find_period(&self, bit: bool, paws: u32) -> usize {
         if self.pulses.len() < 3 {
             return 0;
         }
         let mut sorted = self.pulses.clone();
-        sorted.sort_by_key(|&(seq, _)| seq);
+        sorted.make_contiguous().sort_by_key(|&(seq, _)| seq);
 
-        // Check continuity
-        for i in 1..sorted.len() {
-            let diff = (sorted[i].0 as i64) - (sorted[i - 1].0 as i64);
+        // Sequence IDs wrap at PAWS. Rotate the sorted history across the
+        // largest cyclic gap, which is the seam between the oldest and newest
+        // samples, then require every adjacent sample to be contiguous.
+        let mut largest_gap = 0;
+        let mut largest_gap_at = 0;
+        for i in 0..sorted.len() {
+            let a = sorted[i].0;
+            let b = sorted[(i + 1) % sorted.len()].0;
+            let gap = if b >= a { b - a } else { paws - a + b };
+            if gap > largest_gap {
+                largest_gap = gap;
+                largest_gap_at = i;
+            }
+        }
+        let start = (largest_gap_at + 1) % sorted.len();
+        let ordered: Vec<(u32, bool)> = (0..sorted.len())
+            .map(|offset| sorted[(start + offset) % sorted.len()])
+            .collect();
+        for i in 1..ordered.len() {
+            let prev = ordered[i - 1].0;
+            let current = ordered[i].0;
+            let diff = if current >= prev {
+                current - prev
+            } else {
+                paws - prev + current
+            };
             if diff != 1 {
                 return 0;
             }
@@ -314,8 +350,8 @@ impl AutoTune {
 
         // Find left edge (transition from !bit to bit)
         let mut left_edge = None;
-        for i in 1..sorted.len() {
-            if sorted[i - 1].1 != bit && sorted[i].1 == bit {
+        for i in 1..ordered.len() {
+            if ordered[i - 1].1 != bit && ordered[i].1 == bit {
                 left_edge = Some(i);
                 break;
             }
@@ -326,8 +362,8 @@ impl AutoTune {
         };
 
         // Find right edge (transition from bit to !bit)
-        for i in left + 1..sorted.len() {
-            if sorted[i - 1].1 == bit && sorted[i].1 != bit {
+        for i in left + 1..ordered.len() {
+            if ordered[i - 1].1 == bit && ordered[i].1 != bit {
                 return i - left;
             }
         }
@@ -342,7 +378,8 @@ pub struct FecDecoder {
     shard_size: usize,
     paws: u32,
     shard_set: HashMap<u32, ShardHeap>,
-    newest_shard_id: u32,
+    newest_shard_id: Option<u32>,
+    completed_shards: HashMap<u32, ()>,
     decode_cache: Vec<Vec<u8>>,
     flag_cache: Vec<bool>,
     codec: ReedSolomon<Field>,
@@ -353,7 +390,7 @@ pub struct FecDecoder {
 impl FecDecoder {
     /// Create a new FEC decoder.
     pub fn new(data_shards: usize, parity_shards: usize) -> Option<Self> {
-        if data_shards <= 0 || parity_shards <= 0 {
+        if data_shards == 0 || parity_shards == 0 {
             return None;
         }
         if data_shards + parity_shards > 256 {
@@ -368,7 +405,8 @@ impl FecDecoder {
             shard_size,
             paws,
             shard_set: HashMap::new(),
-            newest_shard_id: 0,
+            newest_shard_id: None,
+            completed_shards: HashMap::new(),
             decode_cache: vec![Vec::new(); shard_size],
             flag_cache: vec![false; shard_size],
             codec,
@@ -386,20 +424,23 @@ impl FecDecoder {
         let seqid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         let flag = u16::from_le_bytes([pkt[4], pkt[5]]);
 
-        // Auto-tune sampling
-        if flag == FEC_TYPE_DATA {
-            self.auto_tune.sample(true, seqid);
-        } else {
-            self.auto_tune.sample(false, seqid);
-            if flag == FEC_TYPE_PARITY {
-                snmp::add(&DEFAULT_SNMP.fec_parity_shards, 1);
-            }
-        }
-
         // Check paws
         if seqid >= self.paws {
             return Vec::new();
         }
+
+        // Only valid FEC types participate in auto-tuning. Unknown flags are
+        // malformed packets, not parity samples; accepting them here would
+        // make an attacker able to perturb the inferred shard dimensions.
+        let is_data = match flag {
+            FEC_TYPE_DATA => true,
+            FEC_TYPE_PARITY => {
+                snmp::add(&DEFAULT_SNMP.fec_parity_shards, 1);
+                false
+            }
+            _ => return Vec::new(),
+        };
+        self.auto_tune.sample(is_data, seqid);
 
         // Check if packet type matches expected FEC parameters
         let idx_in_shard = seqid % self.shard_size as u32;
@@ -407,69 +448,95 @@ impl FecDecoder {
             if flag != FEC_TYPE_DATA {
                 self.should_tune = true;
             }
-        } else {
-            if flag != FEC_TYPE_PARITY {
-                self.should_tune = true;
-            }
+        } else if flag != FEC_TYPE_PARITY {
+            self.should_tune = true;
         }
 
         // Auto-tune if needed
         if self.should_tune {
-            let auto_ds = self.auto_tune.find_period(true);
-            let auto_ps = self.auto_tune.find_period(false);
+            let auto_ds = self.auto_tune.find_period(true, self.paws);
+            let auto_ps = self.auto_tune.find_period(false, self.paws);
             if auto_ds > 0
                 && auto_ps > 0
-                && auto_ds + auto_ps < 256
+                && auto_ds + auto_ps <= 256
                 && (auto_ds != self.data_shards || auto_ps != self.parity_shards)
             {
-                self.data_shards = auto_ds;
-                self.parity_shards = auto_ps;
-                self.shard_size = auto_ds + auto_ps;
-                self.shard_set.clear();
+                // Build all replacement state before swapping dimensions. If
+                // Reed-Solomon rejects the inferred dimensions, retain the
+                // current decoder rather than leaving it half-retuned.
                 if let Ok(codec) = ReedSolomon::<Field>::new(auto_ds, auto_ps) {
+                    let shard_size = auto_ds + auto_ps;
+                    let paws = 0xffffffffu32 / shard_size as u32 * shard_size as u32;
                     self.codec = codec;
+                    self.data_shards = auto_ds;
+                    self.parity_shards = auto_ps;
+                    self.shard_size = shard_size;
+                    self.paws = paws;
+                    self.shard_set.clear();
+                    self.completed_shards.clear();
+                    self.newest_shard_id = None;
+                    self.decode_cache = vec![Vec::new(); shard_size];
+                    self.flag_cache = vec![false; shard_size];
+                    self.should_tune = false;
                 }
-                self.decode_cache = vec![Vec::new(); self.shard_size];
-                self.flag_cache = vec![false; self.shard_size];
-                self.paws = 0xffffffffu32 / self.shard_size as u32 * self.shard_size as u32;
-                self.should_tune = false;
             }
             return Vec::new();
         }
 
-        // Get shard heap
         let shard_id = seqid / self.shard_size as u32;
-        let shard = self
-            .shard_set
-            .entry(shard_id)
-            .or_insert_with(ShardHeap::new);
-
-        // Ignore duplicates
-        if shard.has(seqid) {
+        if !self.observe_shard(shard_id) {
+            return Vec::new();
+        }
+        if self.completed_shards.contains_key(&shard_id) {
+            // A group which already had enough shards has been retired. Late
+            // parity/data must not recreate it and repeatedly trigger work.
             return Vec::new();
         }
 
-        // Push packet
-        shard.push(pkt.to_vec());
+        // Get shard heap
+        let ready = {
+            let shard = self
+                .shard_set
+                .entry(shard_id)
+                .or_insert_with(ShardHeap::new);
 
-        // Try to recover when we have enough shards
-        if shard.len() >= self.data_shards {
-            snmp::add(&DEFAULT_SNMP.fec_full_shards, 1);
-            let pkts = shard.pop_all();
+            // Ignore duplicates
+            if shard.has(seqid) {
+                return Vec::new();
+            }
+
+            // Push packet (zero-copy: reference-counted slice, no to_vec alloc)
+            shard.push(Bytes::copy_from_slice(pkt));
+
+            // Try to recover when we have enough shards
+            if shard.len() >= self.data_shards {
+                snmp::add(&DEFAULT_SNMP.fec_full_shards, 1);
+                let base_seqid =
+                    ((shard_id as u64 * self.shard_size as u64) % self.paws as u64) as u32;
+                let all_data_present = shard.has_all_data(base_seqid, self.data_shards);
+                Some((shard.pop_all(), all_data_present))
+            } else {
+                None
+            }
+        };
+
+        if let Some((pkts, all_data_present)) = ready {
+            if all_data_present {
+                self.complete_group(shard_id);
+                return Vec::new();
+            }
             return self.recover(pkts, shard_id);
         }
 
-        // Update newest shard id and discard old
-        if shard_id > self.newest_shard_id {
-            self.newest_shard_id = shard_id;
-        }
         self.discard_old();
-        snmp::store(&DEFAULT_SNMP.fec_shard_min, self.newest_shard_id as u64);
+        if let Some(newest) = self.newest_shard_id {
+            snmp::store(&DEFAULT_SNMP.fec_shard_min, newest as u64);
+        }
         snmp::store(&DEFAULT_SNMP.fec_shard_set, self.shard_set.len() as u64);
         Vec::new()
     }
 
-    fn recover(&mut self, mut pkts: Vec<Vec<u8>>, shard_id: u32) -> Vec<Vec<u8>> {
+    fn recover(&mut self, mut pkts: Vec<Bytes>, shard_id: u32) -> Vec<Vec<u8>> {
         if pkts.is_empty() {
             return self.cleanup(shard_id, Vec::new());
         }
@@ -506,28 +573,29 @@ impl FecDecoder {
             return self.cleanup(shard_id, Vec::new());
         }
 
-        // Fill decode cache from packets
+        // Fill decode cache from packets — reuse buffers to avoid allocation
         for e in &pkts {
             let sid = u32::from_le_bytes(e[..4].try_into().unwrap_or([0; 4]));
             let idx = (sid % self.shard_size as u32) as usize;
             if idx < self.shard_size {
                 let payload = if e.len() > 6 { &e[6..] } else { &[] };
-                let mut d = payload.to_vec();
-                d.resize(max_plen, 0u8);
-                self.decode_cache[idx] = d;
+                // Reuse existing buffer: clear, extend from payload, then resize
+                let slot = &mut self.decode_cache[idx];
+                slot.clear();
+                slot.extend_from_slice(payload);
+                if slot.len() < max_plen {
+                    slot.resize(max_plen, 0u8);
+                }
                 self.flag_cache[idx] = true;
             }
         }
 
-        // Fill missing shards with empty buffers
-        let mut new_buffers: Vec<Vec<u8>> = Vec::new();
+        // Fill missing shards with empty buffers — reuse via clear+resize
         for k in 0..self.shard_size {
-            if !self.flag_cache[k] && k < self.data_shards {
-                let buf = vec![0u8; max_plen];
-                new_buffers.push(buf.clone());
-                self.decode_cache[k] = buf;
-            } else if !self.flag_cache[k] {
-                self.decode_cache[k] = vec![0u8; max_plen];
+            if !self.flag_cache[k] {
+                let slot = &mut self.decode_cache[k];
+                slot.clear();
+                slot.resize(max_plen, 0u8);
             }
         }
 
@@ -555,16 +623,67 @@ impl FecDecoder {
     }
 
     fn cleanup(&mut self, shard_id: u32, recovered: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        if shard_id > self.newest_shard_id {
-            self.newest_shard_id = shard_id;
-        }
+        self.complete_group(shard_id);
         self.discard_old();
         recovered
     }
 
+    fn complete_group(&mut self, shard_id: u32) {
+        self.shard_set.remove(&shard_id);
+        self.completed_shards.insert(shard_id, ());
+    }
+
+    fn group_count(&self) -> u32 {
+        self.paws / self.shard_size as u32
+    }
+
+    /// Forward distance on the PAWS-sized group ring.
+    fn group_distance(&self, newer: u32, older: u32) -> u32 {
+        let groups = self.group_count();
+        if newer >= older {
+            newer - older
+        } else {
+            newer + groups - older
+        }
+    }
+
+    fn group_is_newer(&self, candidate: u32, reference: u32) -> bool {
+        let distance = self.group_distance(candidate, reference);
+        distance != 0 && distance <= self.group_count() / 2
+    }
+
+    /// Accept a group only while it is near the newest observed group. This
+    /// keeps the shard/tombstone maps bounded and remains correct at PAWS wrap.
+    fn observe_shard(&mut self, shard_id: u32) -> bool {
+        match self.newest_shard_id {
+            None => self.newest_shard_id = Some(shard_id),
+            Some(newest) if self.group_is_newer(shard_id, newest) => {
+                self.newest_shard_id = Some(shard_id);
+                self.discard_old();
+            }
+            Some(newest) if self.group_distance(newest, shard_id) > MAX_SHARD_SETS => {
+                return false;
+            }
+            Some(_) => {}
+        }
+        true
+    }
+
     fn discard_old(&mut self) {
-        let min_id = self.newest_shard_id.saturating_sub(MAX_SHARD_SETS);
-        self.shard_set.retain(|&id, _| id >= min_id);
+        let Some(newest) = self.newest_shard_id else {
+            return;
+        };
+        let groups = self.group_count();
+        let age = |id: u32| {
+            if newest >= id {
+                newest - id
+            } else {
+                newest + groups - id
+            }
+        };
+        self.shard_set.retain(|&id, _| age(id) <= MAX_SHARD_SETS);
+        self.completed_shards
+            .retain(|&id, _| age(id) <= MAX_SHARD_SETS);
     }
 }
 
@@ -807,5 +926,134 @@ mod tests {
             fec_kcp_from_recovered(&[4, 0, 0xAA, 0xBB]),
             Some(&[0xAAu8, 0xBB][..])
         );
+    }
+
+    #[test]
+    fn fec_autotune_history_is_bounded_and_wrap_safe() {
+        let mut tune = AutoTune::new();
+        for seq in 0..300u32 {
+            tune.sample(seq % 5 < 3, seq);
+        }
+        assert_eq!(tune.pulses.len(), tune.max_samples);
+        assert_eq!(tune.pulses.front().map(|&(seq, _)| seq), Some(42));
+        assert_eq!(tune.find_period(true, u32::MAX), 3);
+        assert_eq!(tune.find_period(false, u32::MAX), 2);
+
+        let mut seam = AutoTune::new();
+        let paws = 20;
+        for seq in [17, 18, 19, 0, 1, 2] {
+            seam.sample(seq == 18 || seq == 19 || seq == 0, seq);
+        }
+        assert_eq!(seam.find_period(true, paws), 3);
+        assert_eq!(seam.find_period(false, paws), 0);
+    }
+
+    #[test]
+    fn fec_unknown_flags_do_not_pollute_autotune() {
+        let mut dec = FecDecoder::new(3, 2).unwrap();
+        let mut unknown = vec![0u8; FEC_HEADER_SIZE];
+        unknown[..4].copy_from_slice(&0u32.to_le_bytes());
+        unknown[4..].copy_from_slice(&0x00f3u16.to_le_bytes());
+        assert!(dec.decode(&unknown).is_empty());
+        assert!(dec.auto_tune.pulses.is_empty());
+        assert!(!dec.should_tune);
+
+        let mut invalid_seq = unknown;
+        invalid_seq[..4].copy_from_slice(&dec.paws.to_le_bytes());
+        invalid_seq[4..].copy_from_slice(&FEC_TYPE_DATA.to_le_bytes());
+        assert!(dec.decode(&invalid_seq).is_empty());
+        assert!(dec.auto_tune.pulses.is_empty());
+    }
+
+    #[test]
+    fn fec_group_age_eviction_handles_paws_wrap() {
+        let mut dec = FecDecoder::new(3, 2).unwrap();
+        let groups = dec.group_count();
+        let last = groups - 1;
+        dec.newest_shard_id = Some(last);
+        dec.shard_set.insert(last, ShardHeap::new());
+        dec.shard_set
+            .insert(last - MAX_SHARD_SETS - 1, ShardHeap::new());
+        dec.completed_shards.insert(last - 1, ());
+        dec.completed_shards.insert(last - MAX_SHARD_SETS - 1, ());
+
+        // Group 0 is the next group after the PAWS seam. Observing it moves
+        // the newest marker across the seam and keeps the prior final group
+        // as age one.
+        assert!(dec.observe_shard(0));
+        dec.shard_set.insert(0, ShardHeap::new());
+        assert!(dec.shard_set.contains_key(&last));
+        assert!(dec.shard_set.contains_key(&0));
+        assert!(!dec.shard_set.contains_key(&(last - MAX_SHARD_SETS - 1)));
+        assert!(dec.completed_shards.contains_key(&(last - 1)));
+        assert!(!dec
+            .completed_shards
+            .contains_key(&(last - MAX_SHARD_SETS - 1)));
+        assert_eq!(dec.newest_shard_id, Some(0));
+    }
+
+    #[test]
+    fn fec_no_loss_group_retires_and_late_parity_is_ignored() {
+        let mut enc = FecEncoder::new(3, 2, 0).unwrap();
+        let mut data = Vec::new();
+        let mut parity = Vec::new();
+        for value in 1..=3u8 {
+            let (frame, mut generated) = enc.wrap_kcp_packet(&[value; 12], 1000);
+            data.push(frame);
+            parity.append(&mut generated);
+        }
+        assert_eq!(parity.len(), 2);
+
+        let mut dec = FecDecoder::new(3, 2).unwrap();
+        for frame in &data {
+            assert!(dec.decode(frame).is_empty());
+        }
+        assert!(dec.shard_set.is_empty());
+        assert!(dec.completed_shards.contains_key(&0));
+        for frame in &parity {
+            assert!(dec.decode(frame).is_empty());
+        }
+        assert!(dec.shard_set.is_empty());
+        assert_eq!(dec.completed_shards.len(), 1);
+    }
+
+    #[test]
+    fn fec_interleaved_duplicate_recovery_is_exact() {
+        let mut enc = FecEncoder::new(3, 2, 0).unwrap();
+        let mut groups: Vec<Vec<Vec<u8>>> = Vec::new();
+        for group in 0..2u8 {
+            let mut frames = Vec::new();
+            let mut parity = Vec::new();
+            for value in 0..3u8 {
+                let payload = vec![group * 10 + value; 12 + value as usize];
+                let (frame, mut generated) = enc.wrap_kcp_packet(&payload, 1000);
+                frames.push(frame);
+                parity.append(&mut generated);
+            }
+            assert_eq!(parity.len(), 2);
+            frames.extend(parity);
+            groups.push(frames);
+        }
+
+        let mut dec = FecDecoder::new(3, 2).unwrap();
+        // Interleave groups, duplicate a data shard, and recover group 0 from
+        // two data shards plus one parity shard.
+        assert!(dec.decode(&groups[0][1]).is_empty());
+        assert!(dec.decode(&groups[1][0]).is_empty());
+        assert!(dec.decode(&groups[0][1]).is_empty());
+        assert!(dec.decode(&groups[0][2]).is_empty());
+        let recovered = dec.decode(&groups[0][3]);
+        assert_eq!(recovered.len(), 1);
+        let recovered_kcp = fec_kcp_from_recovered(&recovered[0]).unwrap();
+        assert_eq!(recovered_kcp, &[0u8; 12]);
+
+        // Complete group 1 without loss, then ensure a late parity packet from
+        // group 0 cannot reopen its retired heap.
+        assert!(dec.decode(&groups[1][1]).is_empty());
+        assert!(dec.decode(&groups[1][2]).is_empty());
+        assert!(dec.decode(&groups[0][4]).is_empty());
+        assert!(dec.shard_set.is_empty());
+        assert!(dec.completed_shards.contains_key(&0));
+        assert!(dec.completed_shards.contains_key(&1));
     }
 }

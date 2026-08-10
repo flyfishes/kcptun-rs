@@ -405,9 +405,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::kcp_session_with_socket;
+    use crate::kcp_transport::kcp_conn_with_socket;
+    use kcrypt_rs::OffloadProfile;
 
-    /// Pair of connected UDP sockets + null-crypt KcpConn (mirrors session.rs tests).
+    /// Pair of connected UDP sockets + null-crypt KcpConn.
     async fn make_pair(cfg: KcpConfig) -> (kcp_rs::KcpConn, kcp_rs::KcpConn) {
         let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
@@ -424,12 +425,28 @@ mod tests {
         ));
 
         let key = b"0123456789abcdef0123456789abcdef";
-        let a = kcp_session_with_socket(sock_a, addr_b, key, "null", cfg.clone(), true)
-            .await
-            .unwrap();
-        let b = kcp_session_with_socket(sock_b, addr_a, key, "null", cfg, true)
-            .await
-            .unwrap();
+        let a = kcp_conn_with_socket(
+            sock_a,
+            addr_b,
+            key,
+            "null",
+            cfg.clone(),
+            true,
+            OffloadProfile::Tokio,
+        )
+        .await
+        .unwrap();
+        let b = kcp_conn_with_socket(
+            sock_b,
+            addr_a,
+            key,
+            "null",
+            cfg,
+            true,
+            OffloadProfile::Tokio,
+        )
+        .await
+        .unwrap();
         (a, b)
     }
 
@@ -468,7 +485,7 @@ mod tests {
         // Mixed payload: compressible prefix + varied tail, split across several
         // writes to exercise the persistent stream (single sNaPpY header).
         let mut payload = Vec::with_capacity(256 * 1024);
-        payload.extend(std::iter::repeat(b'a').take(128 * 1024));
+        payload.extend(std::iter::repeat_n(b'a', 128 * 1024));
         payload.extend((0u32..131072).map(|i| (i % 251) as u8));
 
         let mut written = 0usize;

@@ -156,7 +156,7 @@ Update `bench/profiles/HOTSPOTS.md` with before/after notes.
 
 ## Related docs
 
-- `PERF_OPTIMIZATION_PLAN.md` — residual R-items and KPI gates
+- `docs/superpowers/plans/2026-08-05-kcp-conn-listener-tail-latency.md` — conn/listener residual work and KPI gates
 - `.claude/skills/flamegraph-perf/SKILL.md` — agent skill for the full profiling loop
 - `bench/profiles/HOTSPOTS.md` — last recorded ranking
 - `kpprof-rs/src/lib.rs` — kpprof module docs (endpoints, profiling guide, symbol map)

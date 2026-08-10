@@ -7,12 +7,15 @@ description = "KCP protocol implementation in Rust - reliable UDP transport"
 [dependencies]
 bytes = "1"
 parking_lot = "0.12"
-crossbeam = "0.8"
 reed-solomon-erasure = "6"
 crc32fast = "1"
 smallvec = "1"
+thiserror.workspace = true
+async-trait.workspace = true
 # Optional async runtime + I/O (KcpConn). Enable via async-tokio or async-smol.
 kio-rs = { path = "../kio-rs", default-features = false, optional = true }
+# Optional pprof for profiling examples (build with --features pprof)
+kpprof-rs = { path = "../kpprof-rs", default-features = false, optional = true }
 
 [dev-dependencies]
 # Integration tests for KcpConn need a runtime; async-tokio feature pulls kio/tokio.
@@ -27,3 +30,5 @@ async = ["async-tokio"]
 async-tokio = ["dep:kio-rs", "kio-rs/tokio"]
 # Async KcpConn over kio (smol runtime). Mutually exclusive with async-tokio at kio level.
 async-smol = ["dep:kio-rs", "kio-rs/smol"]
+# pprof HTTP server for profiling (use with --profile profiling)
+pprof = ["dep:kpprof-rs", "kpprof-rs/tokio"]

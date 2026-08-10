@@ -47,10 +47,13 @@ pub mod des;
 pub mod wire;
 
 // Re-export the primary public API at the crate root for convenience.
+// Keep the deprecated compatibility functions reachable for downstream users;
+// new code should call `CryptEngine::select`.
+#[allow(deprecated)]
 pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine};
 pub use wire::{
-    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null, offload_profile,
-    set_offload_profile, should_cpu_block_compress, should_cpu_block_decrypt,
-    should_cpu_block_encrypt, strip_cfb_header_if_present, CryptoBuf, InboundCryptError,
-    OffloadProfile, CRYPT_HDR, NONCE_SZ,
+    decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null,
+    should_cpu_block_compress, should_cpu_block_decrypt, should_cpu_block_encrypt,
+    strip_cfb_header_if_present, CryptoBuf, InboundCryptError, OffloadProfile, CRYPTO_HEADER_SIZE,
+    NONCE_SIZE,
 };

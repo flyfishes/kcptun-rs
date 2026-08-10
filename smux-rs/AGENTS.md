@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-22 | Updated: 2026-07-31 (Task 7: Builder + no backpressure) -->
+<!-- Generated: 2026-07-22 | Updated: 2026-08-03 (legacy constructors deprecated; thiserror errors) -->
 
 # smux-rs
 
@@ -17,7 +17,7 @@ SMUX stream multiplexer over a single async transport (typically KCP+Snappy). Ru
 | `src/frame.rs` | 8B header codec; `Cmd`, `Frame`, `FrameCodec`; `FRAME_HEADER_SIZE=8`, `MAX_FRAME_SIZE` |
 | `src/session.rs` | `Session` multiplexer, `Config` / `DEFAULT_CONFIG`, stream open/accept, keepalive, SYN queue |
 | `src/stream.rs` | Logical `Stream`: `AsyncRead`/`AsyncWrite` + optional `set_flush_notify`; R4 locks |
-| `src/conn.rs` | `SmuxConn` + `SmuxConnBuilder` (`connect`/`serve` → `.build().await`); `open_stream`/`accept` → `Arc<Stream>`; legacy `client`/`server` thin wrappers |
+| `src/conn.rs` | `SmuxConn` + `SmuxConnBuilder` (`connect`/`serve` → `.build().await`); `open_stream`/`accept` → `Arc<Stream>`; deprecated legacy `client`/`server` wrappers |
 | `src/io.rs` | Thin `SmuxIo` (flush notify only; **no** KCP `with_backpressure` — removed) |
 
 ## Subdirectories
@@ -29,7 +29,7 @@ None (flat `src/`).
 - **Preferred:** `SmuxConn::connect(transport)` / `SmuxConn::serve(transport)` → chain `.version` / `.keepalive` / `.config` → `.build().await`.
 - `open_stream()` / `accept()` return `Arc<Stream>` which implements `AsyncRead`+`AsyncWrite` directly (no required `SmuxIo` wrapper).
 - Stream writes wake the driver via **`flush_notify`** set by SmuxConn; do not reintroduce KCP-specific `with_backpressure`.
-- `client`/`server` remain as thin sync wrappers (spawn driver) for older call sites.
+- Deprecated `client`/`server` remain as thin sync wrappers for older call sites.
 - Production kcptun binaries still drive **`Session` low-level** with custom flush loops; SmuxConn is library-ready for TCP or `KcpConn`-as-transport.
 
 ## For AI Agents

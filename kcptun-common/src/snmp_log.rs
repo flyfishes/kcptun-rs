@@ -57,7 +57,7 @@ fn civil_from_secs(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 /// Written to a sidecar `<path>.rustobs` so H2 / offload investigations can
 /// read `EncryptInline` / `EncryptOffload` without changing Go-compatible CSV.
 const RUST_OBS_HEADER: &str =
-    "timestamp,EmptyFlush,EncryptInline,EncryptOffload,DecryptOffloadSkipped";
+    "timestamp,EmptyFlush,EncryptInline,EncryptOffload,DecryptOffloadSkipped,WriteInlineSends,WriteFlushSends,InputUrgentSends";
 
 fn rust_obs_path(go_csv_path: &str) -> String {
     format!("{go_csv_path}.rustobs")
@@ -66,12 +66,15 @@ fn rust_obs_path(go_csv_path: &str) -> String {
 fn write_rust_obs_line(path: &str, ts: u64) {
     let snmp = &kcp_rs::DEFAULT_SNMP;
     let line = format!(
-        "{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{}",
         ts,
         snmp.empty_flush.load(Ordering::Acquire),
         snmp.encrypt_inline.load(Ordering::Acquire),
         snmp.encrypt_offload.load(Ordering::Acquire),
         snmp.decrypt_offload_skipped.load(Ordering::Acquire),
+        snmp.write_inline_sends.load(Ordering::Acquire),
+        snmp.write_flush_sends.load(Ordering::Acquire),
+        snmp.input_urgent_sends.load(Ordering::Acquire),
     );
     let mut f = match std::fs::OpenOptions::new()
         .create(true)

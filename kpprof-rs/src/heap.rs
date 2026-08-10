@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(prof.sample_type.len(), 2);
         assert!(prof.sample.is_empty());
         // We include a minimal mapping for tool compatibility
-        assert!(prof.mapping.len() >= 1);
+        assert!(!prof.mapping.is_empty());
     }
 
     #[test]

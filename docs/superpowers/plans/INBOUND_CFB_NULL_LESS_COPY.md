@@ -1,6 +1,6 @@
 # Plan: server/client 入站 in-place CFB + null 少拷
 
-> **Canonical path (git):** `docs/superpowers/plans/inbound-cfb-null-less-copy.md`  
+> **Canonical path (git):** `docs/superpowers/plans/INBOUND_CFB_NULL_LESS_COPY.md`  
 > `.omc/plans/` is gitignored; optional local symlink only for OMC.
 
 | Field | Value |

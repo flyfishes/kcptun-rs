@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn apply_fast3_sets_interval_10() {
-        let mut kcp = KCP::new(1, 0, Box::new(|_| {}));
+        let mut kcp = KCP::new(1, 0, |_| {});
         let cfg = KcpConfig {
             mode: KcpMode::Fast3,
             mtu: 1350,
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn apply_normal_sets_interval_40() {
-        let mut kcp = KCP::new(1, 0, Box::new(|_| {}));
+        let mut kcp = KCP::new(1, 0, |_| {});
         kcp.apply(&KcpConfig {
             mode: KcpMode::Normal,
             ..KcpConfig::default()
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn apply_fast_sets_interval_30() {
-        let mut kcp = KCP::new(1, 0, Box::new(|_| {}));
+        let mut kcp = KCP::new(1, 0, |_| {});
         kcp.apply(&KcpConfig {
             mode: KcpMode::Fast,
             ..KcpConfig::default()
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn apply_manual_uses_explicit_knobs() {
-        let mut kcp = KCP::new(1, 0, Box::new(|_| {}));
+        let mut kcp = KCP::new(1, 0, |_| {});
         kcp.apply(&KcpConfig {
             mode: KcpMode::Manual,
             nodelay: 1,
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn set_mode_fast2() {
-        let mut kcp = KCP::new(1, 0, Box::new(|_| {}));
+        let mut kcp = KCP::new(1, 0, |_| {});
         kcp.set_mode(KcpMode::Fast2, 0, 0, 0, 0);
         assert_eq!(kcp.interval(), 20);
     }

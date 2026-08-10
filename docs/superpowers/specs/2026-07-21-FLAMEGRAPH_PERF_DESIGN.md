@@ -109,7 +109,7 @@ bench/
 .claude/skills/flamegraph-perf/
   SKILL.md                  # project skill: triggers, steps, matrix, decision tree, verify
 docs/superpowers/specs/
-  2026-07-21-flamegraph-perf-design.md   # this document
+  2026-07-21-FLAMEGRAPH_PERF_DESIGN.md   # this document
 ```
 
 Also update:

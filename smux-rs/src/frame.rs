@@ -262,27 +262,18 @@ impl FrameCodec {
 }
 
 /// Errors related to SMUX frame processing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
     /// Frame too short.
+    #[error("frame too short")]
     Truncated,
     /// Unknown command.
+    #[error("unknown command: {0:#04x}")]
     UnknownCommand(u8),
     /// Invalid protocol version.
+    #[error("invalid version: {0}")]
     InvalidVersion(u8),
 }
-
-impl fmt::Display for FrameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FrameError::Truncated => write!(f, "frame too short"),
-            FrameError::UnknownCommand(c) => write!(f, "unknown command: {:#04x}", c),
-            FrameError::InvalidVersion(v) => write!(f, "invalid version: {}", v),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

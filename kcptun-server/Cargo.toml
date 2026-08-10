@@ -9,7 +9,6 @@ kcp-rs = { path = "../kcp-rs" }
 kcrypt-rs = { path = "../kcrypt-rs" }
 kcptun-common = { path = "../kcptun-common", default-features = false }
 smux-rs = { path = "../smux-rs", default-features = false }
-qpp-rs = { path = "../qpp-rs", optional = true }
 kio-rs = { path = "../kio-rs", default-features = false }
 clap = { version = "4", default-features = false, features = ["derive", "env", "std", "help", "usage", "error-context"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,14 +18,9 @@ env_logger = { version = "0.11", default-features = false, features = ["humantim
 anyhow = "1"
 bytes = "1"
 snap = "1"
-pbkdf2 = "0.12"
-sha1 = "0.10"
-parking_lot = "0.12"
-crc32fast = "1"
 socket2 = "0.5"
 mimalloc = { version = "0.1", default-features = false }
 kpprof-rs = { path = "../kpprof-rs", optional = true, default-features = false }
-dashmap = "6"
 
 [features]
 default = ["tokio", "qpp"]
@@ -38,8 +32,12 @@ pprof-deadlock = ["pprof", "kpprof-rs/deadlock"]
 tokio = ["kio-rs/tokio", "smux-rs/tokio", "kcptun-common/tokio", "kpprof-rs?/tokio"]
 smol = ["kio-rs/smol", "smux-rs/smol", "kcptun-common/smol", "kpprof-rs?/smol"]
 # Quantum Permutation Pad stream obfuscation. Optional to keep ARM binaries small.
-qpp = ["dep:qpp-rs", "kcptun-common/qpp"]
+qpp = ["kcptun-common/qpp"]
 
 [[bin]]
 name = "kcptun-server"
 path = "src/main.rs"
+
+[dev-dependencies]
+async-trait = "0.1"
+async-channel = "1"

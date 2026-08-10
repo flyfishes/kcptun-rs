@@ -176,6 +176,7 @@ impl SmuxConn {
     ///
     /// Equivalent to `SmuxConn::connect(transport).config(config)` + start driver
     /// (sync). Prefer [`connect`](Self::connect)`.build().await` for new code.
+    #[deprecated(note = "use SmuxConn::connect(transport).config(config).build().await")]
     pub fn client<T>(config: Config, transport: T) -> Result<Self, SessionError>
     where
         T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
@@ -192,6 +193,7 @@ impl SmuxConn {
     ///
     /// Equivalent to `SmuxConn::serve(transport).config(config)` + start driver
     /// (sync). Prefer [`serve`](Self::serve)`.build().await` for new code.
+    #[deprecated(note = "use SmuxConn::serve(transport).config(config).build().await")]
     pub fn server<T>(config: Config, transport: T) -> Result<Self, SessionError>
     where
         T: kio::AsyncRead + kio::AsyncWrite + Send + Unpin + 'static,
@@ -551,10 +553,15 @@ mod tests {
     use super::*;
     use crate::frame::{Cmd, FrameCodec};
     use crate::session::DEFAULT_CONFIG;
+    #[cfg(feature = "tokio")]
     use bytes::BytesMut;
+    #[cfg(feature = "tokio")]
     use std::pin::Pin;
+    #[cfg(feature = "tokio")]
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(feature = "tokio")]
     use std::sync::{Arc, Mutex};
+    #[cfg(feature = "tokio")]
     use std::task::{Context, Poll};
 
     /// Verify that SmuxConn is Clone and shares the same session.
@@ -569,6 +576,7 @@ mod tests {
     }
 
     /// Builder chain sets Config fields without needing a real network.
+    #[cfg(feature = "tokio")]
     #[test]
     fn connect_builder_sets_config_fields() {
         // Dummy transport never used — we only inspect builder.config before build.

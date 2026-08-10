@@ -49,8 +49,12 @@ pub mod time;
 pub use net::{tcpraw_dial, tcpraw_listen};
 pub use net::{DatagramSocket, TcpListener, TcpStream, UdpSocket};
 pub use net::{TcpRawConn, TcpRawListener};
+pub use sync::cancel::{race, CancellationToken, Cancelled, Race, RaceOutcome};
 pub use sync::Notify;
-pub use task::{block_on, cpu_block, runtime_kind, spawn_task, JoinHandle, RuntimeKind};
+pub use task::{
+    block_on, block_on_local, cpu_block, runtime_kind, spawn_task, yield_now, JoinHandle,
+    RuntimeKind,
+};
 pub use time::{mono_ms, sleep, sleep_ms, timeout, Elapsed};
 
 /// Read a file to a string, using a blocking thread pool to avoid stalling
@@ -102,9 +106,135 @@ where
 {
     let result = cfg_copy_bidirectional(a, b).await;
     if postwait_secs > 0 {
-        sleep_ms(postwait_secs * 1000).await;
+        sleep(Duration::from_secs(postwait_secs)).await;
     }
     result
+}
+
+// ─── copy_bidirectional shared state ───────────────────────────────────────────
+
+const BIDI_BUF_SIZE: usize = 65536;
+
+/// Shared state for bidirectional copy — buffers, counters, and EOF flags.
+///
+/// Used by both tokio and smol backends (which differ in their async
+/// concurrency patterns: `tokio::select!` vs `poll_fn`).
+struct BidiState {
+    buf_a: Box<[u8; BIDI_BUF_SIZE]>,
+    buf_b: Box<[u8; BIDI_BUF_SIZE]>,
+    /// Pending A→B data range in `buf_a`: [pending_ab, n_a).
+    pending_ab: usize,
+    n_a: usize,
+    /// Pending B→A data range in `buf_b`: [pending_ba, n_b).
+    pending_ba: usize,
+    n_b: usize,
+    total_a_to_b: u64,
+    total_b_to_a: u64,
+    a_eof: bool,
+    b_eof: bool,
+}
+
+#[allow(dead_code)] // some methods only used by smol variant
+impl BidiState {
+    fn new() -> Self {
+        Self {
+            buf_a: Box::new([0u8; BIDI_BUF_SIZE]),
+            buf_b: Box::new([0u8; BIDI_BUF_SIZE]),
+            pending_ab: 0,
+            n_a: 0,
+            pending_ba: 0,
+            n_b: 0,
+            total_a_to_b: 0,
+            total_b_to_a: 0,
+            a_eof: false,
+            b_eof: false,
+        }
+    }
+
+    #[inline]
+    fn has_pending_ab(&self) -> bool {
+        self.pending_ab < self.n_a
+    }
+
+    #[inline]
+    fn has_pending_ba(&self) -> bool {
+        self.pending_ba < self.n_b
+    }
+
+    #[inline]
+    fn pending_ab_size(&self) -> usize {
+        self.n_a - self.pending_ab
+    }
+
+    #[inline]
+    fn pending_ba_size(&self) -> usize {
+        self.n_b - self.pending_ba
+    }
+
+    #[inline]
+    fn advance_ab(&mut self, n: usize) {
+        self.total_a_to_b += n as u64;
+        self.pending_ab += n;
+    }
+
+    #[inline]
+    fn advance_ba(&mut self, n: usize) {
+        self.total_b_to_a += n as u64;
+        self.pending_ba += n;
+    }
+
+    #[inline]
+    fn set_ab_read(&mut self, n: usize) {
+        self.pending_ab = 0;
+        self.n_a = n;
+    }
+
+    #[inline]
+    fn set_ba_read(&mut self, n: usize) {
+        self.pending_ba = 0;
+        self.n_b = n;
+    }
+
+    #[inline]
+    fn reset_ab(&mut self) {
+        self.pending_ab = 0;
+        self.n_a = 0;
+    }
+
+    #[inline]
+    fn reset_ba(&mut self) {
+        self.pending_ba = 0;
+        self.n_b = 0;
+    }
+
+    #[inline]
+    fn pending_ab_slice(&self) -> &[u8] {
+        &self.buf_a[self.pending_ab..self.n_a]
+    }
+
+    #[inline]
+    fn pending_ba_slice(&self) -> &[u8] {
+        &self.buf_b[self.pending_ba..self.n_b]
+    }
+
+    #[inline]
+    fn a_buf_mut(&mut self) -> &mut [u8] {
+        &mut self.buf_a[..]
+    }
+
+    #[inline]
+    fn b_buf_mut(&mut self) -> &mut [u8] {
+        &mut self.buf_b[..]
+    }
+
+    #[inline]
+    fn both_eof(&self) -> bool {
+        self.a_eof && self.b_eof
+    }
+
+    fn into_result(self) -> (u64, u64) {
+        (self.total_a_to_b, self.total_b_to_a)
+    }
 }
 
 #[cfg(feature = "tokio")]
@@ -113,61 +243,81 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    // Custom implementation with 64KB buffers (matching Go kcptun's pipe buffer).
-    // tokio::io::copy_bidirectional uses 8KB buffers, which causes excessive
-    // flush-loop iterations (each 8KB write triggers a KCP flush cycle).
-    use AsyncReadExt;
+    // tokio 多线程运行时优化版本：使用 tokio::select! 而非 poll_fn。
+    //
+    // 使用 select! 替代 write_all 的优化：
+    // - 用 write 替代 write_all，避免写入缓冲区满时完全阻塞循环
+    // - write 写入至少 1 字节后返回，select! 可以立即轮询另一方向
     use AsyncWriteExt;
 
-    let mut total_a_to_b: u64 = 0;
-    let mut total_b_to_a: u64 = 0;
-    let mut buf_a = [0u8; 65536];
-    let mut buf_b = [0u8; 65536];
-    let mut a_eof = false;
-    let mut b_eof = false;
+    let mut s = BidiState::new();
 
     loop {
-        if a_eof && b_eof {
+        if s.both_eof() {
             break;
         }
 
-        tokio::select! {
-            result = async {
-                if a_eof { std::future::pending::<std::io::Result<usize>>().await }
-                else { a.read(&mut buf_a).await }
-            } => {
-                match result {
-                    Ok(0) => {
-                        a_eof = true;
-                        let _ = b.shutdown().await;
-                    }
-                    Ok(n) => {
-                        b.write_all(&buf_a[..n]).await?;
-                        total_a_to_b += n as u64;
+        // ── 写入待发数据（非阻塞，每次 select! 迭代只写入一个方向） ──
+        // 如果两个方向都有待发数据，优先写入数据量较少的（更快完成）。
+        if s.has_pending_ab() {
+            let write_ab = !s.has_pending_ba() || s.pending_ab_size() <= s.pending_ba_size();
+            if write_ab {
+                let slice = &s.buf_a[s.pending_ab..s.n_a];
+                match b.write(slice).await {
+                    Ok(0) => {} // 写入侧满，fall through 到 select!
+                    Ok(m) => {
+                        s.advance_ab(m);
+                        continue;
                     }
                     Err(e) => return Err(e),
                 }
             }
+        }
+        if s.has_pending_ba() {
+            let slice = &s.buf_b[s.pending_ba..s.n_b];
+            match a.write(slice).await {
+                Ok(0) => {} // 写入侧满，fall through 到 select!
+                Ok(m) => {
+                    s.advance_ba(m);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // ── 无待发数据，从 A 或 B 读取 ──
+        // tokio::select! 要求各分支的 borrow 不重叠，直接引用字段而非通过 &mut self 方法。
+        tokio::select! {
             result = async {
-                if b_eof { std::future::pending::<std::io::Result<usize>>().await }
-                else { b.read(&mut buf_b).await }
+                if s.a_eof { std::future::pending::<std::io::Result<usize>>().await }
+                else { a.read(&mut s.buf_a[..]).await }
             } => {
                 match result {
                     Ok(0) => {
-                        b_eof = true;
+                        s.a_eof = true;
+                        let _ = b.shutdown().await;
+                    }
+                    Ok(n) => s.set_ab_read(n),
+                    Err(e) => return Err(e),
+                }
+            }
+            result = async {
+                if s.b_eof { std::future::pending::<std::io::Result<usize>>().await }
+                else { b.read(&mut s.buf_b[..]).await }
+            } => {
+                match result {
+                    Ok(0) => {
+                        s.b_eof = true;
                         let _ = a.shutdown().await;
                     }
-                    Ok(n) => {
-                        a.write_all(&buf_b[..n]).await?;
-                        total_b_to_a += n as u64;
-                    }
+                    Ok(n) => s.set_ba_read(n),
                     Err(e) => return Err(e),
                 }
             }
         }
     }
 
-    Ok((total_a_to_b, total_b_to_a))
+    Ok(s.into_result())
 }
 
 #[cfg(feature = "smol")]
@@ -180,34 +330,24 @@ where
     use std::pin::Pin;
     use std::task::Poll;
 
-    // Heap buffers avoid ~128KiB async-state stack frames on smol workers.
-    const BUF: usize = 65536;
-    let mut ab_buf = vec![0u8; BUF]; // read-from-A buffer
-    let mut ba_buf = vec![0u8; BUF]; // read-from-B buffer
-    let mut ab_start = 0usize; // pending A→B data: [ab_start, ab_end) in ab_buf
-    let mut ab_end = 0usize;
-    let mut ba_start = 0usize; // pending B→A data: [ba_start, ba_end) in ba_buf
-    let mut ba_end = 0usize;
-    let mut ab_bytes: u64 = 0;
-    let mut ba_bytes: u64 = 0;
-    let mut a_eof = false;
-    let mut b_eof = false;
+    let mut s = BidiState::new();
+    let mut error: Option<std::io::Error> = None;
 
-    while !(a_eof && b_eof) {
+    while !s.both_eof() && error.is_none() {
         poll_fn(|cx| {
             let mut progress = false;
 
             // Write pending A→B data to B
-            while ab_start < ab_end {
-                match Pin::new(&mut *b).poll_write(cx, &ab_buf[ab_start..ab_end]) {
+            while s.has_pending_ab() {
+                match Pin::new(&mut *b).poll_write(cx, s.pending_ab_slice()) {
                     Poll::Ready(Ok(n)) if n > 0 => {
-                        ab_bytes += n as u64;
-                        ab_start += n;
+                        s.advance_ab(n);
                         progress = true;
                     }
                     Poll::Ready(Ok(_)) => break, // n == 0
-                    Poll::Ready(Err(_)) => {
-                        a_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.a_eof = true;
                         progress = true;
                         break;
                     }
@@ -216,20 +356,20 @@ where
             }
 
             // Read from A if no pending data
-            if ab_start >= ab_end && !a_eof {
-                ab_start = 0;
-                ab_end = 0;
-                match Pin::new(&mut *a).poll_read(cx, &mut ab_buf) {
+            if !s.has_pending_ab() && !s.a_eof && error.is_none() {
+                s.reset_ab();
+                match Pin::new(&mut *a).poll_read(cx, s.a_buf_mut()) {
                     Poll::Ready(Ok(0)) => {
-                        a_eof = true;
+                        s.a_eof = true;
                         progress = true;
                     }
                     Poll::Ready(Ok(n)) => {
-                        ab_end = n;
+                        s.set_ab_read(n);
                         progress = true;
                     }
-                    Poll::Ready(Err(_)) => {
-                        a_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.a_eof = true;
                         progress = true;
                     }
                     Poll::Pending => {}
@@ -237,16 +377,16 @@ where
             }
 
             // Write pending B→A data to A
-            while ba_start < ba_end {
-                match Pin::new(&mut *a).poll_write(cx, &ba_buf[ba_start..ba_end]) {
+            while s.has_pending_ba() {
+                match Pin::new(&mut *a).poll_write(cx, s.pending_ba_slice()) {
                     Poll::Ready(Ok(n)) if n > 0 => {
-                        ba_bytes += n as u64;
-                        ba_start += n;
+                        s.advance_ba(n);
                         progress = true;
                     }
                     Poll::Ready(Ok(_)) => break,
-                    Poll::Ready(Err(_)) => {
-                        b_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.b_eof = true;
                         progress = true;
                         break;
                     }
@@ -255,20 +395,20 @@ where
             }
 
             // Read from B if no pending data
-            if ba_start >= ba_end && !b_eof {
-                ba_start = 0;
-                ba_end = 0;
-                match Pin::new(&mut *b).poll_read(cx, &mut ba_buf) {
+            if !s.has_pending_ba() && !s.b_eof && error.is_none() {
+                s.reset_ba();
+                match Pin::new(&mut *b).poll_read(cx, s.b_buf_mut()) {
                     Poll::Ready(Ok(0)) => {
-                        b_eof = true;
+                        s.b_eof = true;
                         progress = true;
                     }
                     Poll::Ready(Ok(n)) => {
-                        ba_end = n;
+                        s.set_ba_read(n);
                         progress = true;
                     }
-                    Poll::Ready(Err(_)) => {
-                        b_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.b_eof = true;
                         progress = true;
                     }
                     Poll::Pending => {}
@@ -276,10 +416,10 @@ where
             }
 
             // Close write side when the corresponding read side hits EOF
-            if a_eof {
+            if s.a_eof {
                 let _ = Pin::new(&mut *b).poll_close(cx);
             }
-            if b_eof {
+            if s.b_eof {
                 let _ = Pin::new(&mut *a).poll_close(cx);
             }
 
@@ -292,7 +432,10 @@ where
         .await;
     }
 
-    Ok((ab_bytes, ba_bytes))
+    if let Some(e) = error {
+        return Err(e);
+    }
+    Ok(s.into_result())
 }
 
 // ─── copy_bidirectional_idle backend implementations ──────────────────────────
@@ -314,63 +457,63 @@ where
     use AsyncReadExt;
     use AsyncWriteExt;
 
-    let mut total_a_to_b: u64 = 0;
-    let mut total_b_to_a: u64 = 0;
-    let mut buf_a = [0u8; 65536];
-    let mut buf_b = [0u8; 65536];
-    let mut a_eof = false;
-    let mut b_eof = false;
+    let mut s = BidiState::new();
     let idle_duration = Duration::from_secs(idle_secs);
+    let mut idle_deadline = tokio::time::Instant::now() + idle_duration;
 
     loop {
-        if a_eof && b_eof {
+        if s.both_eof() {
             break;
         }
 
-        // Fresh idle timer each iteration — resets on every data transfer.
-        let idle = tokio::time::sleep(idle_duration);
-        tokio::pin!(idle);
+        let mut data_flowed = false;
 
         tokio::select! {
             result = async {
-                if a_eof { std::future::pending::<std::io::Result<usize>>().await }
-                else { a.read(&mut buf_a).await }
+                if s.a_eof { std::future::pending::<std::io::Result<usize>>().await }
+                else { a.read(&mut s.buf_a[..]).await }
             } => {
                 match result {
                     Ok(0) => {
-                        a_eof = true;
+                        s.a_eof = true;
                         let _ = b.shutdown().await;
                     }
                     Ok(n) => {
-                        b.write_all(&buf_a[..n]).await?;
-                        total_a_to_b += n as u64;
+                        b.write_all(&s.buf_a[..n]).await?;
+                        s.total_a_to_b += n as u64;
+                        data_flowed = true;
                     }
                     Err(e) => return Err(e),
                 }
             }
             result = async {
-                if b_eof { std::future::pending::<std::io::Result<usize>>().await }
-                else { b.read(&mut buf_b).await }
+                if s.b_eof { std::future::pending::<std::io::Result<usize>>().await }
+                else { b.read(&mut s.buf_b[..]).await }
             } => {
                 match result {
                     Ok(0) => {
-                        b_eof = true;
+                        s.b_eof = true;
                         let _ = a.shutdown().await;
                     }
                     Ok(n) => {
-                        a.write_all(&buf_b[..n]).await?;
-                        total_b_to_a += n as u64;
+                        a.write_all(&s.buf_b[..n]).await?;
+                        s.total_b_to_a += n as u64;
+                        data_flowed = true;
                     }
                     Err(e) => return Err(e),
                 }
             }
-            _ = &mut idle => {
+            _ = tokio::time::sleep_until(idle_deadline) => {
                 break;
             }
         }
+
+        if data_flowed {
+            idle_deadline = tokio::time::Instant::now() + idle_duration;
+        }
     }
 
-    Ok((total_a_to_b, total_b_to_a))
+    Ok(s.into_result())
 }
 
 #[cfg(feature = "smol")]
@@ -383,9 +526,6 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    // True idle timeout (matches tokio + Go closeWait): the timer resets on
-    // every successful data transfer. A total-duration `timeout()` wrapper
-    // would kill long-lived pipes that stay busy — wrong for closeWait.
     if idle_secs == 0 {
         return cfg_copy_bidirectional(a, b).await;
     }
@@ -395,39 +535,27 @@ where
     use std::pin::Pin;
     use std::task::Poll;
 
-    // Heap-allocate 64KiB buffers. Stack arrays of 128KiB plus the async
-    // state machine overflow smol worker stacks in debug builds.
-    const BUF: usize = 65536;
-    let mut ab_buf = vec![0u8; BUF];
-    let mut ba_buf = vec![0u8; BUF];
-    let mut ab_start = 0usize;
-    let mut ab_end = 0usize;
-    let mut ba_start = 0usize;
-    let mut ba_end = 0usize;
-    let mut ab_bytes: u64 = 0;
-    let mut ba_bytes: u64 = 0;
-    let mut a_eof = false;
-    let mut b_eof = false;
+    let mut s = BidiState::new();
+    let mut error: Option<std::io::Error> = None;
     let idle_duration = Duration::from_secs(idle_secs);
     let mut idle = async_io::Timer::after(idle_duration);
 
-    while !(a_eof && b_eof) {
-        // Reset idle deadline after every progress step (or on first wait).
-        idle.set_after(idle_duration);
-
-        let made_progress = poll_fn(|cx| {
+    while !s.both_eof() && error.is_none() {
+        let result = poll_fn(|cx| -> Poll<Option<bool>> {
             let mut progress = false;
+            let mut data_flowed = false;
 
-            while ab_start < ab_end {
-                match Pin::new(&mut *b).poll_write(cx, &ab_buf[ab_start..ab_end]) {
+            while s.has_pending_ab() {
+                match Pin::new(&mut *b).poll_write(cx, s.pending_ab_slice()) {
                     Poll::Ready(Ok(n)) if n > 0 => {
-                        ab_bytes += n as u64;
-                        ab_start += n;
+                        s.advance_ab(n);
+                        data_flowed = true;
                         progress = true;
                     }
                     Poll::Ready(Ok(_)) => break,
-                    Poll::Ready(Err(_)) => {
-                        a_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.a_eof = true;
                         progress = true;
                         break;
                     }
@@ -435,36 +563,38 @@ where
                 }
             }
 
-            if ab_start >= ab_end && !a_eof {
-                ab_start = 0;
-                ab_end = 0;
-                match Pin::new(&mut *a).poll_read(cx, &mut ab_buf[..]) {
+            if !s.has_pending_ab() && !s.a_eof && error.is_none() {
+                s.reset_ab();
+                match Pin::new(&mut *a).poll_read(cx, s.a_buf_mut()) {
                     Poll::Ready(Ok(0)) => {
-                        a_eof = true;
+                        s.a_eof = true;
                         progress = true;
                     }
                     Poll::Ready(Ok(n)) => {
-                        ab_end = n;
+                        s.set_ab_read(n);
+                        data_flowed = true;
                         progress = true;
                     }
-                    Poll::Ready(Err(_)) => {
-                        a_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.a_eof = true;
                         progress = true;
                     }
                     Poll::Pending => {}
                 }
             }
 
-            while ba_start < ba_end {
-                match Pin::new(&mut *a).poll_write(cx, &ba_buf[ba_start..ba_end]) {
+            while s.has_pending_ba() {
+                match Pin::new(&mut *a).poll_write(cx, s.pending_ba_slice()) {
                     Poll::Ready(Ok(n)) if n > 0 => {
-                        ba_bytes += n as u64;
-                        ba_start += n;
+                        s.advance_ba(n);
+                        data_flowed = true;
                         progress = true;
                     }
                     Poll::Ready(Ok(_)) => break,
-                    Poll::Ready(Err(_)) => {
-                        b_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.b_eof = true;
                         progress = true;
                         break;
                     }
@@ -472,54 +602,56 @@ where
                 }
             }
 
-            if ba_start >= ba_end && !b_eof {
-                ba_start = 0;
-                ba_end = 0;
-                match Pin::new(&mut *b).poll_read(cx, &mut ba_buf[..]) {
+            if !s.has_pending_ba() && !s.b_eof && error.is_none() {
+                s.reset_ba();
+                match Pin::new(&mut *b).poll_read(cx, s.b_buf_mut()) {
                     Poll::Ready(Ok(0)) => {
-                        b_eof = true;
+                        s.b_eof = true;
                         progress = true;
                     }
                     Poll::Ready(Ok(n)) => {
-                        ba_end = n;
+                        s.set_ba_read(n);
+                        data_flowed = true;
                         progress = true;
                     }
-                    Poll::Ready(Err(_)) => {
-                        b_eof = true;
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        s.b_eof = true;
                         progress = true;
                     }
                     Poll::Pending => {}
                 }
             }
 
-            // Do not busy-poll poll_close: only attempt once per progress step
-            // when the peer has EOF'd. Repeated Ready(close) would not set
-            // progress, so it is safe here only when progress is already true
-            // or we are about to wait.
-            if a_eof {
+            if s.a_eof {
                 let _ = Pin::new(&mut *b).poll_close(cx);
             }
-            if b_eof {
+            if s.b_eof {
                 let _ = Pin::new(&mut *a).poll_close(cx);
             }
 
             if progress {
-                return Poll::Ready(true);
+                return Poll::Ready(Some(data_flowed));
             }
 
             match Pin::new(&mut idle).poll(cx) {
-                Poll::Ready(_) => Poll::Ready(false),
+                Poll::Ready(_) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             }
         })
         .await;
 
-        if !made_progress {
-            break;
+        match result {
+            Some(true) => idle.set_after(idle_duration),
+            Some(false) => {}
+            None => break,
         }
     }
 
-    Ok((ab_bytes, ba_bytes))
+    if let Some(e) = error {
+        return Err(e);
+    }
+    Ok(s.into_result())
 }
 
 /// Wait for Ctrl-C (SIGINT). Uses a dedicated blocking thread with a libc
@@ -534,6 +666,8 @@ pub async fn ctrl_c() -> std::io::Result<()> {
         // Install a minimal SIGINT handler that sets a flag.
         // On non-Unix targets this is a no-op.
         #[cfg(unix)]
+        // SAFETY: the installed handler only performs an atomic store. It does
+        // not allocate, lock, or perform I/O while running in signal context.
         unsafe {
             libc::signal(
                 libc::SIGINT,
@@ -562,6 +696,8 @@ pub async fn ctrl_c() -> std::io::Result<()> {
 /// Call once at process startup. On non-Unix targets this is a no-op.
 pub fn ignore_sigpipe() {
     #[cfg(unix)]
+    // SAFETY: SIG_IGN is a valid process-wide disposition for SIGPIPE and no
+    // Rust data is accessed by a signal callback.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
@@ -582,6 +718,8 @@ pub fn install_sigusr1_handler() {
             crate::SIGUSR1_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
+        // SAFETY: the installed handler only performs an atomic store. It does
+        // not allocate, lock, or perform I/O while running in signal context.
         unsafe {
             libc::signal(
                 libc::SIGUSR1,

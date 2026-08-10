@@ -1,12 +1,12 @@
 # Spec: 热路径 is_closed() Mutex → AtomicBool — implementation record
 
-> **Canonical path (git):** `docs/superpowers/specs/2026-07-22-hotpath-is-closed-mutex-regression.md`
+> **Canonical path (git):** `docs/superpowers/specs/2026-07-22-HOTPATH_IS_CLOSED_MUTEX_REGRESSION.md`
 
 | Field | Value |
 |-------|-------|
 | Implemented | 2026-07-22 |
 | All commits | `2973f26` |
-| Plan | `docs/superpowers/plans/2026-07-22-hotpath-is-closed-mutex-regression-todo.md` |
+| Plan | `docs/superpowers/plans/2026-07-22-HOTPATH_IS_CLOSED_MUTEX_REGRESSION_TODO.md` |
 
 ---
 

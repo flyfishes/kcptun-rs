@@ -143,6 +143,46 @@ impl UdpSocket {
         self.inner.try_recv(buf)
     }
 
+    /// Non-blocking send for connected sockets (tokio native).
+    #[inline(always)]
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.try_send(buf)
+    }
+
+    /// Try to send all `bufs` without blocking. Returns the number of packets
+    /// sent (stops on `WouldBlock` / partial).
+    ///
+    /// Linux: `sendmmsg` (one syscall for the batch). Others: per-packet
+    /// `try_send`.
+    pub fn try_send_batch<B: AsRef<[u8]>>(&self, bufs: &[B]) -> io::Result<usize> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            match super::mmsg::sendmmsg_connected(self.inner.as_raw_fd(), bufs) {
+                Ok(n) => Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut sent = 0;
+            for b in bufs {
+                let b = b.as_ref();
+                match self.inner.try_send(b) {
+                    Ok(n) if n == b.len() => sent += 1,
+                    Ok(_) => return Ok(sent), // partial datagram (shouldn't happen)
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(sent),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(sent)
+        }
+    }
+
     #[inline(always)]
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.inner.try_recv_from(buf)
@@ -198,9 +238,86 @@ impl UdpSocket {
         }
     }
 
+    /// Allocation-free batch receive on an unconnected socket.
+    ///
+    /// Fills `packet_bufs[..n]` with payloads **in place** (slots stay owned by
+    /// the caller, no per-slot replacement `Vec`) and writes the source
+    /// addresses into `peers` (cleared first; capacity reused). Returns the
+    /// number of datagrams received; `Ok(0)` on `WouldBlock`.
+    ///
+    /// Linux: one `recvmmsg` syscall. Elsewhere: sequential `try_recv_from`
+    /// filling slots in place (no `to_vec()` copy).
+    pub fn try_recv_batch_from_into(
+        &self,
+        packet_bufs: &mut [Vec<u8>],
+        peers: &mut Vec<SocketAddr>,
+    ) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            return super::mmsg::recvmmsg_from_into(self.inner.as_raw_fd(), packet_bufs, peers);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            peers.clear();
+            let mut n = 0;
+            for slot in packet_bufs.iter_mut() {
+                if slot.capacity() < 2048 {
+                    slot.reserve(2048);
+                }
+                slot.resize(slot.capacity(), 0);
+                match self.inner.try_recv_from(slot) {
+                    Ok((len, peer)) => {
+                        slot.truncate(len);
+                        peers.push(peer);
+                        n += 1;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(n)
+        }
+    }
+
     #[inline(always)]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+
+    /// Non-blocking batch receive on a connected socket (no peer addresses).
+    ///
+    /// Linux/macOS: one `recvmmsg` syscall fills the pool. Others: one
+    /// `try_recv` per call into `pool[0]`. Returns datagrams received.
+    pub fn try_recv_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
+        if pool.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match super::mmsg::recvmmsg_connected(self.inner.as_raw_fd(), pool) {
+                Ok(n) => Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if pool[0].capacity() < 2048 {
+                pool[0].reserve(2048);
+            }
+            // resize to capacity so try_recv gets a non-zero-length buffer.
+            pool[0].resize(pool[0].capacity(), 0);
+            match self.inner.try_recv(&mut pool[0]) {
+                Ok(n) if n > 0 => {
+                    pool[0].truncate(n);
+                    Ok(1)
+                }
+                Ok(_) => Ok(0),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e),
+            }
+        }
     }
 }
 
@@ -230,6 +347,27 @@ impl TcpListener {
         let _ = s.set_nodelay(true);
         Ok((TcpStream { inner: s }, a))
     }
+
+    /// Non-blocking accept of one pending connection; `WouldBlock` when none.
+    ///
+    /// Uses `poll_accept` with a no-op waker (tokio 1.52 lacks `try_accept`).
+    #[inline(always)]
+    pub fn try_accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        use std::task::{Context, Poll, Waker};
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match self.inner.poll_accept(&mut cx) {
+            Poll::Ready(Ok((s, a))) => {
+                let _ = s.set_nodelay(true);
+                Ok((TcpStream { inner: s }, a))
+            }
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no pending connection",
+            )),
+        }
+    }
 }
 
 // ─── TcpStream ────────────────────────────────────────────────────────────────
@@ -241,20 +379,29 @@ pub struct TcpStream {
 impl TcpStream {
     #[inline(always)]
     pub async fn connect(addr: impl AsRef<str>) -> io::Result<Self> {
-        let addr = addr.as_ref();
-        // Resolve DNS hostnames (server `-t` target), not just IP literals.
-        let remote: SocketAddr = addr
-            .to_socket_addrs()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-            .next()
-            .ok_or_else(|| {
+        let addr = addr.as_ref().to_owned();
+        // Offload blocking DNS resolution + TCP connect to the persistent
+        // blocking pool. Try all resolved addresses (IPv6/IPv4 fallback).
+        let std_stream = crate::cpu_block(move || -> io::Result<std::net::TcpStream> {
+            let addrs = addr
+                .to_socket_addrs()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let mut last_err = None;
+            for remote in addrs {
+                match raw_tcp_stream(remote) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("no address for {addr}"),
                 )
-            })?;
-        let std_stream = raw_tcp_stream(remote)?;
-        let s = tokio::net::TcpStream::from_std(std_stream)?;
+            }))
+        })
+        .await;
+        let s = tokio::net::TcpStream::from_std(std_stream?)?;
         Ok(Self { inner: s })
     }
 }

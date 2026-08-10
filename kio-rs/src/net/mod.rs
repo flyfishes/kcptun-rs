@@ -10,13 +10,13 @@
 use std::io;
 use std::net::SocketAddr;
 
-/// UDP recv/send buffer size (2 MB).
-const SOCK_BUF: usize = 2 * 1024 * 1024;
+/// UDP recv/send buffer size (4 MB).
+const SOCK_BUF: usize = 4 * 1024 * 1024;
 
 /// Create a tuned, non-blocking `std::net::UdpSocket` via socket2.
 ///
 /// Both backends share this function to ensure identical socket configuration:
-/// - 2 MB recv/send buffer sizes
+/// - 4 MB recv/send buffer sizes
 /// - SO_REUSEADDR
 /// - non-blocking mode
 ///
@@ -169,6 +169,18 @@ impl DatagramSocket {
         }
     }
 
+    /// Try to send all `bufs` on a connected socket without blocking.
+    ///
+    /// Returns the number of packets actually sent (stops on `WouldBlock`).
+    /// Returns `0` for transports that can't send synchronously (TcpRaw), so
+    /// the caller falls back to the async path.
+    pub fn try_send_batch<B: AsRef<[u8]>>(&self, bufs: &[B]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_send_batch(bufs),
+            Self::TcpRaw(_) => Ok(0),
+        }
+    }
+
     pub async fn send_batch_to<B: AsRef<[u8]>>(
         &self,
         bufs: &[B],
@@ -202,6 +214,30 @@ impl DatagramSocket {
         match self {
             Self::Udp(s) => s.try_recv_batch_from(packet_bufs, out),
             Self::TcpRaw(s) => s.try_recv_batch_from(packet_bufs, out),
+        }
+    }
+
+    /// Allocation-free batch receive on an unconnected socket: fills
+    /// `packet_bufs[..n]` with payloads in place and writes source addresses
+    /// into `peers` (capacity reused). `TcpRaw` returns `0`.
+    pub fn try_recv_batch_from_into(
+        &self,
+        packet_bufs: &mut [Vec<u8>],
+        peers: &mut Vec<SocketAddr>,
+    ) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_recv_batch_from_into(packet_bufs, peers),
+            Self::TcpRaw(_) => Ok(0),
+        }
+    }
+
+    /// Non-blocking batch receive on a connected socket into the caller's
+    /// buffer pool. Linux: `recvmmsg` (one syscall). Others: one `try_recv`
+    /// into `pool[0]`. Returns datagrams received.
+    pub fn try_recv_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
+        match self {
+            Self::Udp(s) => s.try_recv_batch(pool),
+            Self::TcpRaw(_) => Ok(0),
         }
     }
 

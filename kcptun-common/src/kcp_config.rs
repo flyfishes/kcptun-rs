@@ -8,10 +8,10 @@ use kcp_rs::{KcpConfig, KcpMode};
 /// Default conversation ID (matches historical kcptun client/server).
 pub const DEFAULT_CONV: u32 = 0xDEAD_BEEF;
 
-/// CLI-shaped KCP parameters used by both binaries and the new KcpConn path.
+/// CLI-shaped KCP parameters used by both binaries.
 ///
-/// This is the KCP/FEC subset of the larger SessionConfig in client/server —
-/// SMUX / snappy / ratelimit stay outside [`kcp_rs::KcpConn`].
+/// This builds the KCP/FEC portion of [`crate::KcptunConfig`]; SMUX, Snappy,
+/// crypto, and rate limiting remain at their owning layers.
 #[derive(Debug, Clone)]
 pub struct KcpCliParams {
     /// Mode profile: `normal` / `fast` / `fast2` / `fast3`, or anything else
@@ -99,7 +99,7 @@ pub fn parse_kcp_mode(mode: &str) -> KcpMode {
 /// - Unknown / `"manual"` uses the explicit `nodelay`/`interval`/`resend`/`nc`.
 /// - `stream` is always `true` (kcptun SMUX stack).
 /// - FEC is enabled only when both `datashard` and `parityshard` are > 0
-///   (enforced later by `kcp_session*` / KcpConn builder).
+///   (enforced later by `kcp_conn*` / KcpConn builder).
 ///
 /// `conv` defaults to [`DEFAULT_CONV`] when callers pass that constant;
 /// use a non-default value for multi-peer servers that allocate per-peer conv.
@@ -248,7 +248,8 @@ mod tests {
 
     /// Every known mode curve, locked as the single source of truth. Must match
     /// BOTH `crate::apply_mode` (mode.rs) and `KcpMode::nodelay_params` (kcp-rs).
-    const CURVES: [(&str, KcpMode, (u32, u32, u32, u32)); 4] = [
+    type ModeCurve = (&'static str, KcpMode, (u32, u32, u32, u32));
+    const CURVES: [ModeCurve; 4] = [
         ("normal", KcpMode::Normal, (0, 40, 2, 1)),
         ("fast", KcpMode::Fast, (0, 30, 2, 1)),
         ("fast2", KcpMode::Fast2, (1, 20, 2, 1)),
@@ -263,13 +264,13 @@ mod tests {
 
             // Legacy client: `set_snd_wnd`/`set_rcv_wnd` (client main.rs) then
             // `apply_mode` for known modes (KCP set_mode).
-            let mut legacy = kcp_rs::KCP::new(1, 0, Box::new(|_| {}));
+            let mut legacy = kcp_rs::KCP::new(1, 0, |_| {});
             legacy.set_snd_wnd(128);
             legacy.set_rcv_wnd(512);
             crate::apply_mode(&mut legacy, name);
 
             // Library client path: kcp_config_from → KcpConfig.apply.
-            let mut lib = kcp_rs::KCP::new(1, 0, Box::new(|_| {}));
+            let mut lib = kcp_rs::KCP::new(1, 0, |_| {});
             let cfg = kcp_config_from_cli(name, 1350, 128, 512, 0, 50, 0, 0, false, 0, 0);
             lib.apply(&cfg);
 
@@ -285,11 +286,11 @@ mod tests {
         // then `kcp.set_nodelay(n, i, resend, nc)`. Library `KCP::set_mode(Manual, ...)`
         // applies the same clamp.
         for interval in [0u32, 5, 10, 15, 50] {
-            let mut legacy = kcp_rs::KCP::new(1, 0, Box::new(|_| {}));
+            let mut legacy = kcp_rs::KCP::new(1, 0, |_| {});
             let i = if interval >= 10 { interval } else { 40 };
             legacy.set_nodelay(1, i, 2, 1);
 
-            let mut lib = kcp_rs::KCP::new(1, 0, Box::new(|_| {}));
+            let mut lib = kcp_rs::KCP::new(1, 0, |_| {});
             lib.apply(&kcp_config_from(
                 "manual",
                 1350,
@@ -341,7 +342,7 @@ mod tests {
         assert_eq!(cfg.datashard, 10);
         assert_eq!(cfg.parityshard, 3);
 
-        let mut kcp = kcp_rs::KCP::new(1, 0, Box::new(|_| {}));
+        let mut kcp = kcp_rs::KCP::new(1, 0, |_| {});
         kcp.apply(&cfg);
         // Explicit interval 25 (≥10) is used verbatim — not a mode curve.
         assert_eq!(kcp.interval(), 25);

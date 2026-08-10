@@ -17,12 +17,12 @@ DATA_MB="${BENCH_DATA_MB:-200}"
 CHUNK_KB="${BENCH_KB:-128}"
 LATENCY_ITERS="${BENCH_LATENCY_ITERS:-50}"
 
-GO_SERVER=./tests/kcptun-go/server
-GO_CLIENT=./tests/kcptun-go/client
-RUST_TOKIO_SERVER=./target/release/kcptun-server
-RUST_TOKIO_CLIENT=./target/release/kcptun-client
-RUST_SMOL_SERVER=./target/smol-release/release/kcptun-server
-RUST_SMOL_CLIENT=./target/smol-release/release/kcptun-client
+GO_SERVER="${GO_SERVER:-./tests/kcptun-go/server}"
+GO_CLIENT="${GO_CLIENT:-./tests/kcptun-go/client}"
+RUST_TOKIO_SERVER="${RUST_TOKIO_SERVER:-./target/release/kcptun-server}"
+RUST_TOKIO_CLIENT="${RUST_TOKIO_CLIENT:-./target/release/kcptun-client}"
+RUST_SMOL_SERVER="${RUST_SMOL_SERVER:-./target/smol-release/release/kcptun-server}"
+RUST_SMOL_CLIENT="${RUST_SMOL_CLIENT:-./target/smol-release/release/kcptun-client}"
 
 # kcptun args — aligned on both sides for fair cross-impl comparison.
 # Default Rust client sndwnd is 128 vs server 1024; leave them implicit and
@@ -145,6 +145,10 @@ run_bench() {
     local label=$1
     local client_bin=$2
     local server_bin=$3
+
+    if [ -n "${BENCH_FILTER:-}" ] && [ "$label" != "$BENCH_FILTER" ]; then
+        return
+    fi
 
     echo "━━━ $label ━━━"
 

@@ -1,6 +1,6 @@
 # Plan: SMUX stream逻辑泄漏 — 代理场景RSS持续上涨修复
 
-> **Canonical path (git):** `docs/superpowers/plans/2026-07-22-smux-stream-leak-fix.md`
+> **Canonical path (git):** `docs/superpowers/plans/2026-07-22-SMUX_STREAM_LEAK_FIX.md`
 
 | Field | Value |
 |-------|--------|

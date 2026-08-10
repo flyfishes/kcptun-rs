@@ -28,23 +28,32 @@ use bytes::{Bytes, BytesMut};
 use crate::crypt::{AeadCrypt, BlockCrypt, CryptEngine};
 
 /// Crypto header size: `[nonce 16B][CRC32 4B]`.
-pub const CRYPT_HDR: usize = 20;
+pub const CRYPTO_HEADER_SIZE: usize = 20;
 /// Nonce size.
-pub const NONCE_SZ: usize = 16;
+pub const NONCE_SIZE: usize = 16;
+
+/// Deprecated alias for [`CRYPTO_HEADER_SIZE`].
+#[deprecated(note = "renamed to CRYPTO_HEADER_SIZE")]
+pub const CRYPT_HDR: usize = CRYPTO_HEADER_SIZE;
+/// Deprecated alias for [`NONCE_SIZE`].
+#[deprecated(note = "renamed to NONCE_SIZE")]
+pub const NONCE_SZ: usize = NONCE_SIZE;
 
 /// Inbound CFB decrypt / header-strip failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InboundCryptError {
     /// Packet shorter than crypto header (or empty after probe).
+    #[error("packet shorter than crypto header")]
     Short,
     /// CRC32 of payload does not match the header field.
+    #[error("payload CRC32 does not match crypto header")]
     CrcMismatch,
 }
 
 /// Decrypt a CFB wire packet **in place** and return a slice of the plaintext body.
 ///
 /// Layout after decrypt: `[nonce 16B][CRC32 4B][payload…]`. On success the
-/// returned slice is `&buf[CRYPT_HDR..]` — **no** heap alloc and **no** copy
+/// returned slice is `&buf[CRYPTO_HEADER_SIZE..]` — **no** heap alloc and **no** copy
 /// into `CryptoBuf.enc_buf`.
 ///
 /// `probe_header`: when `true` (server historical/compat path), if byte 4 is a
@@ -75,7 +84,7 @@ pub fn strip_cfb_header_if_present(
     probe_header: bool,
 ) -> Result<&[u8], InboundCryptError> {
     if probe_header {
-        if buf.len() > CRYPT_HDR {
+        if buf.len() > CRYPTO_HEADER_SIZE {
             let cmd = buf[4];
             let has_header = cmd != 0x51 && cmd != 0x52 && cmd != 0x53 && cmd != 0x54;
             if !has_header {
@@ -90,20 +99,20 @@ pub fn strip_cfb_header_if_present(
         } else {
             return Err(InboundCryptError::Short);
         }
-    } else if buf.len() <= CRYPT_HDR {
+    } else if buf.len() <= CRYPTO_HEADER_SIZE {
         return Err(InboundCryptError::Short);
     }
 
     let stored_crc = u32::from_le_bytes(
-        buf[NONCE_SZ..CRYPT_HDR]
+        buf[NONCE_SIZE..CRYPTO_HEADER_SIZE]
             .try_into()
             .map_err(|_| InboundCryptError::Short)?,
     );
-    let computed_crc = crc32fast::hash(&buf[CRYPT_HDR..]);
+    let computed_crc = crc32fast::hash(&buf[CRYPTO_HEADER_SIZE..]);
     if stored_crc != computed_crc {
         return Err(InboundCryptError::CrcMismatch);
     }
-    Ok(&buf[CRYPT_HDR..])
+    Ok(&buf[CRYPTO_HEADER_SIZE..])
 }
 
 /// null cipher inbound view — identity slice (no crypto header).
@@ -164,7 +173,7 @@ impl CryptoBuf {
     /// - Nonce is built from a monotonic counter + session_id; no per-packet PRNG.
     #[inline]
     pub fn encrypt_cfb(&mut self, data: &[u8], crypt: &CryptEngine) -> Bytes {
-        let total = CRYPT_HDR + data.len();
+        let total = CRYPTO_HEADER_SIZE + data.len();
         // Keep spare so full-length split_to does not empty the reusable allocation.
         const SPARE: usize = 2048;
         self.enc_buf.clear();
@@ -220,7 +229,7 @@ impl CryptoBuf {
     /// CRC + encrypt in parallel across threads (both are stateless).
     #[inline]
     pub fn prepare_encrypt(&mut self, data: &[u8]) -> BytesMut {
-        let total = CRYPT_HDR + data.len();
+        let total = CRYPTO_HEADER_SIZE + data.len();
         // Keep spare so full-length split_to does not empty the reusable allocation.
         const SPARE: usize = 2048;
         self.enc_buf.clear();
@@ -250,9 +259,9 @@ impl CryptoBuf {
     /// Wire-compatible with Go: CRC is over plaintext only (before encrypt).
     #[inline]
     pub fn finalize_encrypt_packet(buf: &mut [u8], crypt: &CryptEngine) {
-        debug_assert!(buf.len() >= CRYPT_HDR);
-        let crc = crc32fast::hash(&buf[CRYPT_HDR..]);
-        buf[NONCE_SZ..CRYPT_HDR].copy_from_slice(&crc.to_le_bytes());
+        debug_assert!(buf.len() >= CRYPTO_HEADER_SIZE);
+        let crc = crc32fast::hash(&buf[CRYPTO_HEADER_SIZE..]);
+        buf[NONCE_SIZE..CRYPTO_HEADER_SIZE].copy_from_slice(&crc.to_le_bytes());
         crypt.encrypt(buf);
     }
 
@@ -278,7 +287,6 @@ impl CryptoBuf {
 
 /// Runtime-shaped `cpu_block` defaults (scheduling only — not wire format).
 ///
-/// Set from binaries via [`set_offload_profile`] using `kio::runtime_kind()`.
 /// Evidence (2026-07-30, multi-conn xtea no-comp, env A/B):
 /// - smol default (1 pkt / 512 B): r_off≈1.0, med thr lower
 /// - smol raised (4 pkt / 2 KiB): r_off≈0.14, **+19.6%** thr
@@ -287,27 +295,6 @@ impl CryptoBuf {
 pub enum OffloadProfile {
     Tokio,
     Smol,
-}
-
-// 0 = Tokio (default), 1 = Smol.
-static OFFLOAD_PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Install offload profile (last write wins; safe for tests).
-pub fn set_offload_profile(profile: OffloadProfile) {
-    let v = match profile {
-        OffloadProfile::Tokio => 0u8,
-        OffloadProfile::Smol => 1u8,
-    };
-    OFFLOAD_PROFILE.store(v, Ordering::Release);
-}
-
-/// Active profile (defaults to Tokio).
-#[inline]
-pub fn offload_profile() -> OffloadProfile {
-    match OFFLOAD_PROFILE.load(Ordering::Acquire) {
-        1 => OffloadProfile::Smol,
-        _ => OffloadProfile::Tokio,
-    }
 }
 
 /// Optional env overrides. Non-profile keys cache via OnceLock.
@@ -337,7 +324,7 @@ fn env_usize(name: &'static str, default: usize) -> usize {
     }
 }
 
-/// Env override if present; otherwise `default` (may depend on [`offload_profile`]).
+/// Env override if present; otherwise `default` (may depend on profile).
 fn env_or_profile(name: &str, default: usize) -> usize {
     static HEAVY_PKTS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     static HEAVY_BYTES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -361,7 +348,7 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
 
 /// Decide whether a batch encrypt should be offloaded to `cpu_block`.
 ///
-/// Heavy-8 defaults depend on [`offload_profile`]:
+/// Heavy-8 defaults depend on `profile`:
 /// - **Tokio**: 1 pkt / 512 B (protect multi-worker async from CFB-8)
 /// - **Smol**: 4 pkts / 2 KiB (avoid r_off≈1 on every tiny flush; measured +19.6%
 ///   on smol xtea no-comp; same raise hurts tokio)
@@ -374,6 +361,7 @@ pub fn should_cpu_block_encrypt(
     packet_count: usize,
     total_bytes: usize,
     crypt: &CryptEngine,
+    profile: OffloadProfile,
 ) -> bool {
     // Null cipher: the "encrypt" is `out.extend(packets)` — just moving Bytes
     // references (pointer copies). cpu_block dispatch costs more.
@@ -392,7 +380,7 @@ pub fn should_cpu_block_encrypt(
 
     // Heavy 8-byte CFB ciphers (cast5, 3des, blowfish, tea, xtea).
     if matches!(cname, "cast5" | "3des" | "blowfish" | "tea" | "xtea") {
-        let (def_pkts, def_bytes) = match offload_profile() {
+        let (def_pkts, def_bytes) = match profile {
             OffloadProfile::Tokio => (1, 512),
             OffloadProfile::Smol => (4, 2048),
         };
@@ -412,13 +400,18 @@ pub fn should_cpu_block_encrypt(
 /// - AEAD: ≥4 KiB
 /// - CFB: tokio ≥512 B; smol ≥1 KiB (slightly less eager, mirrors encrypt)
 #[inline]
-pub fn should_cpu_block_decrypt(has_encryption: bool, has_aead: bool, data_len: usize) -> bool {
+pub fn should_cpu_block_decrypt(
+    has_encryption: bool,
+    has_aead: bool,
+    data_len: usize,
+    profile: OffloadProfile,
+) -> bool {
     if !has_encryption && !has_aead {
         false
     } else if has_aead {
         data_len >= 4096
     } else {
-        let thr = match offload_profile() {
+        let thr = match profile {
             OffloadProfile::Tokio => 512,
             OffloadProfile::Smol => 1024,
         };
@@ -642,7 +635,8 @@ mod tests {
 
     #[test]
     fn should_cpu_block_thresholds() {
-        set_offload_profile(OffloadProfile::Tokio);
+        let tokio = OffloadProfile::Tokio;
+        let smol = OffloadProfile::Smol;
         let (none_crypt, _) = CryptEngine::select("none", b"");
         // Null cipher: never offload — "encrypt" is just pointer moves.
         assert!(!should_cpu_block_encrypt(
@@ -650,71 +644,83 @@ mod tests {
             false,
             7,
             100_000,
-            &none_crypt
+            &none_crypt,
+            tokio
         ));
         assert!(!should_cpu_block_encrypt(
             false,
             false,
             999,
             999_999,
-            &none_crypt
+            &none_crypt,
+            tokio
         ));
         // Heavy 8-byte CFB under Tokio: early offload.
         let (cast5_crypt, _) = CryptEngine::select("cast5", b"test-key-12345678");
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 1, &cast5_crypt),
+            should_cpu_block_encrypt(true, false, 1, 1, &cast5_crypt, tokio),
             "tokio cast5 1 pkt should offload"
         );
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 100, &cast5_crypt),
+            should_cpu_block_encrypt(true, false, 1, 100, &cast5_crypt, tokio),
             "tokio cast5 small pkt should offload"
         );
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 511, &cast5_crypt),
+            should_cpu_block_encrypt(true, false, 1, 511, &cast5_crypt, tokio),
             "tokio cast5 511B should offload"
         );
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 512, &cast5_crypt),
+            should_cpu_block_encrypt(true, false, 1, 512, &cast5_crypt, tokio),
             "tokio cast5 512B should offload"
         );
         assert!(
-            should_cpu_block_encrypt(true, false, 0, 1000, &cast5_crypt),
+            should_cpu_block_encrypt(true, false, 0, 1000, &cast5_crypt, tokio),
             "tokio cast5 1KiB should offload by bytes"
         );
 
         let (tdes_crypt, _) = CryptEngine::select("3des", b"123456781234567812345678");
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 100, &tdes_crypt),
+            should_cpu_block_encrypt(true, false, 1, 100, &tdes_crypt, tokio),
             "3des small should offload (tokio)"
         );
 
         let (bf_crypt, _) = CryptEngine::select("blowfish", b"test-key");
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 100, &bf_crypt),
+            should_cpu_block_encrypt(true, false, 1, 100, &bf_crypt, tokio),
             "blowfish small should offload (tokio)"
         );
 
         let (tea_crypt, _) = CryptEngine::select("tea", b"test-key");
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 100, &tea_crypt),
+            should_cpu_block_encrypt(true, false, 1, 100, &tea_crypt, tokio),
             "tea small should offload (tokio)"
         );
 
         let (xtea_crypt, _) = CryptEngine::select("xtea", b"test-key");
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 100, &xtea_crypt),
+            should_cpu_block_encrypt(true, false, 1, 100, &xtea_crypt, tokio),
             "xtea small should offload (tokio)"
         );
 
         // Non-heavy CFB (AES, SM4, Twofish) keeps the original 4/4KiB threshold.
         let (aes_crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
-        assert!(!should_cpu_block_encrypt(true, false, 3, 100, &aes_crypt));
-        assert!(should_cpu_block_encrypt(true, false, 4, 100, &aes_crypt));
-        assert!(should_cpu_block_encrypt(true, false, 1, 4096, &aes_crypt));
+        assert!(!should_cpu_block_encrypt(
+            true, false, 3, 100, &aes_crypt, tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            true, false, 4, 100, &aes_crypt, tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            true, false, 1, 4096, &aes_crypt, tokio
+        ));
 
         let (sm4_crypt, _) = CryptEngine::select("sm4", b"test-key-12345678");
-        assert!(!should_cpu_block_encrypt(true, false, 3, 100, &sm4_crypt));
-        assert!(should_cpu_block_encrypt(true, false, 4, 100, &sm4_crypt));
+        assert!(!should_cpu_block_encrypt(
+            true, false, 3, 100, &sm4_crypt, tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            true, false, 4, 100, &sm4_crypt, tokio
+        ));
 
         let (twofish_crypt, _) = CryptEngine::select("twofish", b"test-key-12345678");
         assert!(!should_cpu_block_encrypt(
@@ -722,20 +728,50 @@ mod tests {
             false,
             3,
             100,
-            &twofish_crypt
+            &twofish_crypt,
+            tokio
         ));
         assert!(should_cpu_block_encrypt(
             true,
             false,
             4,
             100,
-            &twofish_crypt
+            &twofish_crypt,
+            tokio
         ));
         // AEAD: offload only large batches (≥8 pkts or ≥8 KiB).
-        assert!(!should_cpu_block_encrypt(false, true, 4, 0, &none_crypt));
-        assert!(!should_cpu_block_encrypt(false, true, 7, 8191, &none_crypt));
-        assert!(should_cpu_block_encrypt(false, true, 8, 0, &none_crypt));
-        assert!(should_cpu_block_encrypt(false, true, 1, 8192, &none_crypt));
+        assert!(!should_cpu_block_encrypt(
+            false,
+            true,
+            4,
+            0,
+            &none_crypt,
+            tokio
+        ));
+        assert!(!should_cpu_block_encrypt(
+            false,
+            true,
+            7,
+            8191,
+            &none_crypt,
+            tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            false,
+            true,
+            8,
+            0,
+            &none_crypt,
+            tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            false,
+            true,
+            1,
+            8192,
+            &none_crypt,
+            tokio
+        ));
         let (aead_crypt, _) = CryptEngine::select("aes-128-gcm", b"0123456789abcdef");
         assert!(aead_crypt.is_aead());
         assert!(should_cpu_block_encrypt(
@@ -743,49 +779,67 @@ mod tests {
             true,
             999,
             999_999,
-            &aead_crypt
+            &aead_crypt,
+            tokio
         ));
         // Fast ciphers: xor/salsa20 offload large batches only.
         let (xor_crypt, _) = CryptEngine::select("xor", b"test-key");
-        assert!(!should_cpu_block_encrypt(true, false, 7, 8191, &xor_crypt));
-        assert!(should_cpu_block_encrypt(true, false, 8, 100, &xor_crypt));
-        assert!(should_cpu_block_encrypt(true, false, 1, 8192, &xor_crypt));
+        assert!(!should_cpu_block_encrypt(
+            true, false, 7, 8191, &xor_crypt, tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            true, false, 8, 100, &xor_crypt, tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            true, false, 1, 8192, &xor_crypt, tokio
+        ));
         let (salsa_crypt, _) = CryptEngine::select("salsa20", b"test-key");
-        assert!(!should_cpu_block_encrypt(true, false, 7, 100, &salsa_crypt));
-        assert!(should_cpu_block_encrypt(true, false, 8, 100, &salsa_crypt));
+        assert!(!should_cpu_block_encrypt(
+            true,
+            false,
+            7,
+            100,
+            &salsa_crypt,
+            tokio
+        ));
+        assert!(should_cpu_block_encrypt(
+            true,
+            false,
+            8,
+            100,
+            &salsa_crypt,
+            tokio
+        ));
         // snappy compress threshold: ≥16 KiB
         assert!(!should_cpu_block_compress(16383));
         assert!(should_cpu_block_compress(16384));
         // inbound decrypt (tokio): null never; AEAD at 4KiB; CFB at 512B
-        assert!(!should_cpu_block_decrypt(false, false, 65535));
-        assert!(!should_cpu_block_decrypt(false, true, 4095));
-        assert!(should_cpu_block_decrypt(false, true, 4096));
-        assert!(!should_cpu_block_decrypt(true, false, 511));
-        assert!(should_cpu_block_decrypt(true, false, 512));
+        assert!(!should_cpu_block_decrypt(false, false, 65535, tokio));
+        assert!(!should_cpu_block_decrypt(false, true, 4095, tokio));
+        assert!(should_cpu_block_decrypt(false, true, 4096, tokio));
+        assert!(!should_cpu_block_decrypt(true, false, 511, tokio));
+        assert!(should_cpu_block_decrypt(true, false, 512, tokio));
 
-        // Smol heavy-8 less eager (same test body: avoid parallel test races on
-        // process-global OFFLOAD_PROFILE).
-        set_offload_profile(OffloadProfile::Smol);
+        // Smol heavy-8 less eager.
         assert!(
-            !should_cpu_block_encrypt(true, false, 1, 100, &xtea_crypt),
+            !should_cpu_block_encrypt(true, false, 1, 100, &xtea_crypt, smol),
             "smol: 1 small pkt stays inline"
         );
         assert!(
-            !should_cpu_block_encrypt(true, false, 3, 1500, &xtea_crypt),
+            !should_cpu_block_encrypt(true, false, 3, 1500, &xtea_crypt, smol),
             "smol: 3 pkts under 2KiB may stay inline"
         );
         assert!(
-            should_cpu_block_encrypt(true, false, 4, 100, &xtea_crypt),
+            should_cpu_block_encrypt(true, false, 4, 100, &xtea_crypt, smol),
             "smol: 4 pkts offload"
         );
         assert!(
-            should_cpu_block_encrypt(true, false, 1, 2048, &xtea_crypt),
+            should_cpu_block_encrypt(true, false, 1, 2048, &xtea_crypt, smol),
             "smol: 2KiB offload by bytes"
         );
-        assert!(!should_cpu_block_decrypt(true, false, 512));
-        assert!(!should_cpu_block_decrypt(true, false, 1023));
-        assert!(should_cpu_block_decrypt(true, false, 1024));
-        set_offload_profile(OffloadProfile::Tokio);
+        assert!(!should_cpu_block_decrypt(true, false, 512, smol));
+        assert!(!should_cpu_block_decrypt(true, false, 1023, smol));
+        assert!(should_cpu_block_decrypt(true, false, 1024, smol));
     }
 
     #[test]
@@ -871,7 +925,7 @@ mod tests {
             let mut serial_cb = CryptoBuf::new(0xBEEF);
             let plain = b"parallel-crc-wire-check-payload!!";
             let mut prepared = prep_cb.prepare_encrypt(plain);
-            assert_eq!(&prepared[NONCE_SZ..CRYPT_HDR], &[0, 0, 0, 0]);
+            assert_eq!(&prepared[NONCE_SIZE..CRYPTO_HEADER_SIZE], &[0, 0, 0, 0]);
             CryptoBuf::finalize_encrypt_packet(&mut prepared, &crypt);
             let serial = serial_cb.encrypt_cfb(plain, &crypt);
             assert_eq!(
@@ -893,7 +947,7 @@ mod tests {
         let s = cb.encrypt_packet(plain, &salsa);
         assert_eq!(
             s.len(),
-            CRYPT_HDR + plain.len(),
+            CRYPTO_HEADER_SIZE + plain.len(),
             "salsa must use CFB header"
         );
         // Roundtrip via decrypt_cfb
@@ -903,10 +957,18 @@ mod tests {
         assert_eq!(&dec.unwrap()[..], plain);
 
         let x = cb.encrypt_packet(plain, &xor);
-        assert_eq!(x.len(), CRYPT_HDR + plain.len(), "xor must use CFB header");
+        assert_eq!(
+            x.len(),
+            CRYPTO_HEADER_SIZE + plain.len(),
+            "xor must use CFB header"
+        );
 
         let a = cb.encrypt_packet(plain, &aes);
-        assert_eq!(a.len(), CRYPT_HDR + plain.len(), "aes must use CFB header");
+        assert_eq!(
+            a.len(),
+            CRYPTO_HEADER_SIZE + plain.len(),
+            "aes must use CFB header"
+        );
     }
 
     #[test]
@@ -919,10 +981,10 @@ mod tests {
         let encrypted = encrypt_batch(packets.clone(), &crypt, &cb, true, false);
         assert_eq!(encrypted.len(), 4);
 
-        // Each encrypted packet should have CRYPT_HDR bytes of header (standard CFB)
+        // Each encrypted packet should have CRYPTO_HEADER_SIZE bytes of header (standard CFB)
         for (i, pkt) in encrypted.iter().enumerate() {
             assert!(
-                pkt.len() >= CRYPT_HDR,
+                pkt.len() >= CRYPTO_HEADER_SIZE,
                 "packet {} too short ({} bytes)",
                 i,
                 pkt.len()
@@ -972,7 +1034,7 @@ mod tests {
         let (crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
         let mut cb = CryptoBuf::new(0);
 
-        let mut short = [0u8; 10]; // < CRYPT_HDR (20)
+        let mut short = [0u8; 10]; // < CRYPTO_HEADER_SIZE (20)
         let result = cb.decrypt_cfb(&mut short, &crypt);
         assert!(result.is_none());
     }
@@ -986,7 +1048,7 @@ mod tests {
         for i in 0..100 {
             let data = vec![i as u8; 100 + i * 10];
             let encrypted = cb.encrypt_cfb(&data, &crypt);
-            assert_eq!(encrypted.len(), CRYPT_HDR + data.len());
+            assert_eq!(encrypted.len(), CRYPTO_HEADER_SIZE + data.len());
 
             // Verify roundtrip
             let mut enc_copy = encrypted.to_vec();
@@ -1004,7 +1066,7 @@ mod tests {
         let plaintext = b"test none cipher";
         let encrypted = cb.encrypt_cfb(plaintext, &crypt);
         // With none cipher, nonce and CRC are still written, data is not encrypted
-        assert_eq!(&encrypted[CRYPT_HDR..], plaintext);
+        assert_eq!(&encrypted[CRYPTO_HEADER_SIZE..], plaintext);
     }
 
     #[test]
@@ -1017,7 +1079,7 @@ mod tests {
         let body = decrypt_cfb_in_place(&mut buf, &crypt, false).unwrap();
         assert_eq!(body, plaintext);
         // body is a subslice of buf (after header)
-        assert_eq!(body.as_ptr(), buf[CRYPT_HDR..].as_ptr());
+        assert_eq!(body.as_ptr(), buf[CRYPTO_HEADER_SIZE..].as_ptr());
     }
 
     #[test]

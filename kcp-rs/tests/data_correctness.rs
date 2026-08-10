@@ -140,21 +140,13 @@ fn run_transfer(payload: &[u8], a2b: Impairment, b2a: Impairment) -> Vec<u8> {
     let chan_b2a = Arc::new(Mutex::new(FlakyChannel::new(b2a)));
 
     let a2b_out = chan_a2b.clone();
-    let mut a = KCP::new(
-        CONV,
-        0,
-        Box::new(move |data: Bytes| {
-            a2b_out.lock().unwrap().push(&data);
-        }),
-    );
+    let mut a = KCP::new(CONV, 0, move |data: Bytes| {
+        a2b_out.lock().unwrap().push(&data);
+    });
     let b2a_out = chan_b2a.clone();
-    let mut b = KCP::new(
-        CONV,
-        0,
-        Box::new(move |data: Bytes| {
-            b2a_out.lock().unwrap().push(&data);
-        }),
-    );
+    let mut b = KCP::new(CONV, 0, move |data: Bytes| {
+        b2a_out.lock().unwrap().push(&data);
+    });
 
     a.apply(&KcpConfig::default());
     b.apply(&KcpConfig::default());

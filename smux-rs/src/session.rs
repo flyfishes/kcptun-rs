@@ -81,41 +81,26 @@ impl Config {
 }
 
 /// Errors from the SMUX session.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// I/O error from the underlying transport.
-    Io(io::Error),
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
     /// Invalid configuration.
+    #[error("invalid config: {0}")]
     InvalidConfig(String),
     /// Session is closed.
+    #[error("session closed")]
     SessionClosed,
     /// Maximum number of streams reached.
+    #[error("too many streams")]
     TooManyStreams,
     /// Stream not found.
+    #[error("stream {0} not found")]
     StreamNotFound(u32),
     /// Invalid frame received.
+    #[error("invalid frame: {0}")]
     InvalidFrame(String),
-}
-
-impl std::fmt::Display for SessionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SessionError::Io(e) => write!(f, "io error: {}", e),
-            SessionError::InvalidConfig(msg) => write!(f, "invalid config: {}", msg),
-            SessionError::SessionClosed => write!(f, "session closed"),
-            SessionError::TooManyStreams => write!(f, "too many streams"),
-            SessionError::StreamNotFound(id) => write!(f, "stream {} not found", id),
-            SessionError::InvalidFrame(msg) => write!(f, "invalid frame: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
-
-impl From<io::Error> for SessionError {
-    fn from(e: io::Error) -> Self {
-        SessionError::Io(e)
-    }
 }
 
 /// A pending UPD frame to be sent to the peer.
@@ -455,6 +440,7 @@ impl Session {
     /// Close the session and all streams.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        self.accept_notify.notify_waiters();
         let mut streams = self.streams.lock();
         for (_, stream) in streams.drain() {
             stream.close();
@@ -581,6 +567,21 @@ impl Session {
     /// available for advanced integration; this method is the recommended
     /// single entry point for normal high-performance flush loops.
     pub fn prepare_outbound_into(&self, buf: &mut BytesMut, max_bytes: usize, ver: u8) -> Vec<u32> {
+        self.prepare_outbound_into_controlled(buf, max_bytes, ver, true)
+    }
+
+    /// Prepare outbound frames, optionally deferring FIN emission.
+    ///
+    /// KCP-backed servers set `allow_fin=false` while previously drained KCP
+    /// data is still unacknowledged, preventing FIN from overtaking echo tail
+    /// data at Go clients.
+    pub fn prepare_outbound_into_controlled(
+        &self,
+        buf: &mut BytesMut,
+        max_bytes: usize,
+        ver: u8,
+        allow_fin: bool,
+    ) -> Vec<u32> {
         let mut fin_streams = Vec::new();
         let mut drained_total = 0usize;
 
@@ -593,6 +594,17 @@ impl Session {
                     Frame::encode_header_into(buf, ver, Cmd::Syn, id, 0);
                 }
             }
+        }
+
+        // Emit flow-control updates before stream payload. A KCP-backed
+        // writer may block while queueing a large payload; putting UPD first
+        // prevents a circular stall where the peer cannot send more request
+        // data until this update is delivered.
+        self.check_upd();
+        for upd in self.take_upd_frames() {
+            Frame::encode_header_into(buf, ver, Cmd::Upd, upd.stream_id, 8);
+            buf.extend_from_slice(&upd.consumed.to_le_bytes());
+            buf.extend_from_slice(&upd.window.to_le_bytes());
         }
 
         {
@@ -619,21 +631,15 @@ impl Session {
 
             // Collect FIN candidates (local closed, no pending send, FIN not yet sent).
             // Encode FIN headers now; mark_fin_sent only after transport accepts the bytes.
-            for (&id, s) in streams.iter() {
-                if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
-                    debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
-                    Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
-                    fin_streams.push(id);
+            if allow_fin {
+                for (&id, s) in streams.iter() {
+                    if s.is_local_closed() && s.pending_send() == 0 && !s.is_fin_sent() {
+                        debug!("SMUX: prepare_outbound encoding FIN for stream {}", id);
+                        Frame::encode_header_into(buf, ver, Cmd::Fin, id, 0);
+                        fin_streams.push(id);
+                    }
                 }
             }
-        }
-
-        // Window updates (UPD). This scans streams and enqueues, then drains the channel.
-        self.check_upd();
-        for upd in self.take_upd_frames() {
-            Frame::encode_header_into(buf, ver, Cmd::Upd, upd.stream_id, 8);
-            buf.extend_from_slice(&upd.consumed.to_le_bytes());
-            buf.extend_from_slice(&upd.window.to_le_bytes());
         }
 
         fin_streams

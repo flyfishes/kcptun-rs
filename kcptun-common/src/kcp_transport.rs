@@ -1,4 +1,4 @@
-//! Encrypted KCP session helpers (`CryptoTransport` + `kcp_session`).
+//! Encrypted packet transport and `KcpConn` construction helpers.
 //!
 //! Protocol stack (matches Go kcp-go v5 / kcptun):
 //!
@@ -13,10 +13,8 @@
 //!
 //! Feature-gated on `tokio` / `smol` (needs kio + kcp-rs async).
 
-use std::future::Future;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -26,7 +24,7 @@ use kcp_rs::{KcpConfig, KcpConn, PacketTransport};
 use kcrypt_rs::crypt::CryptEngine;
 use kcrypt_rs::wire::{
     decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, inbound_null,
-    should_cpu_block_encrypt, CryptoBuf,
+    should_cpu_block_encrypt, CryptoBuf, OffloadProfile,
 };
 
 /// Default conversation ID used as CryptoBuf session_id seed (matches client).
@@ -45,12 +43,14 @@ const ACK_SESSION_XOR: u64 = 0xA11C_B0FF_u64;
 /// Data path uses `data_crypto_buf`; ACK / urgent path uses `ack_crypto_buf`
 /// (matches client `ack_crypto_buf` intent — avoid lock contention with flush).
 pub struct CryptoTransport {
-    inner: Arc<kio::DatagramSocket>,
+    inner: Arc<dyn PacketTransport>,
     crypt: Arc<CryptEngine>,
     /// `crypt != "null"` — `"none"` still packs a CFB header.
     has_encryption: bool,
     data_crypto_buf: Arc<Mutex<CryptoBuf>>,
     ack_crypto_buf: Arc<Mutex<CryptoBuf>>,
+    /// Runtime-shaped CPU offload profile (per-session, not global).
+    offload_profile: OffloadProfile,
 }
 
 impl CryptoTransport {
@@ -58,13 +58,18 @@ impl CryptoTransport {
     ///
     /// `method` is the Go-compatible name (`"aes"`, `"null"`, `"aes-128-gcm"`, …).
     pub fn new(inner: Arc<kio::DatagramSocket>, key: &[u8], method: &str) -> Self {
+        Self::with_transport(inner, key, method)
+    }
+
+    /// Wrap any packet transport, including a listener's per-peer queue.
+    pub fn with_transport(inner: Arc<dyn PacketTransport>, key: &[u8], method: &str) -> Self {
         let (engine, _) = CryptEngine::select(method, key);
         Self::from_engine(inner, Arc::new(engine), method != "null")
     }
 
     /// Wrap with a pre-built [`CryptEngine`].
     pub fn from_engine(
-        inner: Arc<kio::DatagramSocket>,
+        inner: Arc<dyn PacketTransport>,
         crypt: Arc<CryptEngine>,
         has_encryption: bool,
     ) -> Self {
@@ -76,11 +81,17 @@ impl CryptoTransport {
             ack_crypto_buf: Arc::new(Mutex::new(CryptoBuf::new(
                 (DEFAULT_CONV as u64) ^ ACK_SESSION_XOR,
             ))),
+            offload_profile: OffloadProfile::Tokio,
         }
     }
 
+    /// Set the runtime offload profile (defaults to Tokio).
+    pub fn set_offload_profile(&mut self, profile: OffloadProfile) {
+        self.offload_profile = profile;
+    }
+
     /// Access the underlying socket (diagnostics / local_addr).
-    pub fn inner(&self) -> &Arc<kio::DatagramSocket> {
+    pub fn inner(&self) -> &Arc<dyn PacketTransport> {
         &self.inner
     }
 
@@ -126,6 +137,7 @@ impl CryptoTransport {
                 packets.len(),
                 total_bytes,
                 self.crypt.as_ref(),
+                self.offload_profile,
             );
         let allow_parallel = !use_cpu_block;
         if use_cpu_block {
@@ -204,41 +216,37 @@ impl CryptoTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl PacketTransport for CryptoTransport {
-    fn recv<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
-        Box::pin(async move {
-            // Skip bad packets until one decrypts or the socket errors.
-            loop {
-                let n = kio::DatagramSocket::recv(self.inner.as_ref(), buf).await?;
-                let plain = self.decrypt_in_place(buf, n)?;
-                if plain > 0 || n == 0 {
-                    return Ok(plain);
-                }
-                // CRC/AEAD fail → try next datagram (non-blocking drain first).
-                match kio::DatagramSocket::try_recv(self.inner.as_ref(), buf) {
-                    Ok(m) => {
-                        let plain = self.decrypt_in_place(buf, m)?;
-                        if plain > 0 || m == 0 {
-                            return Ok(plain);
-                        }
-                        continue;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Fall through to another blocking recv.
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // Skip bad packets until one decrypts or the socket errors.
+        loop {
+            let n = self.inner.recv(buf).await?;
+            let plain = self.decrypt_in_place(buf, n)?;
+            if plain > 0 || n == 0 {
+                return Ok(plain);
             }
-        })
+            // CRC/AEAD fail → try next datagram (non-blocking drain first).
+            match self.inner.try_recv(buf) {
+                Ok(m) => {
+                    let plain = self.decrypt_in_place(buf, m)?;
+                    if plain > 0 || m == 0 {
+                        return Ok(plain);
+                    }
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Fall through to another blocking recv.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let n = kio::DatagramSocket::try_recv(self.inner.as_ref(), buf)?;
+            let n = self.inner.try_recv(buf)?;
             let plain = self.decrypt_in_place(buf, n)?;
             if plain > 0 || n == 0 {
                 return Ok(plain);
@@ -247,122 +255,149 @@ impl PacketTransport for CryptoTransport {
         }
     }
 
-    fn send_batch<'a>(
-        &'a self,
-        packets: &'a [Bytes],
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            if packets.is_empty() {
-                return Ok(());
+    async fn recv_vec(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        loop {
+            let n = self.inner.recv_vec(buf).await?;
+            let plain = self.decrypt_in_place(buf, n)?;
+            buf.truncate(plain);
+            if plain > 0 || n == 0 {
+                return Ok(plain);
             }
-            let encrypted = self.encrypt_data(packets.to_vec()).await;
-            kio::DatagramSocket::send_batch(self.inner.as_ref(), &encrypted).await
-        })
+        }
     }
 
-    fn send_batch_to<'a>(
-        &'a self,
-        packets: &'a [Bytes],
-        target: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            if packets.is_empty() {
-                return Ok(());
+    fn try_recv_vec(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        loop {
+            let n = self.inner.try_recv_vec(buf)?;
+            let plain = self.decrypt_in_place(buf, n)?;
+            buf.truncate(plain);
+            if plain > 0 || n == 0 {
+                return Ok(plain);
             }
-            let encrypted = self.encrypt_data(packets.to_vec()).await;
-            kio::DatagramSocket::send_batch_to(self.inner.as_ref(), &encrypted, target).await
-        })
+        }
     }
 
-    fn send_urgent<'a>(
-        &'a self,
-        packets: &'a [Bytes],
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            if packets.is_empty() {
-                return Ok(());
+    fn try_recv_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
+        let n = self.inner.try_recv_batch(pool)?;
+        // Decrypt each slot in place and **stably compact** bad packets (CRC /
+        // AEAD failures) out, preserving the relative order of good packets.
+        // Bad slots keep their capacity: the swap below recycles them instead
+        // of dropping the allocation, so the buffer pool does not churn.
+        let mut write = 0;
+        for read in 0..n {
+            let len = pool[read].len();
+            let plain = self.decrypt_in_place(&mut pool[read], len)?;
+            pool[read].truncate(plain);
+            if plain > 0 {
+                pool.swap(write, read);
+                write += 1;
             }
-            let encrypted = self.encrypt_urgent(packets.to_vec()).await;
-            kio::DatagramSocket::send_batch(self.inner.as_ref(), &encrypted).await
-        })
+        }
+        Ok(write)
     }
 
-    fn send_urgent_to<'a>(
-        &'a self,
-        packets: &'a [Bytes],
-        target: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            if packets.is_empty() {
-                return Ok(());
-            }
-            let encrypted = self.encrypt_urgent(packets.to_vec()).await;
-            kio::DatagramSocket::send_batch_to(self.inner.as_ref(), &encrypted, target).await
-        })
+    fn supports_recv_batch(&self) -> bool {
+        self.inner.supports_recv_batch()
+    }
+
+    async fn send_batch(&self, packets: &[Bytes]) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let encrypted = self.encrypt_data(packets.to_vec()).await;
+        self.inner.send_batch(&encrypted).await
+    }
+
+    async fn send_batch_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let encrypted = self.encrypt_data(packets.to_vec()).await;
+        self.inner.send_batch_to(&encrypted, target).await
+    }
+
+    async fn send_urgent(&self, packets: &[Bytes]) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let encrypted = self.encrypt_urgent(packets.to_vec()).await;
+        self.inner.send_urgent(&encrypted).await
+    }
+
+    async fn send_urgent_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let encrypted = self.encrypt_urgent(packets.to_vec()).await;
+        self.inner.send_urgent_to(&encrypted, target).await
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        kio::DatagramSocket::local_addr(self.inner.as_ref())
+        self.inner.local_addr()
     }
 }
 
-// ─── kcp_session factory ──────────────────────────────────────────────────────
-
-/// Dial `addr` over UDP with encryption + optional FEC, returning a [`KcpConn`].
-///
-/// ```no_run
-/// use kcptun_common::{derive_key, kcp_session};
-/// use kcp_rs::KcpConfig;
-/// # fn main() {
-/// # let _fut = async {
-/// let key = derive_key("secret");
-/// let conn = kcp_session("127.0.0.1:29900", &key, "aes", KcpConfig::default()).await?;
-/// # Ok::<_, std::io::Error>(conn)
-/// # };
-/// # }
-/// ```
-///
-/// Stack built: `UDP → CryptoTransport → KcpConn(.fec)` — crypto wraps whole
-/// FEC frames (offset 0), matching Go session layout.
-pub async fn kcp_session(
-    addr: impl ToSocketAddrs,
-    key: &[u8],
-    crypt: &str,
-    config: KcpConfig,
-) -> io::Result<KcpConn> {
-    let remote = resolve_one(addr)?;
-    let bind = if remote.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0u16; 8], 0))
-    };
-    let udp = kio::UdpSocket::connect(bind, remote)?;
-    let inner = Arc::new(kio::DatagramSocket::Udp(udp));
-    let ct = CryptoTransport::new(inner, key, crypt);
-    let transport: Arc<dyn PacketTransport> = Arc::new(ct);
-
-    let mut builder = KcpConn::with_transport(transport, remote)
-        .connected(true)
-        .config(config.clone());
-    if config.datashard > 0 && config.parityshard > 0 {
-        builder = builder.fec(config.datashard, config.parityshard);
-    }
-    builder.build().await
-}
-
-/// Like [`kcp_session`] but wraps an existing connected [`kio::DatagramSocket`].
-pub async fn kcp_session_with_socket(
+/// Build the encrypted KCP layer over an existing datagram socket.
+pub(crate) async fn kcp_conn_with_socket(
     socket: Arc<kio::DatagramSocket>,
     remote: SocketAddr,
     key: &[u8],
     crypt: &str,
     config: KcpConfig,
     connected: bool,
+    offload_profile: OffloadProfile,
 ) -> io::Result<KcpConn> {
-    let ct = CryptoTransport::new(socket, key, crypt);
+    kcp_conn_with_socket_options(
+        socket,
+        remote,
+        key,
+        crypt,
+        config,
+        connected,
+        false,
+        offload_profile,
+    )
+    .await
+}
+
+pub(crate) async fn server_kcp_conn_with_socket(
+    socket: Arc<kio::DatagramSocket>,
+    peer: SocketAddr,
+    key: &[u8],
+    crypt: &str,
+    config: KcpConfig,
+    offload_profile: OffloadProfile,
+) -> io::Result<KcpConn> {
+    kcp_conn_with_socket_options(
+        socket,
+        peer,
+        key,
+        crypt,
+        config,
+        true,
+        true,
+        offload_profile,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn kcp_conn_with_socket_options(
+    socket: Arc<kio::DatagramSocket>,
+    remote: SocketAddr,
+    key: &[u8],
+    crypt: &str,
+    config: KcpConfig,
+    connected: bool,
+    adopt_conv: bool,
+    offload_profile: OffloadProfile,
+) -> io::Result<KcpConn> {
+    let mut ct = CryptoTransport::new(socket, key, crypt);
+    ct.set_offload_profile(offload_profile);
     let transport: Arc<dyn PacketTransport> = Arc::new(ct);
     let mut builder = KcpConn::with_transport(transport, remote)
         .connected(connected)
+        .adopt_conv(adopt_conv)
         .config(config.clone());
     if config.datashard > 0 && config.parityshard > 0 {
         builder = builder.fec(config.datashard, config.parityshard);
@@ -370,41 +405,8 @@ pub async fn kcp_session_with_socket(
     builder.build().await
 }
 
-// ─── Client / server-shaped helpers (Task 4 incremental) ──────────────────────
-//
-// Production binaries still own the custom KCP+SMUX+Snappy flush loops.
-// These helpers build a bare [`KcpConn`] (crypto+FEC+KCP only) for tests and
-// for a future cut-over that keeps Snappy/SMUX outside KcpConn:
-//
-//   SMUX prepare_outbound → Snappy → KcpConn.write
-//   KcpConn.read → Snappy decode → SMUX process_data
-//
-// Server multi-peer demux (DashMap by peer + KcpListener accept) is NOT
-// covered here — see `accept_kcp_peer` docs.
-
-/// Client-shaped dial: existing socket + remote + key/crypt + CLI KCP params.
-///
-/// Returns a ready [`KcpConn`] (AsyncRead/Write). Callers that still run the
-/// legacy binary flush loop should **not** use this on the production path yet.
-///
-/// ```no_run
-/// use kcptun_common::{derive_key, dial_kcp_session, KcpCliParams};
-/// # use std::net::SocketAddr;
-/// # use std::sync::Arc;
-/// # fn main() {
-/// # let _fut = async {
-/// # let socket: Arc<kio::DatagramSocket> = Arc::new(kio::DatagramSocket::Udp(
-/// #     kio::UdpSocket::connect("0.0.0.0:0".parse().unwrap(), "127.0.0.1:29900".parse().unwrap()).unwrap(),
-/// # ));
-/// # let remote: SocketAddr = "127.0.0.1:29900".parse().unwrap();
-/// let key = derive_key("secret");
-/// let params = KcpCliParams { mode: "fast3".into(), ..Default::default() };
-/// let conn = dial_kcp_session(socket, remote, &key, "aes", &params).await?;
-/// # Ok::<_, std::io::Error>(conn)
-/// # };
-/// # }
-/// ```
-pub async fn dial_kcp_session(
+#[cfg(test)]
+async fn test_kcp_conn(
     socket: Arc<kio::DatagramSocket>,
     remote: SocketAddr,
     key: &[u8],
@@ -413,35 +415,16 @@ pub async fn dial_kcp_session(
 ) -> io::Result<KcpConn> {
     let config = params.to_kcp_config();
     // Client sockets are typically `connect()`ed to the remote.
-    kcp_session_with_socket(socket, remote, key, crypt, config, true).await
-}
-
-/// Server single-peer helper: build a [`KcpConn`] for one known peer.
-///
-/// Intended for tests and for a future per-peer spawn after the listen socket
-/// demuxes the first datagram. **Does not** implement multi-peer accept —
-/// `KcpListener` remains a stub and the production server still uses its
-/// DashMap-by-peer loop.
-///
-/// `connected`:
-/// - `true`  — socket already `connect()`ed to `peer` (per-peer UDP socket).
-/// - `false` — shared unconnected listen socket; KcpConn uses send_to(peer).
-pub async fn accept_kcp_peer(
-    socket: Arc<kio::DatagramSocket>,
-    peer: SocketAddr,
-    key: &[u8],
-    crypt: &str,
-    params: &crate::KcpCliParams,
-    connected: bool,
-) -> io::Result<KcpConn> {
-    let config = params.to_kcp_config();
-    kcp_session_with_socket(socket, peer, key, crypt, config, connected).await
-}
-
-fn resolve_one(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
-    addr.to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address"))
+    kcp_conn_with_socket(
+        socket,
+        remote,
+        key,
+        crypt,
+        config,
+        true,
+        OffloadProfile::Tokio,
+    )
+    .await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -531,11 +514,11 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kcp_session_null_localhost_roundtrip() {
+    async fn kcp_conn_null_localhost_roundtrip() {
         use kio::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
-        // Bind two ports, connect both sides via kcp_session_with_socket.
+        // Bind two ports, connect both sides via kcp_conn_with_socket.
         let a_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let b_tmp = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let addr_a = a_tmp.local_addr().unwrap();
@@ -556,12 +539,28 @@ mod tests {
             ..KcpConfig::default()
         };
 
-        let mut conn_a = kcp_session_with_socket(sock_a, addr_b, key, "null", cfg.clone(), true)
-            .await
-            .unwrap();
-        let mut conn_b = kcp_session_with_socket(sock_b, addr_a, key, "null", cfg, true)
-            .await
-            .unwrap();
+        let mut conn_a = kcp_conn_with_socket(
+            sock_a,
+            addr_b,
+            key,
+            "null",
+            cfg.clone(),
+            true,
+            OffloadProfile::Tokio,
+        )
+        .await
+        .unwrap();
+        let mut conn_b = kcp_conn_with_socket(
+            sock_b,
+            addr_a,
+            key,
+            "null",
+            cfg,
+            true,
+            OffloadProfile::Tokio,
+        )
+        .await
+        .unwrap();
 
         let payload = b"session-null-roundtrip-payload!!";
         conn_a.write_all(payload).await.unwrap();
@@ -577,7 +576,7 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kcp_session_aes_localhost_roundtrip() {
+    async fn kcp_conn_aes_localhost_roundtrip() {
         use kio::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
@@ -602,12 +601,21 @@ mod tests {
             ..KcpConfig::default()
         };
 
-        let mut conn_a = kcp_session_with_socket(sock_a, addr_b, key, "aes", cfg.clone(), true)
-            .await
-            .unwrap();
-        let mut conn_b = kcp_session_with_socket(sock_b, addr_a, key, "aes", cfg, true)
-            .await
-            .unwrap();
+        let mut conn_a = kcp_conn_with_socket(
+            sock_a,
+            addr_b,
+            key,
+            "aes",
+            cfg.clone(),
+            true,
+            OffloadProfile::Tokio,
+        )
+        .await
+        .unwrap();
+        let mut conn_b =
+            kcp_conn_with_socket(sock_b, addr_a, key, "aes", cfg, true, OffloadProfile::Tokio)
+                .await
+                .unwrap();
 
         let mut payload = vec![0u8; 8 * 1024];
         for (i, b) in payload.iter_mut().enumerate() {
@@ -627,7 +635,7 @@ mod tests {
     /// Client-shaped dial helper roundtrip (null crypt, CLI params).
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dial_kcp_session_client_shaped_roundtrip() {
+    async fn client_shaped_kcp_conn_roundtrip() {
         use kio::AsyncWriteExt;
 
         let key = b"0123456789abcdef0123456789abcdef";
@@ -658,11 +666,11 @@ mod tests {
             ..crate::KcpCliParams::default()
         };
 
-        let mut client = dial_kcp_session(sock_a, addr_b, key, "null", &params)
+        let mut client = test_kcp_conn(sock_a, addr_b, key, "null", &params)
             .await
             .unwrap();
-        // Server single-peer helper (connected=true mirrors dial).
-        let mut server = accept_kcp_peer(sock_b, addr_a, key, "null", &params, true)
+        // The connected peer uses the same lower-layer dial helper.
+        let mut server = test_kcp_conn(sock_b, addr_a, key, "null", &params)
             .await
             .unwrap();
 
@@ -724,10 +732,10 @@ mod tests {
         assert_eq!(cfg.mode, kcp_rs::KcpMode::Fast);
         assert_eq!(cfg.datashard, 0);
 
-        let mut a = dial_kcp_session(sock_a, addr_b, key, "aes", &params)
+        let mut a = test_kcp_conn(sock_a, addr_b, key, "aes", &params)
             .await
             .unwrap();
-        let mut b = accept_kcp_peer(sock_b, addr_a, key, "aes", &params, true)
+        let mut b = test_kcp_conn(sock_b, addr_a, key, "aes", &params)
             .await
             .unwrap();
 
@@ -769,9 +777,17 @@ mod tests {
             rcvwnd: 64,
             ..KcpConfig::default()
         };
-        let mut conn = kcp_session_with_socket(sock, dead, key, "null", cfg.clone(), true)
-            .await
-            .unwrap();
+        let mut conn = kcp_conn_with_socket(
+            sock,
+            dead,
+            key,
+            "null",
+            cfg.clone(),
+            true,
+            OffloadProfile::Tokio,
+        )
+        .await
+        .unwrap();
 
         let chunk = vec![0xEEu8; 4096];
         let mut accepted = 0usize;
@@ -829,5 +845,98 @@ mod tests {
                 Err(_) => continue,
             }
         }
+    }
+
+    // ── Batch receive: bad-ciphertext compaction (v3 §5.3) ──
+
+    /// In-memory `PacketTransport` queueing caller-supplied packets so
+    /// `try_recv_batch` can be exercised deterministically.
+    #[cfg(feature = "tokio")]
+    struct MockInner {
+        packets: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    }
+
+    #[cfg(feature = "tokio")]
+    #[async_trait::async_trait]
+    impl PacketTransport for MockInner {
+        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.try_recv(buf)
+        }
+        fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut q = self.packets.lock().unwrap();
+            match q.pop_front() {
+                Some(p) => {
+                    let n = p.len().min(buf.len());
+                    buf[..n].copy_from_slice(&p[..n]);
+                    Ok(n)
+                }
+                None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        }
+        async fn send_batch(&self, _packets: &[Bytes]) -> io::Result<()> {
+            Ok(())
+        }
+        async fn send_batch_to(&self, _packets: &[Bytes], _target: SocketAddr) -> io::Result<()> {
+            Ok(())
+        }
+        fn try_recv_batch(&self, pool: &mut [Vec<u8>]) -> io::Result<usize> {
+            let mut q = self.packets.lock().unwrap();
+            let mut n = 0;
+            while n < pool.len() {
+                match q.pop_front() {
+                    Some(p) => {
+                        pool[n].clear();
+                        pool[n].extend_from_slice(&p);
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            if n == 0 {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Ok(n)
+            }
+        }
+        fn supports_recv_batch(&self) -> bool {
+            true
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn try_recv_batch_compacts_bad_packets() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let mock = Arc::new(MockInner {
+            packets: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let inner: Arc<dyn PacketTransport> = mock.clone();
+        let ct = CryptoTransport::with_transport(inner, key, "aes");
+
+        let g0 = ct.encrypt_data(vec![Bytes::from_static(b"good-0")]).await;
+        let g1 = ct.encrypt_data(vec![Bytes::from_static(b"good-1")]).await;
+        let g2 = ct.encrypt_data(vec![Bytes::from_static(b"good-2")]).await;
+
+        // Corrupt the middle packet's ciphertext so its CRC check fails.
+        let mut bad = g1[0].to_vec();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0xFF;
+
+        {
+            let mut q = mock.packets.lock().unwrap();
+            q.push_back(g0[0].to_vec());
+            q.push_back(bad);
+            q.push_back(g2[0].to_vec());
+        }
+
+        let mut pool: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 2048]).collect();
+        let n = ct.try_recv_batch(&mut pool).unwrap();
+        // Bad packet compacted out; good packets keep relative order.
+        assert_eq!(n, 2);
+        assert_eq!(&pool[0][..], b"good-0");
+        assert_eq!(&pool[1][..], b"good-2");
     }
 }

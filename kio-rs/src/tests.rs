@@ -561,12 +561,12 @@ fn bench_spawn_task_throughput() {
     block_on(async {
         // Warmup
         for _ in 0..1000 {
-            let _ = spawn_task(async {});
+            drop(spawn_task(async {}));
         }
 
         let start = std::time::Instant::now();
         for _ in 0..N {
-            let _ = spawn_task(async {});
+            drop(spawn_task(async {}));
         }
         let elapsed = start.elapsed();
 

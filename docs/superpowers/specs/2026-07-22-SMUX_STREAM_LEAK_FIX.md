@@ -1,6 +1,6 @@
 # Spec: SMUX stream memory leak fix — implementation record
 
-> **Canonical path (git):** `docs/superpowers/specs/2026-07-22-smux-stream-leak-fix.md`
+> **Canonical path (git):** `docs/superpowers/specs/2026-07-22-SMUX_STREAM_LEAK_FIX.md`
 
 | Field | Value |
 |-------|--------|

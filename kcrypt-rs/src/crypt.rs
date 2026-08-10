@@ -362,6 +362,7 @@ fn pad(k: &[u8], s: usize) -> Vec<u8> {
 /// Delegates to [`CryptEngine::select`] to avoid duplicating the cipher
 /// selection match — the only difference is the return type (`Box<dyn BlockCrypt>`
 /// vs `CryptEngine` enum).
+#[deprecated(note = "use CryptEngine::select instead")]
 pub fn select_block_crypt(method: &str, pass: &[u8]) -> (Box<dyn BlockCrypt>, String) {
     let (engine, name) = CryptEngine::select(method, pass);
     (Box::new(engine), name)
@@ -370,6 +371,7 @@ pub fn select_block_crypt(method: &str, pass: &[u8]) -> (Box<dyn BlockCrypt>, St
 /// Select an [`AeadCrypt`] if the method is an AEAD variant.
 ///
 /// Returns `None` for non-AEAD methods.
+#[deprecated(note = "use CryptEngine::select and CryptEngine::as_aead instead")]
 pub fn select_aead_crypt(method: &str, pass: &[u8]) -> Option<Box<dyn AeadCrypt>> {
     match method {
         "aes-128-gcm" => Some(Box::new(Aes128GcmCrypt::new(pass))),
@@ -561,6 +563,7 @@ impl BlockCrypt for CryptEngine {
 // ─── Integration tests ─────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests verify the compatibility API against CryptEngine.
 mod tests {
     use super::*;
 

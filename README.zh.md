@@ -307,6 +307,31 @@ make linux-aarch64     # ARM64 Linux musl（从 macOS 交叉编译）
 
 ARM 交叉构建使用 **smol** 运行时，禁用 `pprof` 以保持二进制最小。
 
+### 系统级 UDP 缓冲区调优（macOS）
+
+macOS 默认的 UDP socket 缓冲区很小（发送/接收通常各 256 KB）。在高吞吐 KCP 负载下 —— 尤其是大窗口（`sndwnd`/`rcvwnd` ≥ 512）或高并发场景 —— 内核 UDP 接收缓冲区可能溢出，导致**静默丢包**，直接推高 P99/P999 尾部延迟并触发 KCP 重传风暴。
+
+增大内核 socket 缓冲区上限可消除此瓶颈。这是 macOS 上对 P99/P999 延迟最有效的系统级调优：
+
+```bash
+# 将最大 socket 缓冲区提升到 8MB（默认 ~256KB）
+sudo sysctl -w kern.ipc.maxsockbuf=8388608
+
+# 将 UDP 接收缓冲区提升到 4MB（默认 ~256KB）
+sudo sysctl -w net.inet.udp.recvspace=4194304
+```
+
+> **对 P99/P999 的实测效果：** 应用上述设置后，裸 KCP 层在回环上的最大可持续吞吐从 **2975 → 3802 req/s**（tokio，+28%）和 **2411 → 2921 req/s**（Go，+21%）提升，P99 延迟从 14.2ms → 10.5ms（tokio）和 20.3ms → 15.9ms（Go）下降。完整数据见 [bench/LATENCY_P99_REPORT.md](bench/LATENCY_P99_REPORT.md)。
+
+要使更改在重启后持久化，添加到 `/etc/sysctl.conf`：
+
+```
+kern.ipc.maxsockbuf=8388608
+net.inet.udp.recvspace=4194304
+```
+
+> **Linux 等效设置：** `net.core.rmem_max`、`net.core.rmem_default`、`net.core.wmem_max`、`net.core.wmem_default` —— 设为 `4194304` 或更高。部分发行版还需调 `net.core.netdev_max_backlog`。
+
 ---
 
 ## 🔬 优化历程
@@ -324,6 +349,7 @@ ARM 交叉构建使用 **smol** 运行时，禁用 `pprof` 以保持二进制最
 | + Snappy 卸载与阈值调优 | — | — |
 | + sendmmsg/recvmmsg 批量 I/O | — | — |
 | + 加密算法枚举静态分发 | vtable 消除 | — |
+| + macOS UDP 缓冲区调优（sysctl）| P99 −26%，吞吐 +28% | — |
 | → **最终（smol 大吞吐）** | **108 MB/s** | **2.11×** 🏆 |
 
 ### 沿途发现的关键 Bug 修复
@@ -336,6 +362,50 @@ ARM 交叉构建使用 **smol** 运行时，禁用 `pprof` 以保持二进制最
 | KCP ACK 从未填充 | 无限重传 → 死锁 | 对每个收到的 Push 段排队 ACK |
 | `snd_buf` 从不清理 | 窗口卡在 32 个包 | flush() 中前缓冲清理 |
 | Twofish 256 位密钥 S-box | 与 Go 密文不符 | 增加第 5 层 sbox |
+
+### p99 延迟崩塌排查（256KB @ 高并发）
+
+症状：裸 `kcp-rs` KcpConn（无隧道层）在大包高并发下崩塌 —— 256KB 回环
+**RPS=300 时从 ~4ms 飙到 p50=3.2s**，而 Go 用*完全相同*的 512/512 窗口 +
+Fast3 配置保持 **19ms**。单请求延迟本来就快（4.3ms）；只有当请求开始重叠时
+管道才停滞。
+
+**根因：** 每个收到的 KCP 段都会触发一次完整的 `flush_with_current()`
+（kcp.input → `parse_una>0` → 遍历整个 `snd_buf` ~500 段做重传检查）。
+50k+ pkt/s 下 ≈ 3000 万次 snd_buf 迭代/秒，每段成本膨胀到 ~680µs，并驱动
+fast/early 重传风暴（~20K/2s）。
+
+**有效修复（保留）：**
+
+| 修复 | 位置 | 效果（256KB@RPS=300） |
+|:----|:-----|:---------------------|
+| 批量 input flush：`input_no_flush()` + `flush_if_pending()`（每个 recv 批次只做一次推迟的 flush、一次锁） | kcp.rs, conn.rs | **3183ms → 2.1ms**，100% 成功（原 87%），重传风暴归零 |
+| flush loop 信任 `kcp.flush()` 返回值（clamp 1..10ms）而非强制 1ms | conn.rs | flush loop 开销降低 ~5-10× |
+| P3：nodelay 窗口探测间隔 500→50ms（`IKCP_PROBE_INIT_NODELAY`） | kcp.rs | 崩塌边缘恢复 947ms → 47ms（RPS=250）|
+| 同样的批量 flush 同步到 **legacy 二进制会话**（`input_no_flush` + 每个 datagram FEC 组一次 `flush_if_pending`）| kcptun-client, kcptun-server | 256KB@RPS=300：p50 12.4→10.5ms（legacy 隧道本就不崩 —— 1024 窗口 + FEC + SMUX 缓冲让它低于崩塌线）|
+| fast/early 重传加 `new_segs_count > 0` 门控 —— 只在窗口能载新数据时重传；满窗口下在途段的 fastack 通常是延迟 ACK 而非丢失 | kcp.rs | RPS=300 p99 69ms→3.9ms；RPS≤450 干净（~2.3ms）|
+| `write_notify` 改 `notify_one()`（存 permit）—— 原 `notify_waiters` 在 waiter 注册前到达的 notify 会丢失，负载下触发 10ms 兜底 | conn.rs | RPS=475 干净 2.3ms（原 539ms 崩塌）；RPS=500 p50 500ms+→~100ms |
+
+**隧道对比（raw 极端负载排队非 lib 缺陷的证据）**：同一个 `kcp_rs::KcpConn`
+按产品用法（默认共享 session 隧道，`copy_bidirectional` 每连接双向独立
+任务）**256KB@RPS=500 只有 ~11ms、100% 成功**（Go 隧道 30.5ms）。raw benchmark
+残余的 RPS=500 深排队是单任务串行 echo 在单连接 131MB/s 的最坏情况；隧道的
+SMUX/TCP 层解耦了读写。macOS 无公开 `sendmmsg`/`recvmmsg`（libSystem 无符号），
+批量收发需裸 syscall（未实施）。
+
+Rust 现在以 ~2.1ms 撑住 300 RPS 的 256KB —— **比 Go 的 19ms 快 ~9 倍**。
+wire 格式不变；已通过 Go↔Rust 双向互操作验证（各 500/500）。
+
+**无效方案（已测试并回退，记录以免重试）：**
+
+| 方案 | 结果 |
+|:-----|:-----|
+| 非对称窗口（rcv_wnd=2048）| 无变化 —— **证伪了 wnd=0 死锁是主因**（Go 也用 512/512）|
+| `rmt_wnd==0` 时抑制重传 | 无变化 —— 崩塌期间 `rmt_wnd` 一直 >0 |
+| 完全禁用 fast/early 重传 | 更差 4× —— 重传在恢复真实丢包 |
+| ackOnly input flush（跳过 snd_buf 扫描）| 更差 5× —— flush 的数据恢复部分是关键 |
+| 排空优先 recv 循环（+ `yield_now`）| 死锁 —— reactor 等待原本就是隐式 yield |
+| listener reader 批量排空 | 更差 3.7× |
 
 ---
 

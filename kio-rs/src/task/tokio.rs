@@ -11,6 +11,11 @@ use super::JoinHandle;
 use std::future::Future;
 use std::sync::OnceLock;
 
+/// Yield control to the tokio scheduler.  See `mod.rs` docs.
+pub async fn yield_now() {
+    tokio::task::yield_now().await;
+}
+
 // ─── CPU affinity pinning (Linux only) ─────────────────────────────────────
 /// Pin the current thread to a specific CPU core via `sched_setaffinity`.
 ///
@@ -153,4 +158,25 @@ where
     T: Send,
 {
     global_rt().block_on(future)
+}
+
+/// Drive `future` on a fresh **current-thread** tokio runtime (single worker).
+///
+/// All tasks spawned inside via [`spawn_task`] (which calls `tokio::spawn`)
+/// run on this one worker — no cross-thread work-stealing, no multi-worker
+/// socket contention. This is used by the server's `--event-loop
+/// current-thread` mode (and later by per-SO_REUSEPORT-shard workers) to get
+/// smol-style serial I/O on a single core while keeping the tokio backend.
+///
+/// A fresh runtime is built per call; callers are whole servers or shard
+/// workers, so the one-time build cost is amortized over the process lifetime.
+pub fn block_on_local<F, T>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create current-thread tokio runtime")
+        .block_on(future)
 }

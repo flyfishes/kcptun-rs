@@ -1,0 +1,59 @@
+# ─── build stage ──────────────────────────────────────────────────────────────
+FROM rust:latest AS builder
+
+# mimalloc (libmimalloc-sys) needs cmake + a C compiler; the rust image already
+# ships gcc and make, but cmake is missing.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# The project's .cargo/config.toml sets linker = "x86_64-linux-gnu-gcc" for
+# x86_64-unknown-linux-gnu. On Debian the gcc package provides /usr/bin/gcc
+# but not necessarily the x86_64-linux-gnu-gcc symlink. Create one so the
+# build doesn't fail.
+RUN ln -sf /usr/bin/gcc /usr/local/bin/x86_64-linux-gnu-gcc
+
+WORKDIR /build
+
+# Copy the entire source tree (no layer-caching tricks — the stub-file
+# approach fails because cargo fetch requires lib.rs/main.rs targets).
+COPY . .
+
+# Remove any leftover stub files just in case.
+RUN find . -name dummy.rs -delete
+
+# ── Build: tokio (default) ───────────────────────────────────────────────────
+RUN cargo build --release --workspace -j$(nproc)
+
+# ── Build: smol backend ───────────────────────────────────────────────────────
+RUN RT_PKGS="-p kcptun-client -p kcptun-server -p kio-rs -p smux-rs -p kpprof-rs" && \
+    cargo build --release --no-default-features --features smol \
+        $RT_PKGS -j$(nproc) --target-dir target/smol-release
+
+# ─── verify stage ────────────────────────────────────────────────────────────
+# Small runtime image for smoke testing.
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        netcat-openbsd \
+        procps \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy release binaries (tokio backend).
+COPY --from=builder /build/target/release/kcptun-server /app/kcptun-server-tokio
+COPY --from=builder /build/target/release/kcptun-client /app/kcptun-client-tokio
+
+# Copy release binaries (smol backend).
+COPY --from=builder /build/target/smol-release/release/kcptun-server /app/kcptun-server-smol
+COPY --from=builder /build/target/smol-release/release/kcptun-client /app/kcptun-client-smol
+
+# Copy the verification script.
+COPY docker-verify.sh /app/verify.sh
+RUN chmod +x /app/verify.sh
+
+ENTRYPOINT ["/app/verify.sh"]

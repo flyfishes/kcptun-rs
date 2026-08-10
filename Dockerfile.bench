@@ -1,0 +1,71 @@
+# ─── Dockerfile.bench — kcptun-rs Linux 矩阵测试 ────────────────────────────
+# Build:   docker build -f Dockerfile.bench -t kcptun-bench .
+# Run:     docker run --rm kcptun-bench [--quick] [--rust-only] [--go-only] ...
+#
+# 构建 Rust (tokio + smol) + Go Linux 二进制，然后跑 bench_rust_vs_go.py 矩阵。
+# Go 二进制需预先交叉编译并存放在 kcptun-go-linux/ 下（见 docker-bench.sh）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Build Rust binaries (tokio + smol) ─────────────────────────────
+FROM rust:latest AS rust-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/gcc /usr/local/bin/x86_64-linux-gnu-gcc
+
+WORKDIR /build
+
+COPY . .
+
+RUN find . -name dummy.rs -delete
+
+# tokio (default)
+RUN cargo build --release --workspace -j$(nproc)
+
+# smol
+RUN RT_PKGS="-p kcptun-client -p kcptun-server -p kio-rs -p smux-rs -p kpprof-rs" && \
+    cargo build --release --no-default-features --features smol \
+        $RT_PKGS -j$(nproc) --target-dir target/smol-release
+
+# ── Stage 2: Runtime ────────────────────────────────────────────────────────
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        netcat-openbsd \
+        procps \
+        iproute2 \
+        lsof \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Rust binaries (tokio)
+COPY --from=rust-builder /build/target/release/kcptun-server /app/kcptun-server-tokio
+COPY --from=rust-builder /build/target/release/kcptun-client /app/kcptun-client-tokio
+
+# Rust binaries (smol)
+COPY --from=rust-builder /build/target/smol-release/release/kcptun-server /app/kcptun-server-smol
+COPY --from=rust-builder /build/target/smol-release/release/kcptun-client /app/kcptun-client-smol
+
+# Go Linux binaries (pre-built, placed in kcptun-go-linux/ by docker-bench.sh)
+COPY kcptun-go-linux/server /app/kcptun-go/server
+COPY kcptun-go-linux/client /app/kcptun-go/client
+RUN chmod +x /app/kcptun-go/*
+
+# Benchmark script
+COPY bench_rust_vs_go.py /app/bench_rust_vs_go.py
+
+# Symlink so the script finds binaries at expected paths.
+# Must create parent directories first (ln -s doesn't auto-create them).
+RUN mkdir -p /app/target/release /app/target/smol-release/release /app/tests/kcptun-go && \
+    ln -s /app/kcptun-server-tokio /app/target/release/kcptun-server && \
+    ln -s /app/kcptun-client-tokio /app/target/release/kcptun-client && \
+    ln -s /app/kcptun-server-smol /app/target/smol-release/release/kcptun-server && \
+    ln -s /app/kcptun-client-smol /app/target/smol-release/release/kcptun-client && \
+    ln -s /app/kcptun-go/server /app/tests/kcptun-go/server && \
+    ln -s /app/kcptun-go/client /app/tests/kcptun-go/client
+
+ENTRYPOINT ["python3", "/app/bench_rust_vs_go.py"]

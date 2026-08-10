@@ -1,6 +1,6 @@
 # Plan: 热路径 is_closed() Mutex 回退修复
 
-> **Canonical path (git):** `docs/superpowers/plans/2026-07-22-hotpath-is-closed-mutex-regression-todo.md`
+> **Canonical path (git):** `docs/superpowers/plans/2026-07-22-HOTPATH_IS_CLOSED_MUTEX_REGRESSION_TODO.md`
 
 | Field | Value |
 |-------|-------|

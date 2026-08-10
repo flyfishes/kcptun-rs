@@ -20,16 +20,55 @@ use bytes::{Bytes, BytesMut};
 use log::debug;
 use parking_lot::Mutex;
 
+/// Default buffer size for pooled BytesMut chunks (matching typical SMUX frame payload).
+const POOL_BUF_SIZE: usize = 16384;
+/// Maximum pooled buffers per stream to avoid unbounded growth.
+const POOL_MAX_BUFFERS: usize = 8;
+
+/// A lightweight buffer pool for SMUX stream data chunks.
+///
+/// Reduces `Bytes::copy_from_slice` allocations on the hot write/push_data path
+/// by reusing `BytesMut` capacity. When the pool is empty, falls back to
+/// `Bytes::copy_from_slice` (same behavior as before).
+struct BytesPool {
+    buffers: Vec<BytesMut>,
+}
+
+impl BytesPool {
+    fn new() -> Self {
+        BytesPool { buffers: Vec::with_capacity(POOL_MAX_BUFFERS) }
+    }
+
+    /// Acquire a buffer from the pool, or allocate a fresh one.
+    #[inline]
+    fn acquire(&mut self) -> BytesMut {
+        self.buffers.pop().unwrap_or_else(|| BytesMut::with_capacity(POOL_BUF_SIZE))
+    }
+
+    /// Return a buffer to the pool for reuse (cleared, capacity retained).
+    #[inline]
+    fn release(&mut self, mut buf: BytesMut) {
+        if self.buffers.len() < POOL_MAX_BUFFERS {
+            buf.clear();
+            self.buffers.push(buf);
+        }
+    }
+}
+
 /// Error returned by stream operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamError {
     /// Stream has been closed.
+    #[error("stream closed")]
     Closed,
     /// Stream has been reset.
+    #[error("stream reset")]
     Reset,
     /// Buffer overflow.
+    #[error("buffer overflow")]
     BufferOverflow,
     /// Not enough data available.
+    #[error("not enough data (would block)")]
     WouldBlock,
 }
 
@@ -70,12 +109,16 @@ struct RecvInner {
     /// than its flush; without the grace, `read` EOFs and the caller's pipe
     /// completes, dropping the tail).
     remote_closed_at: Option<Instant>,
+    /// Buffer pool for inbound data chunks (reduces Bytes::copy_from_slice alloc).
+    pool: BytesPool,
 }
 
 /// Send half + write waker (separate mutex so push/read does not block drain).
 struct SendInner {
     send: VecDeque<Bytes>,
     write_waker: Option<Waker>,
+    /// Buffer pool for outbound data chunks (reduces Bytes::copy_from_slice alloc).
+    pool: BytesPool,
 }
 
 /// A single logical stream within a SMUX session.
@@ -144,10 +187,12 @@ impl Stream {
                 read_waker: None,
                 local_closed_at: None,
                 remote_closed_at: None,
+                pool: BytesPool::new(),
             }),
             send: Mutex::new(SendInner {
                 send: VecDeque::new(),
                 write_waker: None,
+                pool: BytesPool::new(),
             }),
             send_buf_bytes: AtomicUsize::new(0),
             recv_buf_bytes_avail: AtomicUsize::new(0),
@@ -304,11 +349,26 @@ impl Stream {
     }
 
     /// Push incoming data into the receive buffer.
+    ///
+    /// Uses the internal [`BytesPool`] to avoid `Bytes::copy_from_slice`
+    /// allocation when a pooled buffer is available. The buffer is copied
+    /// into a pooled `BytesMut`, then split and frozen; the remaining capacity
+    /// is returned to the pool for reuse.
     pub fn push_data(&self, data: &[u8]) -> Result<(), StreamError> {
         if data.is_empty() {
             return Ok(());
         }
-        self.push_data_bytes(Bytes::copy_from_slice(data))
+        let bytes = {
+            let mut inner = self.recv.lock();
+            let mut buf = inner.pool.acquire();
+            buf.extend_from_slice(data);
+            let n = buf.len();
+            let bytes = buf.split_to(n).freeze();
+            // Return the remaining BytesMut (with preserved capacity) to pool
+            inner.pool.release(buf);
+            bytes
+        };
+        self.push_data_bytes(bytes)
     }
 
     /// Push incoming data as a `Bytes` (zero-copy append).
@@ -429,9 +489,24 @@ impl Stream {
         }
     }
 
-    /// Write data into the send buffer (copies into owned `Bytes`).
+    /// Write data into the send buffer (copies into owned `Bytes` via pool).
+    ///
+    /// Uses the internal [`BytesPool`] to avoid `Bytes::copy_from_slice`
+    /// allocation when a pooled buffer is available.
     pub fn write(&self, data: &[u8]) -> Result<usize, StreamError> {
-        self.write_bytes(Bytes::copy_from_slice(data))
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let bytes = {
+            let mut inner = self.send.lock();
+            let mut buf = inner.pool.acquire();
+            buf.extend_from_slice(data);
+            let n = buf.len();
+            let bytes = buf.split_to(n).freeze();
+            inner.pool.release(buf);
+            bytes
+        };
+        self.write_bytes(bytes)
     }
 
     /// Write a `Bytes` chunk into the send buffer (zero-copy enqueue).
@@ -1102,7 +1177,7 @@ mod tests {
             #[cfg(feature = "tokio")]
             stream.shutdown().await.unwrap();
             #[cfg(feature = "smol")]
-            stream.close().await.unwrap();
+            kio::AsyncWriteExt::close(&mut stream).await.unwrap();
             assert!(stream.is_local_closed());
         });
     }

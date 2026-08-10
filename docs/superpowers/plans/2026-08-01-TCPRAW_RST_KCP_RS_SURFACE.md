@@ -26,7 +26,7 @@
 - `kio-rs/src/net/tcpraw_stub.rs` — add `TcpRawListener::local_addr` (non-Linux parity).
 - `kcp-rs/src/conn.rs` — `KcpConn::connect_tcp` (builder `DialTransport`), `KcpTcpListener` + builder.
 - `kcp-rs/tests/tcpconn_tcp.rs` — new Linux+root gated kcp-rs integration tests (feature `async-tokio`).
-- Docs: `kio-rs/src/net/AGENTS.md`, `kcp-rs/AGENTS.md`, pointer note in `docs/superpowers/specs/2026-07-29-tcpraw-transport-design.md`, `test_e2e.sh` Linux-gated `--tcp` case.
+- Docs: `kio-rs/src/net/AGENTS.md`, `kcp-rs/AGENTS.md`, pointer note in `docs/superpowers/specs/2026-07-29-TCPRAW_TRANSPORT_DESIGN.md`, `test_e2e.sh` Linux-gated `--tcp` case.
 
 ## Task Map
 
@@ -1095,7 +1095,7 @@ git commit -m "test(kio-rs,kcp-rs): root-gated tcpraw + connect_tcp integration 
 ### Task 7: Docs + e2e `--tcp` Case
 
 **Files:**
-- Modify: `kio-rs/src/net/AGENTS.md`, `kcp-rs/AGENTS.md`, `docs/superpowers/specs/2026-07-29-tcpraw-transport-design.md`, `test_e2e.sh`
+- Modify: `kio-rs/src/net/AGENTS.md`, `kcp-rs/AGENTS.md`, `docs/superpowers/specs/2026-07-29-TCPRAW_TRANSPORT_DESIGN.md`, `test_e2e.sh`
 
 **Interfaces:** none (documentation + test harness).
 
@@ -1109,9 +1109,9 @@ Key Files `conn.rs` row + Async API sketch: add `KcpConn::connect_tcp` and `KcpT
 
 - [ ] **Step 3: Pointer note in the old spec**
 
-Append to `2026-07-29-tcpraw-transport-design.md`:
+Append to `2026-07-29-TCPRAW_TRANSPORT_DESIGN.md`:
 ```markdown
-> **Superseded in part by** `2026-08-01-tcpraw-rst-kcp-rs-surface.md` — adds inbound RST filtering, graceful close, and an iptables TTL-DROP fallback takeover (not TCP_REPAIR-only).
+> **Superseded in part by** `2026-08-01-TCPRAW_RST_KCP_RS_SURFACE.md` — adds inbound RST filtering, graceful close, and an iptables TTL-DROP fallback takeover (not TCP_REPAIR-only).
 ```
 
 - [ ] **Step 4: e2e `--tcp` case**
@@ -1127,7 +1127,7 @@ fi
 - [ ] **Step 5: Commit**
 
 ```bash
-git add kio-rs/src/net/AGENTS.md kcp-rs/AGENTS.md docs/superpowers/specs/2026-07-29-tcpraw-transport-design.md test_e2e.sh
+git add kio-rs/src/net/AGENTS.md kcp-rs/AGENTS.md docs/superpowers/specs/2026-07-29-TCPRAW_TRANSPORT_DESIGN.md test_e2e.sh
 git commit -m "docs: tcpraw RST/takeover + kcp-rs connect_tcp surface; e2e --tcp case"
 ```
 

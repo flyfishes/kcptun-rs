@@ -1,13 +1,14 @@
 //! smol backend: spawn_task, cpu_block, block_on.
 //!
 //! `block_on` creates a multi-threaded pool:
-//! - N-1 worker threads run the global `async_executor::Executor` to handle
+//! - One worker thread plus the calling thread run the global executor. Keeping
+//!   two executor participants avoids cross-core task migration tail spikes.
 //!   spawned tasks (flush loops, stream handlers, UDP readers, etc.)
 //! - The main thread runs `exec.run(future)`, which concurrently drives the
 //!   user's future AND processes spawned tasks via `run_forever`.
 //!
-//! When the main future completes, the stop channel is closed, and all
-//! worker threads exit cleanly (joined via `std::thread::scope`).
+//! When the main future completes, the stop channel is closed, and all worker
+//! threads exit cleanly (joined via `std::thread::scope`).
 //!
 //! `cpu_block` uses a **persistent blocking thread pool** (separate from the
 //! async executor workers) whose threads stay alive for the process lifetime.
@@ -20,6 +21,11 @@ use std::future::Future;
 use std::sync::OnceLock;
 
 use async_executor::Executor;
+
+/// Yield control to the smol scheduler.  See `mod.rs` docs.
+pub async fn yield_now() {
+    futures_lite::future::yield_now().await;
+}
 
 // ─── CPU affinity pinning (Linux only) ─────────────────────────────────────
 /// Pin the current thread to a specific CPU core via `sched_setaffinity`.
@@ -168,15 +174,31 @@ where
 /// threads exit cleanly via `std::thread::scope`.
 ///
 /// On single-core systems, runs single-threaded (no worker threads).
+/// smol already drives everything from the calling thread plus at most one
+/// helper worker, so a "local" variant is a semantic no-op aliasing the
+/// global executor's [`block_on`]. Present for API symmetry with the tokio
+/// backend's `block_on_local` (current-thread runtime).
 #[inline(always)]
+pub fn block_on_local<F, T>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    block_on(future)
+}
+
 pub fn block_on<F, T>(future: F) -> T
 where
     F: Future<Output = T>,
 {
     let exec = global_exec();
-    let ncpus = num_cpus::get();
+    // A small fixed executor is intentional: async_executor uses one shared
+    // runnable queue, and one worker per logical CPU makes the KCP input/flush
+    // tasks migrate between cores. On SMT machines this produced rare 10-20ms
+    // stalls. The caller plus one worker preserves parallel I/O progress while
+    // keeping task locality stable; CPU-heavy work uses the separate pool.
+    let workers = num_cpus::get().min(2);
 
-    if ncpus > 1 {
+    if workers > 1 {
         let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
 
         let result = std::thread::scope(|s| {
@@ -184,7 +206,7 @@ where
             // Each worker runs exec.run(pending()) which blocks on the
             // executor's run loop, processing spawned tasks as they become
             // ready. The race with stop_rx ensures clean shutdown.
-            for i in 0..(ncpus - 1) {
+            for i in 0..(workers - 1) {
                 let stop_rx = stop_rx.clone();
                 std::thread::Builder::new()
                     .name(format!("smol-worker-{i}"))

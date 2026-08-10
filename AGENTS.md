@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-22 | Updated: 2026-07-31 (Task 7: KcpConn/SmuxConn library surface) -->
+<!-- Generated: 2026-07-22 | Updated: 2026-08-05 (conn/listener tail-latency plan) -->
 
 # kcptun-rs
 
@@ -24,7 +24,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `test_e2e.sh` | Go↔Rust (tokio & smol) interop matrix (crypt, mode, smuxver, nocomp, FEC) |
 | `bench_rust_vs_go.py` | Throughput comparison harness (Go / Rust-tokio / Rust-smol) |
 | `bench_results.json` | Latest 3-way bench numbers |
-| `PERF_OPTIMIZATION_PLAN.md` | Performance plan: completed P0/P1, remaining R1–R10, acceptance rules |
+| `docs/superpowers/plans/2026-08-05-kcp-conn-listener-tail-latency.md` | Canonical evidence-gated implementation plan for KcpConn/KcpListener throughput and P99/P999 tail latency |
 | `bench/profile_rust_go_pprof.sh` | Rust CPU profile as Go pprof protobuf (`go tool pprof`) |
 | `.claude/skills/flamegraph-perf/` | Agent skill: Go pprof profile → optimize → verify |
 | `.claude/skills/agents-md-orient/` | Agent skill: AGENTS.md-first orient + sync after structural changes |
@@ -44,7 +44,7 @@ UDP → BlockCrypt/AEAD (+ optional FEC) → KCP ARQ → Snappy (session-level) 
 | `qpp-rs/` | Quantum Permutation Pad stream obfuscation (see `qpp-rs/AGENTS.md`) |
 | `kio-rs/` | Runtime-agnostic async I/O tokio\|smol (see `kio-rs/AGENTS.md`) |
 | `kpprof-rs/` | Go-compatible pprof HTTP server (CPU/heap/goroutine/deadlock) (see `kpprof-rs/AGENTS.md`) |
-| `kcptun-common/` | Shared helpers + library-ready `CryptoTransport`/`kcp_session` (see `kcptun-common/AGENTS.md`) |
+| `kcptun-common/` | Shared production `KcptunConfig`/`KcptunSession`/`KcptunListener` and encrypted KCP transport (see `kcptun-common/AGENTS.md`) |
 | `kcptun-client/` | Client binary (see `kcptun-client/AGENTS.md`) |
 | `kcptun-server/` | Server binary + stress tests (see `kcptun-server/AGENTS.md`) |
 | `bench/` | Bench/profile runners (see `bench/AGENTS.md`) |
@@ -119,23 +119,23 @@ kcptun-server ──┤
 - Native default: tokio; ARM Makefile targets default to smol
 - Business code uses `kio::*` only — never raw tokio/smol in new code paths
 
-### Binary hot path (flush loop)
+### Binary session path
 
-Production client/server still use **legacy** per-session KCP+SMUX+Snappy loops (not yet cut over to library `kcp_rs::KcpConn` / `SmuxConn`). Both client and server split flush into **4 phases** to minimize KCP mutex hold time:
-
-1–3. Outside lock: snappy (via `kio::cpu_block` when appropriate), crypto prepare, optional parallel encrypt  
-4. Inside lock: `kcp.send()` / `update()` / `flush()` briefly
+Client and server use the shared `kcptun_common::KcptunSession` stack for both
+UDP and raw TCP. Shared server UDP sockets first pass through `KcptunListener`
+for per-peer demultiplexing; accepted raw-TCP sockets are already per-peer and
+connect directly. Binaries do not maintain their own KCP/FEC/Snappy/SMUX loops.
 
 Snappy is **session-level** (not per-stream), matching Go. Compression **on by default** (`--nocomp` disables).
 
-### Library-ready stack (Tasks 1–7; production cut-over deferred)
+### Shared production stack
 
 ```
-UDP → CryptoTransport (kcptun-common) → KcpConn (+FEC) → [Snappy] → SmuxConn → Stream
+UDP/raw TCP → CryptoTransport → KcpConn (+FEC) → [Snappy] → SMUX Session → Stream
 ```
 
 - `kcp-rs`: feature `async-tokio` / `async-smol` → `KcpConn`, `PacketTransport`, FEC on builder; **no crypto inside KcpConn**
-- `kcptun-common`: `CryptoTransport`, `kcp_session*`, `kcp_config_from`, `dial_kcp_session` / `accept_kcp_peer`
+- `kcptun-common`: `KcptunConfig` configures the complete stack; `kcp_transport` builds encrypted `KcpConn`; `KcptunListener` performs shared-UDP server demux; `KcptunSession` owns Snappy + SMUX above KCP
 - `smux-rs`: `SmuxConn::connect`/`serve` Builder; `Arc<Stream>` is AsyncRead/Write; **no** `with_backpressure`
 - Specs: `docs/superpowers/specs/2026-07-30-kcp-netconn-abstraction-analysis.md`, `docs/superpowers/specs/2026-07-31-smux-rs-simplification.md`
 

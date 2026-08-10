@@ -104,10 +104,7 @@ mod tests {
         assert_eq!(data, orig, "TEA roundtrip");
         // Verify TEA uses big endian (matching Go)
         let block = [0u8; 16];
-        let (lo, hi) = (
-            u32::from_be_bytes([b'0', b'1', b'2', b'3']),
-            u32::from_be_bytes([b'4', b'5', b'6', b'7']),
-        );
+        let (lo, hi) = (u32::from_be_bytes(*b"0123"), u32::from_be_bytes(*b"4567"));
         // Just confirm big-endian behavior
         let k = |i: usize| u32::from_be_bytes([key[i], key[i + 1], key[i + 2], key[i + 3]]);
         assert_eq!(k(0), 0x30313233, "TEA key bytes are big-endian");

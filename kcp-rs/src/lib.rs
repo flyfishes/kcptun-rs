@@ -7,7 +7,7 @@
 //! ## Design
 //!
 //! - **Zero-copy** segment parsing via `bytes::BytesMut`
-//! - **Lock-free** segment pooling with `crossbeam::queue::SegQueue`
+//! - **Zero-alloc** segment pooling with a `Vec`-backed free list
 //! - **Atomic SNMP counters** via `std::sync::atomic` with precise `Ordering`
 //! - **Cache-friendly** `#[repr(C)]` struct layouts aligned to 64-byte cache lines
 //! - **Pluggable** `BlockCrypt` trait for encryption at the segment level
@@ -25,30 +25,15 @@
 // (collapsible-if, while-let, type-complexity, etc.) would obscure that
 // correspondence, so they are suppressed at the crate level here.
 #![allow(
-    clippy::type_complexity,
+    // mirrors Go kcp-go control flow for easy auditing
     clippy::collapsible_if,
-    clippy::collapsible_match,
     clippy::while_let_loop,
-    clippy::manual_div_ceil,
-    clippy::unnecessary_cast,
-    clippy::needless_range_loop,
-    clippy::redundant_pattern_matching,
-    clippy::uninlined_format_args,
+    // KCP API surface matches Go kcp-go
     clippy::too_many_arguments,
-    clippy::new_without_default,
-    clippy::len_without_is_empty,
-    clippy::empty_line_after_doc_comments,
-    clippy::absurd_extreme_comparisons,
+    // index-based iteration matches Go kcp-go
+    clippy::needless_range_loop,
+    // Go kcp-go uses same action in multiple branches for clarity
     clippy::if_same_then_else,
-    clippy::manual_range_contains,
-    clippy::useless_conversion,
-    clippy::arc_with_non_send_sync,
-    clippy::needless_late_init,
-    clippy::manual_hash_one,
-    clippy::collapsible_else_if,
-    // Newer clippy lints on pre-existing KCP/crypto paths (Go-port fidelity).
-    clippy::manual_clamp,
-    clippy::manual_checked_ops,
 )]
 
 pub mod config;
@@ -60,6 +45,15 @@ pub mod snmp;
 #[cfg(any(feature = "async-tokio", feature = "async-smol"))]
 pub mod conn;
 
+#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+pub mod listener;
+
+#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+pub(crate) mod transport;
+
+#[cfg(test)]
+mod kcp_p999_optimizations_test;
+
 pub use config::{KcpConfig, KcpMode, DEFAULT_CONV};
 pub use fec::{
     fec_expand_packets, fec_kcp_from_recovered, FecDecoder, FecEncoder, FEC_HEADER_SIZE,
@@ -70,7 +64,10 @@ pub use segment::SegmentPool;
 pub use snmp::{add as snmp_add, enable as snmp_enable, store as snmp_store, DEFAULT_SNMP, SNMP};
 
 #[cfg(any(feature = "async-tokio", feature = "async-smol"))]
-pub use conn::{
-    KcpConn, KcpConnBuilder, KcpListener, KcpListenerBuilder, KcpTcpListener,
-    KcpTcpListenerBuilder, PacketTransport,
-};
+pub use conn::{KcpConn, KcpConnBuilder};
+
+#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+pub use listener::{KcpListener, KcpListenerBuilder, KcpTcpListener, KcpTcpListenerBuilder};
+
+#[cfg(any(feature = "async-tokio", feature = "async-smol"))]
+pub use transport::PacketTransport;

@@ -99,7 +99,7 @@ mod tokio;
 mod smol;
 
 #[cfg(feature = "tokio")]
-pub use self::tokio::{block_on, cpu_block, spawn_task};
+pub use self::tokio::{block_on, block_on_local, cpu_block, spawn_task, yield_now};
 
 #[cfg(feature = "smol")]
-pub use self::smol::{block_on, cpu_block, spawn_task};
+pub use self::smol::{block_on, block_on_local, cpu_block, spawn_task, yield_now};

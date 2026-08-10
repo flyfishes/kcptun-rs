@@ -114,6 +114,18 @@ pub struct SNMP {
     /// Inbound datagrams that matched the heavy-decrypt heuristic but stayed
     /// inline for ordering safety (offload disabled / FEC / comp).
     pub decrypt_offload_skipped: AtomicU64,
+    /// Data-path sends that ran inline in `write_all_shared` (immediate send,
+    /// bypassing the background flush loop).
+    pub write_inline_sends: AtomicU64,
+    /// Data-path sends drained+transmitted by the background flush loop.
+    pub write_flush_sends: AtomicU64,
+    /// ACK / urgent batches sent by the input loop.
+    pub input_urgent_sends: AtomicU64,
+    /// Times the `WAIT_FALLBACK_MS` safety-net fired (lost-wake recovery on a
+    /// busy link; ~10 Hz × idle-connection timer churn on idle links). Correlate
+    /// against a P999 spike to decide whether the fallback interval is a
+    /// hotspot before tuning it (plan Phase 3.1).
+    pub read_fallback_timeout: AtomicU64,
 }
 
 impl SNMP {
@@ -154,9 +166,30 @@ impl SNMP {
             encrypt_inline: AtomicU64::new(0),
             encrypt_offload: AtomicU64::new(0),
             decrypt_offload_skipped: AtomicU64::new(0),
+            write_inline_sends: AtomicU64::new(0),
+            write_flush_sends: AtomicU64::new(0),
+            input_urgent_sends: AtomicU64::new(0),
+            read_fallback_timeout: AtomicU64::new(0),
         }
     }
+}
 
+impl Default for SNMP {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SNMP {
+    /// Times the `WAIT_FALLBACK_MS` safety-net fired on the read/wait paths.
+    /// Gated by [`enable`] like every other counter (zero cost when off).
+    #[inline]
+    pub fn read_fallback_timeout(&self) -> u64 {
+        self.read_fallback_timeout.load(Ordering::Acquire)
+    }
+}
+
+impl SNMP {
     /// Point-in-time snapshot of all counters (including Rust-only fields).
     pub(crate) fn snapshot(&self) -> SnmpSnapshot {
         SnmpSnapshot {
@@ -193,6 +226,9 @@ impl SNMP {
             encrypt_inline: self.encrypt_inline.load(Ordering::Acquire),
             encrypt_offload: self.encrypt_offload.load(Ordering::Acquire),
             decrypt_offload_skipped: self.decrypt_offload_skipped.load(Ordering::Acquire),
+            write_inline_sends: self.write_inline_sends.load(Ordering::Acquire),
+            write_flush_sends: self.write_flush_sends.load(Ordering::Acquire),
+            input_urgent_sends: self.input_urgent_sends.load(Ordering::Acquire),
         }
     }
 
@@ -303,6 +339,10 @@ impl SNMP {
         self.encrypt_inline.store(0, Ordering::Release);
         self.encrypt_offload.store(0, Ordering::Release);
         self.decrypt_offload_skipped.store(0, Ordering::Release);
+        self.write_inline_sends.store(0, Ordering::Release);
+        self.write_flush_sends.store(0, Ordering::Release);
+        self.input_urgent_sends.store(0, Ordering::Release);
+        self.read_fallback_timeout.store(0, Ordering::Release);
     }
 
     /// Record a new established session. `active=true` for client dial.
@@ -375,6 +415,9 @@ pub(crate) struct SnmpSnapshot {
     pub encrypt_inline: u64,
     pub encrypt_offload: u64,
     pub decrypt_offload_skipped: u64,
+    pub write_inline_sends: u64,
+    pub write_flush_sends: u64,
+    pub input_urgent_sends: u64,
 }
 
 impl fmt::Display for SnmpSnapshot {
@@ -413,6 +456,9 @@ impl fmt::Display for SnmpSnapshot {
         writeln!(f, "EncryptInline: {}", self.encrypt_inline)?;
         writeln!(f, "EncryptOffload: {}", self.encrypt_offload)?;
         writeln!(f, "DecryptOffloadSkipped: {}", self.decrypt_offload_skipped)?;
+        writeln!(f, "WriteInlineSends: {}", self.write_inline_sends)?;
+        writeln!(f, "WriteFlushSends: {}", self.write_flush_sends)?;
+        writeln!(f, "InputUrgentSends: {}", self.input_urgent_sends)?;
         Ok(())
     }
 }

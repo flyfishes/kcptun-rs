@@ -16,30 +16,38 @@
 //! All multibyte fields are **little-endian** on the wire.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::{BufMut, BytesMut};
-use crossbeam::queue::SegQueue;
 
 // ─── Wire constants ───────────────────────────────────────────────────────────
 
 /// Maximum segment size (MTU-safe default).
 /// Matches Go kcp-go `IKCP_MTU_DEF = 1400`.
 pub const MTU: usize = 1400;
+/// Semantic alias for [`MTU`].
+pub const DEFAULT_MTU: usize = MTU;
 
 /// Overhead of the KCP header (24 bytes).
 pub const KCP_OVERHEAD: usize = 24;
+/// Semantic alias for [`KCP_OVERHEAD`].
+pub const HEADER_SIZE: usize = KCP_OVERHEAD;
 
 /// Default reliable window.
 /// Matches Go kcp-go `IKCP_WND_SND = 32` / `IKCP_WND_RCV = 32`.
 pub const KCP_DEFAULT_WND: u32 = 32;
+/// Semantic alias for [`KCP_DEFAULT_WND`].
+pub const DEFAULT_WINDOW: u32 = KCP_DEFAULT_WND;
 
 /// Maximum reliable window.
 pub const KCP_MAX_WND: u32 = 32768;
+/// Semantic alias for [`KCP_MAX_WND`].
+pub const MAX_WINDOW: u32 = KCP_MAX_WND;
 
 /// Maximum number of fragments per segment.
 /// Matches Go kcp-go limit of 255 (uint8 max).
 pub const KCP_MAX_FRAG: u32 = 255;
+/// Semantic alias for [`KCP_MAX_FRAG`].
+pub const MAX_FRAGMENTS: u32 = KCP_MAX_FRAG;
 
 /// KCP command codes.
 #[repr(u8)]
@@ -73,14 +81,20 @@ impl Command {
 /// our receive window opens up after being full.
 /// Matches the original KCP C define `IKCP_ASK_TELL = 2`.
 pub const KCP_ASK_TELL: u32 = 2;
+/// Semantic alias for [`KCP_ASK_TELL`].
+pub const ASK_TELL: u32 = KCP_ASK_TELL;
 
 /// Ask threshold for window probing.
 pub const KCP_ASK_SEND: u32 = 1;
+/// Semantic alias for [`KCP_ASK_SEND`].
+pub const ASK_SEND: u32 = KCP_ASK_SEND;
 
 /// Data segment is ready to send.
 pub const KCP_THRESHOLD_INIT: u32 = 2;
+/// Semantic alias for [`KCP_THRESHOLD_INIT`].
+pub const SSTHRESH_INIT: u32 = KCP_THRESHOLD_INIT;
 
-/// ─── Segment ─────────────────────────────────────────────────────────────────
+// ─── Segment ─────────────────────────────────────────────────────────────────
 
 /// A single KCP segment. Fields correspond directly to the wire header.
 #[derive(Clone)]
@@ -159,19 +173,19 @@ impl Segment {
     /// Encode this segment into the provided `BufMut`.
     ///
     /// Returns the number of bytes written (header + payload).
-    /// Header is written as a 24-byte little-endian block (P2.1 micro-opt).
+    /// Header is written directly to the buffer (zero temp-array allocation).
     #[inline(always)]
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> usize {
-        let mut hdr = [0u8; KCP_OVERHEAD];
-        hdr[0..4].copy_from_slice(&self.conv.to_le_bytes());
-        hdr[4] = self.cmd;
-        hdr[5] = self.frg;
-        hdr[6..8].copy_from_slice(&self.wnd.to_le_bytes());
-        hdr[8..12].copy_from_slice(&self.ts.to_le_bytes());
-        hdr[12..16].copy_from_slice(&self.sn.to_le_bytes());
-        hdr[16..20].copy_from_slice(&self.una.to_le_bytes());
-        hdr[20..24].copy_from_slice(&self.len.to_le_bytes());
-        buf.put_slice(&hdr);
+        // Write header fields directly to avoid stack array allocation
+        // This saves ~24 bytes of stack space per call and reduces memory writes
+        buf.put_u32_le(self.conv);
+        buf.put_u8(self.cmd);
+        buf.put_u8(self.frg);
+        buf.put_u16_le(self.wnd);
+        buf.put_u32_le(self.ts);
+        buf.put_u32_le(self.sn);
+        buf.put_u32_le(self.una);
+        buf.put_u32_le(self.len);
         if self.len > 0 {
             buf.put_slice(&self.data[..self.len as usize]);
         }
@@ -196,12 +210,16 @@ impl Segment {
         let una = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
         let len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
 
-        let total_len = KCP_OVERHEAD + len as usize;
+        // Keep the arithmetic checked before using the attacker-controlled
+        // payload length for slicing/allocation.  On 32-bit targets a
+        // `u32` length plus the 24-byte header can overflow `usize`.
+        let payload_len = usize::try_from(len).ok()?;
+        let total_len = KCP_OVERHEAD.checked_add(payload_len)?;
         if data.len() < total_len {
             return None;
         }
 
-        let mut seg = Segment::with_capacity(len as usize);
+        let mut seg = Segment::with_capacity(payload_len);
         seg.conv = conv;
         seg.cmd = cmd;
         seg.frg = frg;
@@ -237,16 +255,20 @@ impl fmt::Debug for Segment {
 
 // ─── Segment Pool ─────────────────────────────────────────────────────────────
 
-/// A lock-free pool of [`Segment`] instances.
+/// A pool of [`Segment`] instances.
 ///
-/// Go's `sync.Pool` is approximated here by `crossbeam::SegQueue` with an
-/// upper bound. When the pool is empty, new segments are allocated directly —
-/// the amortized cost is still near-zero under steady-state traffic because
-/// segments are recycled as soon as they are acknowledged.
+/// Backed by a simple `Vec<Segment>` stack.  KCP is always behind a
+/// `Mutex<KCP>`, so pool access is serialized — no need for lock-free
+/// atomics (the previous `crossbeam::SegQueue` used CAS per acquire/release,
+/// adding ~10-20ns of atomic overhead per segment on the hot path).
+///
+/// When the pool is empty, new segments are allocated directly — the
+/// amortized cost is near-zero under steady-state traffic because segments
+/// are recycled as soon as they are acknowledged.
 pub struct SegmentPool {
-    inner: SegQueue<Segment>,
+    inner: Vec<Segment>,
     max_capacity: usize,
-    created: AtomicU32,
+    created: u32,
 }
 
 impl SegmentPool {
@@ -254,24 +276,39 @@ impl SegmentPool {
     #[inline]
     pub fn new(max_capacity: usize) -> Self {
         SegmentPool {
-            inner: SegQueue::new(),
+            // Reserve actual Segment storage only when traffic creates one.
+            // A fixed 64-slot index allocation per idle KCP connection adds
+            // substantial cold RSS at high connection counts without avoiding
+            // any payload allocation (the pool starts logically empty).
+            inner: Vec::new(),
             max_capacity,
-            created: AtomicU32::new(0),
+            created: 0,
+        }
+    }
+
+    /// Preallocate segments to avoid runtime allocation spikes.
+    /// Call this during initialization for steady-state performance.
+    #[inline]
+    pub fn preallocate(&mut self, count: usize) {
+        let to_create = (self.inner.len() + count).min(self.max_capacity) - self.inner.len();
+        for _ in 0..to_create {
+            self.created += 1;
+            self.inner.push(Segment::with_capacity(MTU));
         }
     }
 
     /// Acquire a segment from the pool, or allocate a fresh one.
     #[inline]
-    pub fn acquire(&self) -> Segment {
+    pub fn acquire(&mut self) -> Segment {
         self.inner.pop().unwrap_or_else(|| {
-            self.created.fetch_add(1, Ordering::Relaxed);
+            self.created += 1;
             Segment::with_capacity(MTU)
         })
     }
 
     /// Return a segment to the pool for reuse.
     #[inline]
-    pub fn release(&self, mut seg: Segment) {
+    pub fn release(&mut self, mut seg: Segment) {
         seg.reset();
         // Avoid unbounded growth by dropping when at capacity.
         if self.inner.len() < self.max_capacity {
@@ -279,16 +316,52 @@ impl SegmentPool {
         }
     }
 
+    /// Batch acquire segments - reduces function call overhead when multiple
+    /// segments are needed at once (e.g., during burst processing).
+    #[inline]
+    pub fn acquire_batch(&mut self, count: usize, out: &mut Vec<Segment>) {
+        out.clear();
+        out.reserve(count);
+        for _ in 0..count {
+            out.push(self.acquire());
+        }
+    }
+
+    /// Batch release segments - more efficient than individual releases
+    /// for burst recycling.
+    #[inline]
+    pub fn release_batch(&mut self, mut segs: Vec<Segment>) {
+        if self.inner.len() + segs.len() <= self.max_capacity {
+            for seg in &mut segs {
+                seg.reset();
+            }
+            self.inner.extend(segs);
+        } else {
+            // Pool would overflow - only keep what fits
+            let keep_count = self.max_capacity.saturating_sub(self.inner.len());
+            for seg in segs.iter_mut().take(keep_count) {
+                seg.reset();
+            }
+            self.inner.extend(segs.into_iter().take(keep_count));
+        }
+    }
+
     /// Total number of segments created (useful for diagnostics).
     #[inline]
     pub fn created(&self) -> u32 {
-        self.created.load(Ordering::Relaxed)
+        self.created
     }
 
     /// Approximate number of segments currently in the pool.
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    /// Returns `true` if the pool contains no segments.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
@@ -333,8 +406,15 @@ mod tests {
     }
 
     #[test]
+    fn segment_decode_rejects_wrapping_payload_length() {
+        let mut wire = vec![0u8; KCP_OVERHEAD];
+        wire[KCP_OVERHEAD - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Segment::decode(&wire).is_none());
+    }
+
+    #[test]
     fn segment_pool_reuses_segments() {
-        let pool = SegmentPool::new(10);
+        let mut pool = SegmentPool::new(10);
         let seg = pool.acquire();
         assert_eq!(seg.len, 0);
         pool.release(seg);
@@ -345,7 +425,7 @@ mod tests {
 
     #[test]
     fn segment_pool_respects_capacity() {
-        let pool = SegmentPool::new(2);
+        let mut pool = SegmentPool::new(2);
         let mut segs = Vec::new();
         for _ in 0..10 {
             segs.push(pool.acquire());

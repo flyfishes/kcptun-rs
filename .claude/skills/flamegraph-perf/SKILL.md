@@ -83,7 +83,7 @@ curl 'http://127.0.0.1:6060/debug/pprof/deadlock'
 1. Capture: `bash bench/profile_rust_go_pprof.sh server 20`
 2. Open: `go tool pprof -http=127.0.0.1:0 bench/profiles/rust-server-*.pb`
 3. Update `bench/profiles/HOTSPOTS.md` with ranks + throughput
-4. One surgical fix if hotspot actionable (map to `PERF_OPTIMIZATION_PLAN.md`)
+4. One surgical fix if hotspot actionable (map to `docs/superpowers/plans/2026-08-05-kcp-conn-listener-tail-latency.md`)
 5. `cargo test --workspace` + `cargo clippy --workspace -- -D warnings`
 6. stress/e2e as needed (`make stress`, `bash test_e2e.sh`)
 7. Re-bench + re-profile
@@ -144,5 +144,5 @@ Hard rules: wire compatibility; no congestion cheats; one class per change; shar
 
 - `bench/PROFILE_RUNBOOK.md`
 - `bench/profiles/HOTSPOTS.md`
-- `PERF_OPTIMIZATION_PLAN.md`
+- `docs/superpowers/plans/2026-08-05-kcp-conn-listener-tail-latency.md`
 - `kpprof-rs/src/lib.rs` — kpprof module docs (endpoints, profiling guide, vendored modifications)

@@ -1,0 +1,218 @@
+name: Release build
+
+on:
+  # 手动触发，方便控制
+  workflow_dispatch:
+  # 也可以配置在 push 到 main 时自动触发（但建议手动触发 Release）
+  # push:
+  #   branches: [ "main" ]
+
+env:
+  # ===== 在这里配置主版本号 =====
+  # 格式: 主版本.次版本 (补丁号会自动递增)
+  MAJOR_MINOR: "0.1"
+  # =============================
+
+jobs:
+  # ============================================================
+  # 任务 1: 计算版本号并创建 Tag
+  # ============================================================
+  versioning:
+    name: Calculate Version & Create Tag
+    runs-on: ubuntu-latest
+    outputs:
+      # 将计算出的版本号传递给后续 Job
+      full_version: ${{ steps.version.outputs.full_version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      release_title: ${{ steps.version.outputs.release_title }}
+    permissions:
+      contents: write  # 需要推送 Tag 的权限
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取所有历史记录，包括所有 Tags
+
+      # ----- 计算新版本号 -----
+      - name: Calculate new version
+        id: version
+        run: |
+          # 1. 从环境变量读取主版本号
+          BASE_VERSION="${{ env.MAJOR_MINOR }}"
+          
+          # 2. 获取当前日期 (YYYYMMDD)
+          DATE_SUFFIX=$(date +'%Y%m%d')
+          
+          # 3. 查找符合 "主版本.补丁号" 格式的最新 Tag
+          #    例如: 查找所有以 "0.1." 开头的 tag，提取最大的补丁号
+          PATTERN="${BASE_VERSION}."
+          # 获取所有匹配的 tag，排序后取最大的补丁号
+          LATEST_PATCH=$(git tag -l "${PATTERN}*" | \
+                         sed -n "s/^${PATTERN}\([0-9]*\)-.*$/\1/p" | \
+                         sort -n | \
+                         tail -1)
+          
+          # 4. 如果没有找到，从 0 开始
+          if [ -z "$LATEST_PATCH" ]; then
+            NEW_PATCH=0
+          else
+            NEW_PATCH=$((LATEST_PATCH + 1))
+          fi
+          
+          # 5. 组装完整版本号
+          FULL_VERSION="${BASE_VERSION}.${NEW_PATCH}"
+          TAG_NAME="v${FULL_VERSION}-${DATE_SUFFIX}"
+          RELEASE_TITLE="Release ${FULL_VERSION} (${DATE_SUFFIX})"
+          
+          # 6. 输出供后续步骤使用
+          echo "full_version=${FULL_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "release_title=${RELEASE_TITLE}" >> $GITHUB_OUTPUT
+          
+          # 打印信息到日志
+          echo "=========================================="
+          echo "  Base version:   ${BASE_VERSION}"
+          echo "  Latest patch:   ${LATEST_PATCH:-none}"
+          echo "  New patch:      ${NEW_PATCH}"
+          echo "  Full version:   ${FULL_VERSION}"
+          echo "  Tag name:       ${TAG_NAME}"
+          echo "  Release title:  ${RELEASE_TITLE}"
+          echo "=========================================="
+
+      # ----- 创建并推送 Tag -----
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.tag_name }}
+          git push origin ${{ steps.version.outputs.tag_name }}
+
+  # ============================================================
+  # 任务 2: 跨平台编译（复用之前的配置）
+  # ============================================================
+  build-cross-platform:
+    name: Build ${{ matrix.target }}
+    needs: versioning  # 等待版本号计算完成
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_ext: .exe
+            rustup_toolchain: stable-msvc
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_ext: ''
+            rustup_toolchain: stable
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rustup_toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Install musl-tools (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (Release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapp-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/myapp${{ matrix.artifact_ext }}
+          retention-days: 30
+
+  # ============================================================
+  # 任务 3: OpenWrt 编译
+  # ============================================================
+  build-openwrt:
+    name: Build OpenWrt (x86-64)
+    needs: versioning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build OpenWrt
+        uses: danshui-git/build-actions@v1.0
+        with:
+          TARGET: x86_64
+          CONFIG_FILE: .config
+          ENABLE_SSH: false
+
+      - name: Upload OpenWrt Firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-x86-64-firmware
+          path: |
+            openwrt/bin/targets/x86/64/*.img.gz
+            openwrt/bin/targets/x86/64/*.vmdk
+          retention-days: 30
+
+  # ============================================================
+  # 任务 4: 创建 Release 并上传所有产物
+  # ============================================================
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [versioning, build-cross-platform, build-openwrt]
+    permissions:
+      contents: write
+      # 如果上传到 Release 需要，也可以添加：
+      # packages: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts (for debugging)
+        run: |
+          echo "=== Downloaded artifacts ==="
+          ls -la artifacts/
+          find artifacts/ -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.versioning.outputs.tag_name }}
+          name: ${{ needs.versioning.outputs.release_title }}
+          # 从 tag 自动生成 Release Notes（可选）
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          # 上传所有产物
+          files: |
+            artifacts/**/myapp-*
+            artifacts/**/*.exe
+            artifacts/**/*.img.gz
+            artifacts/**/*.vmdk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

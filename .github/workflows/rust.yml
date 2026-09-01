@@ -4,8 +4,8 @@ on:
   # 手动触发，方便控制
   workflow_dispatch:
   # 也可以配置在 push 到 main 时自动触发（但建议手动触发 Release）
-  # push:
-  #   branches: [ "main" ]
+  push:
+    branches: [ "main" ]
 
 env:
   # ===== 在这里配置主版本号 =====

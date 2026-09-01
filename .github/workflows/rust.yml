@@ -44,12 +44,12 @@ jobs:
           # 2. 获取当前日期 (YYYYMMDD)
           DATE_SUFFIX=$(date +'%Y%m%d')
           
-          # 3. 查找符合 "主版本.补丁号" 格式的最新 Tag
-          #    例如: 查找所有以 "0.1." 开头的 tag，提取最大的补丁号
-          PATTERN="${BASE_VERSION}."
-          # 获取所有匹配的 tag，排序后取最大的补丁号
+          # 3. 查找符合 "v主版本.补丁号-日期" 格式的最新 Tag
+          #    例如: 查找所有以 "v0.1." 开头的 tag，提取最大的补丁号
+          PATTERN="v${BASE_VERSION}."
+          # 获取所有匹配的 tag，提取补丁号（数字部分）
           LATEST_PATCH=$(git tag -l "${PATTERN}*" | \
-                         sed -n "s/^${PATTERN}\([0-9]*\)-.*$/\1/p" | \
+                         sed -n "s/^${PATTERN}\([0-9]*\)-[0-9]*$/\1/p" | \
                          sort -n | \
                          tail -1)
           

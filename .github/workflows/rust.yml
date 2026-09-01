@@ -91,36 +91,41 @@ jobs:
   # ============================================================
   # 任务 2: 跨平台编译（复用之前的配置）
   # ============================================================
+  # 构建任务
   build-cross-platform:
     name: Build ${{ matrix.target }}
-    needs: versioning  # 等待版本号计算完成
+    needs: versioning
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_ext: .exe
-            rustup_toolchain: stable-msvc
-
+          # ---------- Linux (MUSL 静态编译) ----------
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact_ext: ''
             rustup_toolchain: stable
-
+  
+          # ---------- Windows (仅在依赖允许时启用) ----------
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_ext: .exe
+            rustup_toolchain: stable-msvc
+            # 添加一个标志，跳过 pprof 相关的编译
+            skip_pprof: true
+  
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
+  
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rustup_toolchain }}
           targets: ${{ matrix.target }}
-
+  
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -132,14 +137,29 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
             ${{ runner.os }}-cargo-
-
+  
       - name: Install musl-tools (Linux)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-
+  
+      # ---------- 为 Windows 添加环境变量来禁用 pprof ----------
+      - name: Set environment for Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "RUSTFLAGS=--cfg=windows" >> $GITHUB_ENV
+          # 或者通过 feature 来控制
+          echo "CARGO_FEATURES=--no-default-features --features=my_other_features" >> $GITHUB_ENV
+  
       - name: Build (Release)
-        run: cargo build --release --target ${{ matrix.target }}
-
+        run: |
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            # Windows 构建，跳过 pprof 相关的 feature
+            cargo build --release --target ${{ matrix.target }} --no-default-features
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
+  
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -156,24 +176,42 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build OpenWrt
-        uses: danshui-git/build-actions@v1.0
-        with:
-          TARGET: x86_64
-          CONFIG_FILE: .config
-          ENABLE_SSH: false
-
-      - name: Upload OpenWrt Firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: openwrt-x86-64-firmware
-          path: |
-            openwrt/bin/targets/x86/64/*.img.gz
-            openwrt/bin/targets/x86/64/*.vmdk
-          retention-days: 30
+      # 这部分可以替换掉你原来有问题的 'Build OpenWrt' 步骤
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    # 1. 克隆 OpenWrt 源码 (这里以 Lean 的源码为例)
+    - name: Clone OpenWrt source
+      run: |
+        git clone https://github.com/coolsnowwolf/lede openwrt
+        cd openwrt
+        # 此处可切换到你需要的分支，如 ./scripts/feeds update -a
+    
+    # 2. 复制你已经准备好的 .config 文件到源码目录
+    #    你需要在你的仓库根目录准备好这个配置文件
+    - name: Copy config file
+      run: cp .config openwrt/.config
+    
+    # 3. 更新并安装 feeds (软件包)
+    - name: Update and install feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    # 4. 开始编译 (这个过程通常比较长)
+    - name: Build firmware
+      run: |
+        cd openwrt
+        make -j$(nproc) || make -j1 V=s
+        # 先尝试多线程编译，失败后回退到单线程详细模式
+    
+    # 5. 上传编译好的固件
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-firmware
+        path: openwrt/bin/targets/**/*.img.gz  # 根据实际编译目标调整路径
 
   # ============================================================
   # 任务 4: 创建 Release 并上传所有产物

@@ -1,0 +1,177 @@
+name:  Build and Release
+
+on:
+  push:
+    branches: [ "main", "master" ] # 触发分支，可根据需要修改
+  workflow_dispatch: # 允许手动触发
+
+env:
+  # 初始版本号，建议也可以在 GitHub 仓库的 Settings -> Secrets and variables -> Actions -> Variables 中配置 INIT_VERSION
+  INIT_VERSION: "0.1" 
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================
+  # Job 1: 计算版本号并创建 Tag
+  # ==========================================
+  prepare:
+    name: Prepare Version and Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag_name: ${{ steps.ver.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 必须获取所有历史记录和 tags 才能计算版本号
+
+      - name: Calculate Version
+        id: ver
+        run: |
+          # 优先从仓库 Variables 读取，如果没有则使用 env 中的默认值
+          BASE_VERSION="${{ vars.INIT_VERSION || env.INIT_VERSION }}"
+          
+          # 获取最新的以 BASE_VERSION. 开头的 tag (例如 0.1.5-20260801)
+          LATEST_TAG=$(git tag -l "${BASE_VERSION}.*" | sort -V | tail -n 1)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            PATCH=0
+          else
+            # 提取 patch 版本号 (例如从 0.1.5-20260801 提取 5)
+            PATCH=$(echo $LATEST_TAG | sed -E "s/^${BASE_VERSION}\.([0-9]+).*/\1/")
+            PATCH=$((PATCH + 1))
+          fi
+          
+          VERSION="${BASE_VERSION}.${PATCH}"
+          TAG_NAME="${VERSION}-$(date +'%Y%m%d')"
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "✅ Calculated Version: ${VERSION}, Tag: ${TAG_NAME}"
+
+      - name: Create and Push Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          TAG_NAME="${{ steps.ver.outputs.tag_name }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+          
+          # 防止重复运行导致 tag 冲突
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "⚠️ Tag $TAG_NAME already exists, skipping push."
+          else
+            git tag -a "$TAG_NAME" -m "Release $VERSION"
+            git push origin "$TAG_NAME"
+            echo "🚀 Pushed tag $TAG_NAME to origin."
+          fi
+
+  # ==========================================
+  # Job 2: 跨平台编译
+  # ==========================================
+  build:
+    name: Build (${{ matrix.artifact_name }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1. Windows (MSVC)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+            use_cross: false
+            install_musl: false
+            artifact_name: windows-x86_64
+            
+          # 2. Linux (兼容 CentOS/Debian/Ubuntu)
+          # 使用 cross 编译 glibc，底层基于 CentOS 7，完美兼容各大发行版
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            use_cross: true
+            install_musl: false
+            artifact_name: linux-x86_64-gnu
+            
+          # 3. OpenWrt (x86_64)
+          # OpenWrt 使用 musl libc，静态编译后兼容性最强
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
+            use_cross: false
+            install_musl: true
+            artifact_name: openwrt-x86_64-musl
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for Linux glibc)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@cross
+
+      - name: Install musl-tools (for OpenWrt musl)
+        if: matrix.install_musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build Release
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" == "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package Artifact
+        shell: bash
+        run: |
+          # 自动获取 Cargo.toml 中的 crate name 作为二进制文件名
+          BIN_NAME=$(cargo pkgid | sed -E 's/.*#([^:]+).*/\1/')
+          SRC_PATH="target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.ext }}"
+          
+          # 重命名并打包 (统一使用 tar.gz，Windows 10+ 原生支持)
+          DEST_NAME="${{ needs.prepare.outputs.tag_name }}-${{ matrix.artifact_name }}${{ matrix.ext }}"
+          cp "$SRC_PATH" "$DEST_NAME"
+          
+          ARCHIVE_NAME="${{ needs.prepare.outputs.tag_name }}-${{ matrix.artifact_name }}"
+          tar -czvf "${ARCHIVE_NAME}.tar.gz" "$DEST_NAME"
+          
+          echo "✅ Packaged: ${ARCHIVE_NAME}.tar.gz"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ needs.prepare.outputs.tag_name }}-${{ matrix.artifact_name }}.tar.gz
+
+  # ==========================================
+  # Job 3: 创建 GitHub Release
+  # ==========================================
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true # 将所有平台的产物合并到同一个目录
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag_name }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          files: artifacts/*.tar.gz
+          generate_release_notes: true # 自动生成 Release Notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

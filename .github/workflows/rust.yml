@@ -1,4 +1,4 @@
-name: Cross-Platform Build
+name:  Build release
 
 on:
   workflow_dispatch:
@@ -95,16 +95,18 @@ jobs:
             artifact_ext: ''
             rustup_toolchain: stable
             features: ""
-            env: {}
+            env:
+              RUSTFLAGS: ""
 
-          # ---------- Windows ----------
+          # ---------- Windows (GNU 静态链接) ----------
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-gnu
             artifact_ext: .exe
-            rustup_toolchain: stable-msvc
-            # Windows 需要额外启用 kio-rs/tokio，并跳过 pprof
+            rustup_toolchain: stable-gnu
+            # Windows 需要额外启用 kio-rs/tokio
             features: "kio-rs/tokio"
             env:
+              # 启用静态链接，生成独立的 .exe
               RUSTFLAGS: "-C target-feature=+crt-static"
 
     env: ${{ matrix.env }}
@@ -120,6 +122,18 @@ jobs:
         with:
           toolchain: ${{ matrix.rustup_toolchain }}
           targets: ${{ matrix.target }}
+
+      # ---------- Windows GNU 工具链需要安装 MinGW ----------
+      - name: Setup MinGW (for Windows GNU target)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-toolchain
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -137,6 +151,16 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # ---------- 调试：查看依赖树 ----------
+      - name: Debug dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "=== Dependency tree (filtering pprof) ==="
+          cargo tree | grep -E "(pprof|kpprof)" || echo "No pprof dependencies found"
+          echo "=== Features enabled ==="
+          cargo tree -e features | grep -E "(pprof|kpprof)" || echo "No pprof features found"
+        shell: bash
+
       - name: Build (Release)
         run: |
           if [ -n "${{ matrix.features }}" ]; then
@@ -144,6 +168,24 @@ jobs:
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
           else
             cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      # ---------- 验证生成的二进制文件 ----------
+      - name: Verify binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          BINARY_PATH="target/${{ matrix.target }}/release/kcptun-client${{ matrix.artifact_ext }}"
+          if [ -f "$BINARY_PATH" ]; then
+            echo "✅ Binary found: $BINARY_PATH"
+            echo "=== Binary size ==="
+            ls -lh "$BINARY_PATH"
+            echo "=== Checking dependencies (using objdump) ==="
+            # 使用 objdump 检查依赖的 DLL
+            objdump -p "$BINARY_PATH" | grep "DLL Name" || echo "No external DLL dependencies found (likely static linked)"
+          else
+            echo "❌ Binary not found!"
+            exit 1
           fi
         shell: bash
 
@@ -208,7 +250,7 @@ jobs:
           EOF
             make defconfig
           fi
-          
+
       - name: Build firmware
         run: |
           cd openwrt
@@ -238,6 +280,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: List artifacts (for debugging)
+        run: |
+          echo "=== Downloaded artifacts ==="
+          ls -la artifacts/
+          find artifacts/ -type f
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
